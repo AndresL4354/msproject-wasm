@@ -1,30 +1,32 @@
 //! Imagenes de PDF: formato con que se entregan, ubicacion en la pagina y extraccion.
 //!
 //! - JPEG (DCTDecode) y JPEG 2000 (JPXDecode) se entregan tal cual, sin recomprimir.
-//! - Fax (CCITTFaxDecode) se envuelve en un TIFF de una tira, sin decodificar.
+//! - Fax (CCITTFaxDecode, grupos 3 y 4) y JBIG2 se decodifican y salen como PNG de un bit,
+//!   listos para OCR. Si el fax no se puede decodificar, se entrega envuelto en un TIFF.
 //! - Los pixeles (Flate, LZW, RunLength, sin compresion...) pasan a PNG: gris, RGB, CMYK
 //!   (convertido a RGB), indexado (con su paleta), tinta plana (Separation) y mascaras de un bit;
 //!   con transparencia si traen mascara suave (SMask) del mismo tamano. Si el flujo ya es un PNG
 //!   por dentro (Flate con predictor PNG y parametros coincidentes) se copia sin recomprimir.
-//! - JBIG2 y espacios de color como Lab no se convierten: la imagen figura con una nota.
+//! - Espacios de color como Lab, y JBIG2 con Huffman o semitonos, no se convierten: la imagen
+//!   figura con una nota.
 
 use super::document::Pdf;
 use super::filters::{self, Parms};
 use super::object::{Dict, Obj};
 use crate::png::{self, Color, Spec};
+use crate::{ccitt, jbig2};
 
 /// Tope de pixeles por imagen al extraer (5.000 x 5.000): mas alla, la memoria no compensa.
 pub const MAX_PIXELS: u64 = 25_000_000;
-
-const NOTE_JBIG2: &str = "Imagen JBIG2 (tipica de escaneos en blanco y negro): no se convierte.";
+/// Tope para imagenes de un bit (escaneos en blanco y negro), que ocupan mucho menos: alcanza
+/// para una hoja A3 a 600 dpi (unos 70 millones de pixeles).
+pub const MAX_PIXELS_1BIT: u64 = 100_000_000;
 
 /// Filtro que ya es un formato de imagen: los datos se entregan desde ahi.
 fn image_filter(name: &str) -> Option<&'static str> {
     match name {
         "DCTDecode" | "DCT" => Some("jpeg"),
         "JPXDecode" => Some("jp2"),
-        "CCITTFaxDecode" | "CCF" => Some("tiff"),
-        "JBIG2Decode" => Some("jbig2"),
         _ => None,
     }
 }
@@ -152,7 +154,7 @@ fn image_space(pdf: &Pdf, d: &Dict) -> Space {
 /// Formato con que se entregaria la imagen y, si no se puede entregar, por que. No decodifica.
 pub fn classify(pdf: &Pdf, d: &Dict) -> (&'static str, Option<String>) {
     if let Some(f) = filter_names(pdf, d).iter().find_map(|n| image_filter(n)) {
-        return (f, (f == "jbig2").then(|| NOTE_JBIG2.to_string()));
+        return (f, None);
     }
     match image_space(pdf, d) {
         Space::Other(name) => ("desconocido", Some(format!("Espacio de color {} no soportado.", name))),
@@ -188,34 +190,108 @@ pub fn place(m: [f64; 6], bbox: [f64; 4], rotate: i64) -> (f64, f64, f64, f64) {
     (r(x0), r(ph - y1), r(x1 - x0), r(y1 - y0))
 }
 
-/// Extrae la imagen: formato y bytes del archivo, o el motivo por el que no se entrega.
-pub fn extract(pdf: &Pdf, obj: &Obj) -> Result<(&'static str, Vec<u8>), String> {
+/// Extrae la imagen: formato, bytes del archivo y un aviso (por ejemplo, un fax danado que se
+/// decodifico en parte), o el motivo por el que no se entrega.
+pub fn extract(pdf: &Pdf, obj: &Obj) -> Result<(&'static str, Vec<u8>, Option<String>), String> {
     let d = match obj {
         Obj::Stream { dict, .. } => dict,
         _ => return Err("El objeto no es una imagen.".into()),
     };
     let (w, h) = size(pdf, d).ok_or("La imagen no declara su tamano.")?;
-    if w as u64 * h as u64 > MAX_PIXELS {
+    let one_bit = bits(pdf, d) == 1 && image_space(pdf, d).components() == 1 && d.get("SMask").is_none();
+    if w as u64 * h as u64 > if one_bit { MAX_PIXELS_1BIT } else { MAX_PIXELS } {
         return Err(format!("Imagen demasiado grande para extraerla ({} x {} pixeles).", w, h));
     }
     let (mut data, chain) = pdf.stream_parts(obj).ok_or("No se pudieron leer los datos de la imagen.")?;
     let last = chain.len().saturating_sub(1);
+    let mut note = None;
     for (i, (name, parms, raw)) in chain.iter().enumerate() {
         if let Some(kind) = image_filter(name) {
-            return match kind {
-                "jbig2" => Err(NOTE_JBIG2.into()),
-                "tiff" => Ok(("tiff", ccitt_tiff(pdf, &data, w, h, raw.as_ref(), inverted(pdf, d)))),
-                k => Ok((k, data)),
-            };
+            return Ok((kind, data, None));
+        }
+        match name.as_str() {
+            "CCITTFaxDecode" | "CCF" => {
+                let (rows, decoded) = ccitt_samples(pdf, &data, w, h, raw.as_ref());
+                if decoded == 0 {
+                    let tiff = ccitt_tiff(pdf, &data, w, h, raw.as_ref(), inverted(pdf, d));
+                    return Ok(("tiff", tiff, Some("No se pudo decodificar el fax: se entrega tal cual, como TIFF.".into())));
+                }
+                if decoded < h as usize {
+                    note = Some(format!("Fax danado: se decodificaron {} de {} filas.", decoded, h));
+                }
+                data = rows;
+                continue;
+            }
+            "JBIG2Decode" => {
+                let globals = raw.as_ref().map(|p| pdf.get(p, "JBIG2Globals")).filter(|g| matches!(**g, Obj::Stream { .. })).and_then(|g| pdf.stream_data(&g));
+                let page = jbig2::decode(&data, globals.as_deref(), w as usize, h as usize)?;
+                // En PDF, el filtro entrega 0 = negro (al reves que JBIG2).
+                data = pack(&page.px, page.w, page.h, true);
+                continue;
+            }
+            _ => {}
         }
         if i == last && matches!(name.as_str(), "FlateDecode" | "Fl") {
             if let Some(png) = passthrough(pdf, d, &data, w, h, parms) {
-                return Ok(("png", png));
+                return Ok(("png", png, None));
             }
         }
         data = filters::apply(name, &data, parms).ok_or_else(|| format!("Filtro {} no soportado.", name))?;
     }
-    pixels_to_png(pdf, d, data, w, h).map(|p| ("png", p))
+    pixels_to_png(pdf, d, data, w, h).map(|p| ("png", p, note))
+}
+
+/// Filas de un bit empaquetadas a partir de un pixel por byte (1 = negro); `invert` deja 0 = negro.
+fn pack(px: &[u8], w: usize, h: usize, invert: bool) -> Vec<u8> {
+    let stride = w.div_ceil(8);
+    let mut out = vec![0u8; stride * h];
+    for y in 0..h {
+        for x in 0..w {
+            if px.get(y * w + x).copied().unwrap_or(0) != 0 {
+                out[y * stride + x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    if invert {
+        out.iter_mut().for_each(|b| *b = !*b);
+    }
+    out
+}
+
+/// Fax decodificado como lo entrega el filtro de PDF (sin `BlackIs1`, 0 = negro), con filas del
+/// ancho de la imagen. Devuelve tambien cuantas filas se decodificaron.
+fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>) -> (Vec<u8>, usize) {
+    let get = |k: &str| parms.and_then(|p| pdf.get(p, k).as_i64());
+    let on = |k: &str| parms.is_some_and(|p| flag(pdf, p, k));
+    let columns = get("Columns").filter(|&c| c > 0).unwrap_or(w as i64) as usize;
+    let p = ccitt::Params {
+        k: get("K").unwrap_or(0),
+        columns,
+        rows: get("Rows").filter(|&r| r > 0).unwrap_or(h as i64) as usize,
+        byte_align: on("EncodedByteAlign"),
+        end_of_block: parms.is_none_or(|p| !matches!(&*pdf.get(p, "EndOfBlock"), Obj::Bool(false))),
+    };
+    let (rows, decoded) = ccitt::decode(data, &p, h as usize);
+    let black_is_1 = on("BlackIs1");
+    let (w, h) = (w as usize, h as usize);
+    let src_stride = columns.div_ceil(8);
+    let stride = w.div_ceil(8);
+    let mut out = vec![0u8; stride * h];
+    for y in 0..h.min(rows.len() / src_stride.max(1)) {
+        if columns == w {
+            out[y * stride..(y + 1) * stride].copy_from_slice(&rows[y * src_stride..(y + 1) * src_stride]);
+        } else {
+            for x in 0..w.min(columns) {
+                if rows[y * src_stride + x / 8] & (0x80 >> (x % 8)) != 0 {
+                    out[y * stride + x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+        }
+    }
+    if !black_is_1 {
+        out.iter_mut().for_each(|b| *b = !*b);
+    }
+    (out, decoded)
 }
 
 fn bits(pdf: &Pdf, d: &Dict) -> u8 {

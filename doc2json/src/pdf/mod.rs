@@ -232,9 +232,9 @@ pub fn read_opts(bytes: &[u8], extract: bool) -> Result<Document, String> {
         for (img, key) in doc.images.iter_mut().zip(&set.keys) {
             let obj = key.split_once(' ').and_then(|(n, _)| n.parse::<u32>().ok()).map(|n| pdf.object(n));
             match obj.map(|o| images::extract(&pdf, &o)) {
-                Some(Ok((format, data))) => {
+                Some(Ok((format, data, note))) => {
                     img.format = format;
-                    img.note = None;
+                    img.note = note;
                     img.data = Some(data);
                 }
                 Some(Err(note)) => img.note = Some(note),

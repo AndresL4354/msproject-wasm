@@ -12,8 +12,10 @@
 
 pub mod doc;
 pub mod docx;
+pub mod ccitt;
 pub mod image;
 pub mod inflate;
+pub mod jbig2;
 pub mod json;
 pub mod pdf;
 pub mod png;
