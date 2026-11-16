@@ -1,4 +1,4 @@
-//! Linea de comandos: `doc2json <archivo.docx|archivo.pdf> [salida.json] [--full]`
+//! Linea de comandos: `doc2json <archivo.docx|.pdf|.pptx|.xlsx> [salida.json] [--full]`
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ fn say(msg: &str) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("Uso: doc2json <archivo.docx|archivo.pdf> [salida.json] [--full]");
+    eprintln!("Uso: doc2json <archivo.docx|.pdf|.pptx|.xlsx> [salida.json] [--full]");
     ExitCode::from(2)
 }
 
