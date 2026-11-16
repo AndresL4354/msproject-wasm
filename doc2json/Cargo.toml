@@ -1,0 +1,18 @@
+[package]
+name = "doc2json"
+version = "0.1.0"
+edition = "2021"
+description = "Convierte documentos Word (.docx) y PDF a JSON. Sin dependencias; compila a WebAssembly."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "doc2json"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "doc2json"
+path = "src/main.rs"
+
+# Sin dependencias, igual que mpp2xlsx: descompresor, lector ZIP, lector XML y lector PDF propios.
+[dependencies]

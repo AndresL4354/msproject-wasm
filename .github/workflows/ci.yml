@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pruebas:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pruebas de Rust
+        run: cargo test --workspace
+      - name: Compilar a WebAssembly
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build --release --workspace --lib --target wasm32-unknown-unknown
+      - name: Probar los cargadores con los .wasm recien compilados
+        shell: bash
+        run: |
+          cp target/wasm32-unknown-unknown/release/*.wasm web/
+          node web/prueba.mjs

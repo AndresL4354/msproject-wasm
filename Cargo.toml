@@ -1,0 +1,32 @@
+# Dos herramientas independientes, cada una con su ejecutable y su .wasm:
+#   mpp2xlsx  (este directorio)  Microsoft Project -> Excel / JSON
+#   doc2json  (doc2json/)        Word y PDF -> JSON
+[workspace]
+members = [".", "doc2json"]
+
+[package]
+name = "mpp2xlsx"
+version = "0.1.0"
+edition = "2021"
+description = "Convierte archivos de Microsoft Project (.mpp) a Excel (.xlsx) y JSON. Sin dependencias; compila a WebAssembly."
+license = "LGPL-2.1-or-later"
+publish = false
+
+[lib]
+name = "mpp2xlsx"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "mpp2xlsx"
+path = "src/main.rs"
+
+# Sin dependencias a proposito: el .wasm queda pequeno y no hay nada que auditar ni actualizar.
+[dependencies]
+
+[profile.release]
+# "s" y no "z": el .wasm crece ~7 KB comprimido, pero cada conversion usa ~25 % menos CPU.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

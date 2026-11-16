@@ -1,0 +1,7 @@
+target/
+.venv/
+*.xlsx
+!ejemplo/*.xlsx
+# Los planes reales no se suben: solo los de ejemplo/.
+*.mpp
+!ejemplo/*.mpp

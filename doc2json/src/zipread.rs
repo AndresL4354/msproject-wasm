@@ -1,0 +1,103 @@
+//! Lector ZIP minimo: directorio central y entradas almacenadas o comprimidas con DEFLATE.
+//! Suficiente para abrir un .docx (que es un ZIP con archivos XML dentro).
+
+use crate::inflate::inflate;
+
+pub struct Entry {
+    pub name: String,
+    method: u16,
+    packed: usize,
+    pub size: usize,
+    offset: usize,
+}
+
+pub struct ZipArchive<'a> {
+    data: &'a [u8],
+    pub entries: Vec<Entry>,
+}
+
+fn u16_at(d: &[u8], o: usize) -> usize {
+    match d.get(o..o + 2) {
+        Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
+        None => 0,
+    }
+}
+
+fn u32_at(d: &[u8], o: usize) -> usize {
+    match d.get(o..o + 4) {
+        Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize,
+        None => 0,
+    }
+}
+
+impl<'a> ZipArchive<'a> {
+    pub fn open(data: &'a [u8]) -> Result<ZipArchive<'a>, String> {
+        // El registro de fin de directorio esta al final, seguido como mucho de un comentario.
+        let min = data.len().saturating_sub(22 + 65535);
+        let mut eocd = None;
+        let mut i = data.len().saturating_sub(22);
+        loop {
+            if data.get(i..i + 4) == Some(&[0x50, 0x4B, 0x05, 0x06]) {
+                eocd = Some(i);
+                break;
+            }
+            if i == 0 || i <= min {
+                break;
+            }
+            i -= 1;
+        }
+        let eocd = eocd.ok_or("El archivo no es un ZIP valido (no se encontro el directorio).")?;
+        let count = u16_at(data, eocd + 10);
+        let mut pos = u32_at(data, eocd + 16);
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if data.get(pos..pos + 4) != Some(&[0x50, 0x4B, 0x01, 0x02]) {
+                break;
+            }
+            let name_len = u16_at(data, pos + 28);
+            let name = String::from_utf8_lossy(data.get(pos + 46..pos + 46 + name_len).unwrap_or(&[])).replace('\\', "/");
+            entries.push(Entry {
+                name,
+                method: u16_at(data, pos + 10) as u16,
+                packed: u32_at(data, pos + 20),
+                size: u32_at(data, pos + 24),
+                offset: u32_at(data, pos + 42),
+            });
+            pos += 46 + name_len + u16_at(data, pos + 30) + u16_at(data, pos + 32);
+        }
+        Ok(ZipArchive { data, entries })
+    }
+
+    pub fn find(&self, name: &str) -> Option<&Entry> {
+        let name = name.trim_start_matches('/');
+        self.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn read(&self, name: &str) -> Option<Vec<u8>> {
+        let e = self.find(name)?;
+        let o = e.offset;
+        if self.data.get(o..o + 4) != Some(&[0x50, 0x4B, 0x03, 0x04]) {
+            return None;
+        }
+        let start = o + 30 + u16_at(self.data, o + 26) + u16_at(self.data, o + 28);
+        let raw = self.data.get(start..start.checked_add(e.packed)?)?;
+        match e.method {
+            0 => Some(raw.to_vec()),
+            8 => Some(inflate(raw).data),
+            _ => None,
+        }
+    }
+
+    /// Lee una entrada como texto UTF-8 (los XML de un .docx lo son; se tolera UTF-16 con BOM).
+    pub fn read_text(&self, name: &str) -> Option<String> {
+        let d = self.read(name)?;
+        Some(if d.starts_with(&[0xFF, 0xFE]) || d.starts_with(&[0xFE, 0xFF]) {
+            let be = d[0] == 0xFE;
+            let units: Vec<u16> = d[2..].chunks_exact(2).map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            let d = d.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(&d);
+            String::from_utf8_lossy(d).into_owned()
+        })
+    }
+}
