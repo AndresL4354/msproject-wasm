@@ -1,8 +1,12 @@
 //! Interfaz WebAssembly "a mano" (sin wasm-bindgen), con el mismo protocolo que mpp2xlsx:
 //!   1. `ptr = doc_alloc(n)` y copiar los bytes del documento en la memoria del modulo.
-//!   2. `estado = doc_convert(ptr, n, modo)`  (modo 0 = JSON, 1 = JSON completo).
+//!   2. `estado = doc_convert(ptr, n, modo)`  (modo 0 = JSON, 1 = JSON completo; sumando 4 se
+//!      extraen tambien las imagenes, y `modo | (lado_minimo << 8)` omite los bytes de las
+//!      imagenes mas chicas que eso).
 //!   3. Leer `doc_result_len()` bytes desde `doc_result_ptr()`:
-//!      con estado 0 es el JSON; con estado 1 es el mensaje de error, ambos en UTF-8.
+//!      con estado 0 es el JSON en UTF-8 o, con imagenes, `[largo del JSON: u32 LE][JSON][bytes de
+//!      las imagenes]` (cada imagen del JSON trae su `offset` y `length` en ese bloque final);
+//!      con estado 1 es el mensaje de error en UTF-8.
 //!   4. `doc_free(ptr, n)`.
 
 use std::alloc::{alloc, dealloc, Layout};
@@ -36,8 +40,21 @@ pub unsafe extern "C" fn doc_free(ptr: *mut u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn doc_convert(ptr: *const u8, len: usize, mode: u32) -> u32 {
     let input: &[u8] = if ptr.is_null() || len == 0 { &[] } else { std::slice::from_raw_parts(ptr, len) };
-    let (status, bytes) = match crate::to_json(input, mode != 0) {
-        Ok(s) => (0, s.into_bytes()),
+    let full = mode & 1 != 0;
+    let result = if mode & 4 != 0 {
+        crate::read_with_images(input).map(|doc| {
+            let (json, blob) = crate::doc::to_json_with_images(&doc, full, mode >> 8);
+            let mut out = Vec::with_capacity(4 + json.len() + blob.len());
+            out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            out.extend_from_slice(json.as_bytes());
+            out.extend_from_slice(&blob);
+            out
+        })
+    } else {
+        crate::to_json(input, full).map(String::into_bytes)
+    };
+    let (status, bytes) = match result {
+        Ok(b) => (0, b),
         Err(e) => (1, e.into_bytes()),
     };
     // WebAssembly aqui es de un solo hilo: no hay acceso concurrente a RESULT.

@@ -5,7 +5,7 @@ Dos herramientas independientes, escritas en **Rust sin ninguna dependencia**, q
 | Herramienta | Entrada | Salida | Ejecutable | WebAssembly |
 |---|---|---|---|---|
 | **mpp2xlsx** | Microsoft Project (`.mpp`) | Excel (`.xlsx`) con Gantt, y JSON | 569 KB | 339 KB (93 KB con brotli) |
-| **doc2json** | Word (`.docx`) y PDF | JSON con el contenido estructurado | 596 KB | 378 KB (120 KB con brotli) |
+| **doc2json** | Word (`.docx`) y PDF | JSON con el contenido estructurado, e imágenes | 506 KB | 421 KB (134 KB con brotli) |
 
 No necesitan Microsoft Project, Word, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
 
@@ -27,6 +27,10 @@ target\release\doc2json.exe informe.pdf
 
 ```bash
 target\release\doc2json.exe contrato.docx salida.json --full
+```
+
+```bash
+target\release\doc2json.exe informe.pdf --imagenes
 ```
 
 **En una página web:** copia a tu proyecto los archivos de `web/` y llama a los cargadores como se muestra en [Integración en una web](#integración-en-una-web-vercel--supabase). La conversión ocurre en el navegador; el archivo no se sube a ningún lado.
@@ -89,6 +93,7 @@ Los dos formatos salen con **la misma forma**, así una sola tabla en la base de
 | `pages` | Solo PDF: tamaño y texto de cada página. |
 | `outline` | Solo PDF: marcadores (tabla de contenidos) con su página. |
 | `headers`, `footers`, `footnotes`, `endnotes`, `comments` | Solo Word, cuando existen. |
+| `images` | Imágenes sin repetir: formato, tamaño en píxeles, texto alternativo y dónde se muestran (ver [Imágenes](#imágenes)). |
 | `warnings` | Avisos: páginas escaneadas sin texto, índice reconstruido, fuentes ilegibles. |
 
 Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de cada bloque, los tramos con formato (negrita, cursiva, enlaces) y, en PDF, cada línea con su posición y tamaño de letra.
@@ -114,6 +119,29 @@ Un PDF no guarda párrafos ni tablas: guarda letras sueltas con coordenadas. La 
 - Incluye el texto de **firmas digitales, sellos y campos de formulario**, que no está en el contenido de la página sino en anotaciones.
 - Abre PDF "protegidos" contra edición o copia (cifrado RC4 y AES-128 sin contraseña de apertura).
 - Si el índice interno del archivo está dañado, lo reconstruye recorriendo el archivo.
+
+### Imágenes
+
+`images` lista cada imagen **una vez**, aunque se muestre varias (un logo en cada página), con un `id` desde 1:
+
+```json
+{ "id": 3, "format": "png", "width": 1240, "height": 620, "alt": "Diagrama del circuito",
+  "places": [{ "page": 2, "x": 72, "y": 142, "w": 300, "h": 150 }] }
+```
+
+- **Word:** cada imagen sigue en `content` como bloque `image` en su lugar de lectura, ahora con `"image": <id>`; las que están dentro de una tabla (pictogramas, firmas) quedan citadas desde su celda, en `images`. `places` trae el tamaño con que se muestra (`w`, `h`, en puntos). Las de encabezados y pies figuran en la lista aunque esos bloques salgan como texto.
+- **PDF:** `places` dice en qué página y dónde se dibuja cada vez: `x`, `y` (esquina superior izquierda, medida desde la esquina superior izquierda de la página en su orientación de lectura, igual que `y` de las líneas), `w` y `h`, en puntos. `width` y `height` son los píxeles de la imagen.
+
+**Extraer los archivos:** `--imagenes[=carpeta]` en la consola (quedan como `imagen-<id>.<formato>`), `docToJson(archivo, { images: true })` en la web (cada imagen trae sus bytes en `data`, un `Uint8Array`, con `mime` y `size`; `minSide: 32` omite los bytes de iconos y líneas) y `doc2json::read_with_images` en Rust.
+
+| Origen | Se entrega como |
+|---|---|
+| Word | El archivo incrustado tal cual (PNG, JPEG, GIF, EMF, WMF, SVG…). |
+| PDF con JPEG (DCTDecode) o JPEG 2000 (JPXDecode) | El mismo JPEG o JPEG 2000, sin recomprimir. |
+| PDF con fax (CCITTFaxDecode) | TIFF de grupo 3 o 4 con los mismos datos. |
+| PDF con píxeles (Flate, LZW, RunLength o sin comprimir) | PNG: gris, RGB, CMYK (convertido a RGB), indexado con su paleta, tinta plana y máscaras de un bit, con transparencia si traen máscara suave del mismo tamaño (también la premezclada con `/Matte`). Si los datos ya son un PNG por dentro (Flate con predictor PNG), se copian sin recomprimir. |
+
+No se convierten, y figuran con `note`: JBIG2, espacios de color Lab o DeviceN de varias tintas, e imágenes de más de 25 millones de píxeles. Las imágenes incrustadas en el contenido de la página (`BI … EI`, poco comunes) se cuentan pero no se extraen.
 
 ---
 
@@ -350,7 +378,8 @@ node web/prueba.mjs
 - Las tablas de PDF se detectan por alineación del texto, no por sus líneas dibujadas. Una tabla con celdas de varias líneas puede salir partida en más filas.
 - No abre PDF con cifrado AES-256 ni los que piden contraseña para abrirse: da un mensaje claro.
 - Si un PDF usa fuentes sin tabla de caracteres, ese texto es ilegible para cualquier extractor (también al copiar y pegar desde un visor).
-- Las imágenes se cuentan y, en Word, se nombran; no se extraen.
+- En PDF las imágenes no se insertan en `content` (que se deduce del texto): se ubican con `places`.
+- Los PNG se comprimen con códigos Huffman fijos: una imagen sin compresión en el PDF puede quedar más pesada que con un compresor completo. Las fotografías suelen venir como JPEG, que se entrega tal cual.
 - En Word no se lee el texto de gráficos ni de diagramas SmartArt.
 - No lee `.doc` antiguos (Word 97-2003): da un mensaje pidiendo guardarlos como `.docx`.
 
@@ -376,6 +405,12 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - Descifrado probado con RC4 de 40 y 128 bits y AES-128, con y sin flujos de objetos: mismo texto que el original.
 - Páginas apaisadas y rotadas (90°, 180°, 270°) y texto a dos columnas: mismo orden de lectura que la referencia.
 
+**doc2json, imágenes** contra PyMuPDF y Pillow
+
+- 300 PDF reales con imágenes (8.812 imágenes): se extraen 8.807 (las otras 5 pasan de 25 millones de píxeles) y todas abren en Pillow con el tamaño declarado (3.520 JPEG, 5.162 PNG, 125 TIFF). De los PNG comparables con el mapa de píxeles de PyMuPDF, 3.336 de 3.338 difieren en a lo sumo 1 nivel por canal; los otros 2 usan perfiles ICC, que PyMuPDF aplica y aquí no.
+- Lugares: 54.044 contra 54.230 de PyMuPDF; en páginas sin girar, el 98,8 % coincide con su rectángulo con menos de 1,5 puntos de diferencia.
+- 200 Word reales (10.426 imágenes): los bytes extraídos son idénticos a los del archivo incrustado en todos los casos, y el 98,3 % queda citado desde un bloque o una celda (el resto está en encabezados y pies).
+
 **Resistencia**
 
 - 1.500 PDF (6.127 páginas) y 400 Word reales: ningún fallo ni cuelgue; 51 ms por archivo en promedio.
@@ -397,6 +432,7 @@ doc2json/src/           doc2json
   inflate.rs            descompresor DEFLATE / zlib
   zipread.rs  xml.rs    lector ZIP y lector XML
   docx.rs               lector de Word: estilos, numeración, tablas, notas
+  image.rs  png.rs      lista de imágenes, formato por cabecera y escritor PNG
   pdf/
     object.rs           objetos de PDF y su analizador
     document.rs         tabla de referencias, objetos, páginas, metadatos
@@ -406,10 +442,12 @@ doc2json/src/           doc2json
     font.rs             fuentes y tablas ToUnicode
     content.rs          intérprete del contenido de página
     layout.rs           de letras con coordenadas a líneas, párrafos y tablas
+    images.rs           imágenes de PDF: ubicación y conversión a PNG, JPEG o TIFF
   doc.rs                modelo común de documento y salida JSON
   symbols.rs            fuentes Symbol y Wingdings a Unicode
 doc2json/tests/
   ejemplo.rs            pruebas de punta a punta con los archivos de ejemplo/
+  imagenes.rs           imágenes de Word y PDF armados en la prueba
 web/
   mpp2xlsx.js  .d.ts  .wasm     módulo de Project
   doc2json.js  .d.ts  .wasm     módulo de documentos

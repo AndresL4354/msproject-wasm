@@ -10,10 +10,12 @@ pub mod document;
 pub mod encoding;
 pub mod filters;
 pub mod font;
+pub mod images;
 pub mod layout;
 pub mod object;
 
-use crate::doc::{Document, Line, Meta, OutlineItem, Page};
+use crate::doc::{Document, Image, Line, Meta, OutlineItem, Page, Place};
+use crate::image::ImageSet;
 use content::{FontCache, Interp};
 use document::{date_string, text_string, Pdf};
 use object::{Dict, Obj};
@@ -135,6 +137,11 @@ fn annotations(pdf: &Pdf, page: &document::PageInfo, interp: &mut Interp) {
 }
 
 pub fn read(bytes: &[u8]) -> Result<Document, String> {
+    read_opts(bytes, false)
+}
+
+/// Lee el PDF; con `extract` agrega los bytes de cada imagen (JPEG, JPEG 2000, TIFF o PNG).
+pub fn read_opts(bytes: &[u8], extract: bool) -> Result<Document, String> {
     let pdf = Pdf::open(bytes)?;
     let pages = pdf.pages();
     if pages.is_empty() {
@@ -163,13 +170,30 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
     let fonts = FontCache::default();
     let mut page_lines: Vec<Vec<layout::TLine>> = Vec::with_capacity(pages.len());
     let (mut empty_pages, mut unmapped, mut total_chars) = (Vec::new(), 0usize, 0usize);
+    let mut set = ImageSet::default();
+    let mut inline_images = 0usize;
     for (i, page) in pages.iter().enumerate() {
         let data = pdf.page_content(page);
         let mut interp = Interp::new(&pdf, &fonts);
         interp.run(&data, &page.resources, IDENTITY);
         annotations(&pdf, page, &mut interp);
-        let text = interp.out;
+        let mut text = interp.out;
         unmapped += text.unmapped;
+        inline_images += text.inline_images;
+        for (k, u) in std::mem::take(&mut text.uses).into_iter().enumerate() {
+            let (x, y, w, h) = images::place(u.ctm, page.bbox, page.rotate);
+            let place = Place { page: Some(i as u32 + 1), x: Some(x), y: Some(y), w, h };
+            // Un objeto sin numero (no deberia pasar con flujos) cuenta como imagen propia.
+            let key = match u.key {
+                Some((n, g)) => format!("{} {}", n, g),
+                None => format!("p{} {}", i + 1, k),
+            };
+            set.add(&key, Some(place), "", || {
+                let (format, note) = images::classify(&pdf, &u.dict);
+                let (width, height) = images::size(&pdf, &u.dict).map_or((None, None), |(w, h)| (Some(w), Some(h)));
+                Image { format, width, height, note, ..Image::default() }
+            });
+        }
         let (lines, width, height) = layout::lines(text.items, page.bbox, page.rotate);
         let lines = layout::reorder_columns(lines, width);
         let page_text = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
@@ -201,6 +225,25 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
     sizes.truncate(6);
     for (i, lines) in page_lines.iter().enumerate() {
         layout::blocks(lines, i as u32 + 1, body, &sizes, &mut doc.content);
+    }
+
+    doc.images = set.list;
+    if extract {
+        for (img, key) in doc.images.iter_mut().zip(&set.keys) {
+            let obj = key.split_once(' ').and_then(|(n, _)| n.parse::<u32>().ok()).map(|n| pdf.object(n));
+            match obj.map(|o| images::extract(&pdf, &o)) {
+                Some(Ok((format, data))) => {
+                    img.format = format;
+                    img.note = None;
+                    img.data = Some(data);
+                }
+                Some(Err(note)) => img.note = Some(note),
+                None => img.note = Some("No se pudo ubicar el objeto de la imagen.".into()),
+            }
+        }
+        if inline_images > 0 {
+            doc.warnings.push(format!("{} imagenes incrustadas en el contenido de las paginas (BI ... EI) no se extraen.", inline_images));
+        }
     }
 
     let page_index: HashMap<u32, u32> = pages.iter().enumerate().filter(|(_, p)| p.obj != 0).map(|(i, p)| (p.obj, i as u32 + 1)).collect();

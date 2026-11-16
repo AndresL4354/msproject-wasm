@@ -1,4 +1,7 @@
-//! Linea de comandos: `doc2json <archivo.docx|archivo.pdf> [salida.json] [--full]`
+//! Linea de comandos: `doc2json <archivo.docx|archivo.pdf> [salida.json] [--full] [--imagenes[=carpeta]]`
+//!
+//! Con `--imagenes` cada imagen queda como `imagen-<id>.<formato>` en la carpeta indicada (por
+//! defecto, `<documento>_imagenes` junto al documento); su `id` es el de la lista `images` del JSON.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,9 +11,12 @@ fn main() -> ExitCode {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut full = false;
+    let mut images: Option<Option<PathBuf>> = None;
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--full" => full = true,
+            "--imagenes" => images = Some(None),
+            _ if a.starts_with("--imagenes=") => images = Some(Some(PathBuf::from(&a["--imagenes=".len()..]))),
             "-h" | "--help" => return usage(),
             _ if input.is_none() => input = Some(PathBuf::from(a)),
             _ if output.is_none() => output = Some(PathBuf::from(a)),
@@ -25,7 +31,8 @@ fn main() -> ExitCode {
         Ok(b) => b,
         Err(e) => return fail(&format!("No se pudo leer {}: {}", input.display(), e)),
     };
-    let doc = match doc2json::read(&bytes) {
+    let read = if images.is_some() { doc2json::read_with_images } else { doc2json::read };
+    let doc = match read(&bytes) {
         Ok(d) => d,
         Err(e) => return fail(&e),
     };
@@ -33,6 +40,24 @@ fn main() -> ExitCode {
     let out = output.unwrap_or_else(|| input.with_extension("json"));
     if let Err(e) = std::fs::write(&out, doc2json::doc::to_json(&doc, full)) {
         return fail(&format!("No se pudo escribir {}: {}", out.display(), e));
+    }
+    if let Some(dir) = images {
+        let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let dir = dir.unwrap_or_else(|| input.with_file_name(format!("{}_imagenes", stem)));
+        let with_data: Vec<_> = doc.images.iter().filter(|i| i.data.is_some()).collect();
+        if !with_data.is_empty() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return fail(&format!("No se pudo crear {}: {}", dir.display(), e));
+            }
+        }
+        for img in &with_data {
+            let path = dir.join(format!("imagen-{:03}.{}", img.id, extension(img.format)));
+            if let Err(e) = std::fs::write(&path, img.data.as_deref().unwrap_or_default()) {
+                return fail(&format!("No se pudo escribir {}: {}", path.display(), e));
+            }
+        }
+        let skipped = doc.images.len() - with_data.len();
+        say(&format!("Imagenes: {} extraidas en {}{}.", with_data.len(), dir.display(), if skipped > 0 { format!(", {} sin extraer (ver `note` en el JSON)", skipped) } else { String::new() }));
     }
     let pages = doc.page_count.map_or(String::new(), |n| format!("{} paginas, ", n));
     say(&format!("Leido ({}): {}{} bloques de contenido.", doc.kind, pages, doc.content.len()));
@@ -43,13 +68,22 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn extension(format: &str) -> &str {
+    match format {
+        "jpeg" => "jpg",
+        "tiff" => "tif",
+        "desconocido" => "bin",
+        f => f,
+    }
+}
+
 /// Imprime sin abortar si la salida esta cerrada.
 fn say(msg: &str) {
     let _ = writeln!(std::io::stdout(), "{}", msg);
 }
 
 fn usage() -> ExitCode {
-    eprintln!("Uso: doc2json <archivo.docx|archivo.pdf> [salida.json] [--full]");
+    eprintln!("Uso: doc2json <archivo.docx|archivo.pdf> [salida.json] [--full] [--imagenes[=carpeta]]");
     ExitCode::from(2)
 }
 

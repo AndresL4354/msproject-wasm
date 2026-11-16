@@ -12,9 +12,11 @@
 
 pub mod doc;
 pub mod docx;
+pub mod image;
 pub mod inflate;
 pub mod json;
 pub mod pdf;
+pub mod png;
 pub mod symbols;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
@@ -52,6 +54,15 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
     match detect(bytes)? {
         Format::Docx => docx::read(bytes),
         Format::Pdf => pdf::read(bytes),
+    }
+}
+
+/// Lee un documento y extrae ademas sus imagenes: cada una de `Document::images` trae sus
+/// bytes en `data` (o el motivo por el que no, en `note`).
+pub fn read_with_images(bytes: &[u8]) -> Result<Document, String> {
+    match detect(bytes)? {
+        Format::Docx => docx::read_opts(bytes, true),
+        Format::Pdf => pdf::read_opts(bytes, true),
     }
 }
 
