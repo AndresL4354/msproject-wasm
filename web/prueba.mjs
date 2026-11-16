@@ -43,6 +43,17 @@ for (const nombre of ['procedimiento.docx', 'procedimiento.pdf']) {
   comprobar(`${nombre}: la salida completa trae mas datos`, (await doc.docToJsonText(bytes, { full: true })).length > texto.length);
 }
 
+{
+  // Limites de recursos: con pocos caracteres se entrega la primera parte con un aviso, y los
+  // limites de una llamada no quedan para la siguiente.
+  const bytes = await readFile(path.join(ejemplo, 'procedimiento.docx'));
+  const corto = await doc.docToJson(bytes, { limits: { maxChars: 100 } });
+  comprobar('limits.maxChars corta el texto y avisa', (corto.warnings || []).some((w) => /limite de 100 caracteres/.test(w)));
+  const completo = await doc.docToJson(bytes);
+  comprobar('los limites no quedan para la conversion siguiente', !completo.warnings && completo.content.length > corto.content.length);
+  comprobar('limits rechaza valores invalidos', /maxPages/.test(await mensajeDeError(doc.docToJson(bytes, { limits: { maxPages: 0 } }))));
+}
+
 comprobar('doc2json rechaza un archivo que no es documento', /no reconocido/.test(await mensajeDeError(doc.docToJson(new TextEncoder().encode('hola mundo')))));
 comprobar('doc2json rechaza un archivo vacio', /vac/.test(await mensajeDeError(doc.docToJson(new Uint8Array(0)))));
 comprobar('mpp2xlsx rechaza un archivo que no es .mpp', /no es un \.mpp/.test(await mensajeDeError(mpp.mppToXlsx(await readFile(path.join(ejemplo, 'procedimiento.pdf'))))));
