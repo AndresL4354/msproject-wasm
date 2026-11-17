@@ -422,3 +422,33 @@ fn ejemplos_sin_imagenes_no_cambian() {
         assert_eq!(doc2json::doc::to_json(&d, false), expected);
     }
 }
+
+#[test]
+fn pdf_fax_y_jbig2_con_tamanos_fuera_de_rango() {
+    // /Columns enormes: en wasm32, 2^31 columnas por 16 filas daba un arreglo de 0 bytes y la
+    // primera fila caia fuera; un valor de mas de 32 bits se truncaba. Ahora quedan con una nota.
+    // /Rows mayor que el alto de la imagen no hace decodificar filas de mas. El JBIG2 es un
+    // segmento de 11 bytes con largo 0xFFFFFFFE, que en wasm32 desbordaba.
+    let fax = |columns: &str, rows: &str| {
+        stream(&format!("/Subtype /Image /Width 8 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 {} {} >>", columns, rows), &[0xFF, 0xFF])
+    };
+    let bytes = pdf(&[
+        obj("<< /Type /Catalog /Pages 2 0 R >>"),
+        obj("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>"),
+        obj("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R /Im2 6 0 R /Im3 7 0 R /Im4 8 0 R >> >> >>"),
+        stream("", b"q 8 0 0 16 0 0 cm /Im1 Do Q q 8 0 0 16 20 0 cm /Im2 Do Q q 8 0 0 16 40 0 cm /Im3 Do Q q 8 0 0 8 60 0 cm /Im4 Do Q"),
+        fax("/Columns 2147483648", ""),
+        fax("/Columns 99999999999999", ""),
+        fax("", "/Rows 99999999999"),
+        stream("/Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode", &[0, 0, 0, 0, 48, 0, 1, 0xFF, 0xFF, 0xFF, 0xFE]),
+    ]);
+    let d = read_with_images(&bytes).unwrap();
+    for id in [1, 2] {
+        assert!(image(&d, id).data.is_none());
+        assert!(image(&d, id).note.as_deref().unwrap_or("").contains("demasiado grande"), "{:?}", image(&d, id).note);
+    }
+    let (w, h, _, _, _, _) = decode_png(image(&d, 3).data.as_deref().unwrap());
+    assert_eq!((w, h), (8, 16));
+    let (w, h, _, _, _, px) = decode_png(image(&d, 4).data.as_deref().unwrap());
+    assert_eq!((w, h, px), (8, 8, vec![0xFF; 8]));
+}

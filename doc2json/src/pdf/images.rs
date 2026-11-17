@@ -211,7 +211,7 @@ pub fn extract(pdf: &Pdf, obj: &Obj) -> Result<(&'static str, Vec<u8>, Option<St
         }
         match name.as_str() {
             "CCITTFaxDecode" | "CCF" => {
-                let (rows, decoded) = ccitt_samples(pdf, &data, w, h, raw.as_ref());
+                let (rows, decoded) = ccitt_samples(pdf, &data, w, h, raw.as_ref())?;
                 if decoded == 0 {
                     let tiff = ccitt_tiff(pdf, &data, w, h, raw.as_ref(), inverted(pdf, d));
                     return Ok(("tiff", tiff, Some("No se pudo decodificar el fax: se entrega tal cual, como TIFF.".into())));
@@ -259,19 +259,26 @@ fn pack(px: &[u8], w: usize, h: usize, invert: bool) -> Vec<u8> {
 }
 
 /// Fax decodificado como lo entrega el filtro de PDF (sin `BlackIs1`, 0 = negro), con filas del
-/// ancho de la imagen. Devuelve tambien cuantas filas se decodificaron.
-fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>) -> (Vec<u8>, usize) {
+/// ancho de la imagen. Devuelve tambien cuantas filas se decodificaron. Columnas o filas fuera de
+/// rango son un error.
+fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>) -> Result<(Vec<u8>, usize), String> {
     let get = |k: &str| parms.and_then(|p| pdf.get(p, k).as_i64());
     let on = |k: &str| parms.is_some_and(|p| flag(pdf, p, k));
-    let columns = get("Columns").filter(|&c| c > 0).unwrap_or(w as i64) as usize;
+    // Sin `as usize`: en wasm32 truncaria un valor enorme del archivo a uno chico cualquiera.
+    let size = |k: &str, default: u32| match get(k) {
+        Some(v) if v > 0 => usize::try_from(v).map_err(|_| format!("Fax con /{} fuera de rango ({}).", k, v)),
+        _ => Ok(default as usize),
+    };
+    let columns = size("Columns", w)?;
     let p = ccitt::Params {
         k: get("K").unwrap_or(0),
         columns,
-        rows: get("Rows").filter(|&r| r > 0).unwrap_or(h as i64) as usize,
+        // Mas filas que las de la imagen no se usan: no se decodifican.
+        rows: size("Rows", h)?.min(h as usize),
         byte_align: on("EncodedByteAlign"),
-        end_of_block: parms.is_none_or(|p| !matches!(&*pdf.get(p, "EndOfBlock"), Obj::Bool(false))),
+        end_of_block: !parms.is_some_and(|p| matches!(&*pdf.get(p, "EndOfBlock"), Obj::Bool(false))),
     };
-    let (rows, decoded) = ccitt::decode(data, &p, h as usize);
+    let (rows, decoded) = ccitt::decode(data, &p, h as usize)?;
     let black_is_1 = on("BlackIs1");
     let (w, h) = (w as usize, h as usize);
     let src_stride = columns.div_ceil(8);
@@ -291,7 +298,7 @@ fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>) -
     if !black_is_1 {
         out.iter_mut().for_each(|b| *b = !*b);
     }
-    (out, decoded)
+    Ok((out, decoded))
 }
 
 fn bits(pdf: &Pdf, d: &Dict) -> u8 {
