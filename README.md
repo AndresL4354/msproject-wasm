@@ -425,5 +425,6 @@ web/
 
 - **mpp2xlsx** (`src/`, `web/mpp2xlsx.*`): [LGPL-2.1-or-later](LICENSE).
 - **doc2json** (`doc2json/`, `web/doc2json.*`): [MIT](doc2json/LICENSE-MIT) o [Apache-2.0](doc2json/LICENSE-APACHE), a elección.
+- **`src/zip.rs`** (escritor ZIP y compresor DEFLATE): además de la LGPL, se ofrece bajo MIT o Apache-2.0, a elección, para que doc2json pueda reutilizarlo. Es código genérico que no proviene de MPXJ.
 
 Este proyecto no está afiliado a Microsoft ni cuenta con su respaldo. Microsoft Project, Word y Excel son marcas de Microsoft Corporation.
