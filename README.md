@@ -5,7 +5,7 @@ Dos herramientas independientes, escritas en **Rust sin ninguna dependencia**, q
 | Herramienta | Entrada | Salida | Ejecutable | WebAssembly |
 |---|---|---|---|---|
 | **mpp2xlsx** | Microsoft Project (`.mpp`) | Excel (`.xlsx`) con Gantt, y JSON | 569 KB | 339 KB (93 KB con brotli) |
-| **doc2json** | Word (`.docx`) y PDF | JSON con el contenido estructurado, e imágenes | 550 KB | 464 KB (146 KB con brotli) |
+| **doc2json** | Word (`.docx`) y PDF | JSON con el contenido estructurado, e imágenes | 554 KB | 470 KB (148 KB con brotli) |
 
 No necesitan Microsoft Project, Word, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
 
@@ -142,6 +142,15 @@ Un PDF no guarda párrafos ni tablas: guarda letras sueltas con coordenadas. La 
 | PDF con píxeles (Flate, LZW, RunLength o sin comprimir) | PNG: gris, RGB, CMYK (convertido a RGB), indexado con su paleta, tinta plana y máscaras de un bit, con transparencia si traen máscara suave del mismo tamaño (también la premezclada con `/Matte`). Si los datos ya son un PNG por dentro (Flate con predictor PNG), se copian sin recomprimir. |
 
 No se convierten, y figuran con `note`: JBIG2 con codificación Huffman, semitonos, regiones intermedias, plantilla extendida (`EXTTEMPLATE`) o diccionarios que reutilizan los contextos de otro (no aparecieron en más de mil imágenes JBIG2 reales), fax o JBIG2 cuyos tamaños declarados pasan los topes, espacios de color Lab o DeviceN de varias tintas, e imágenes de más de 25 millones de píxeles (100 millones si son de un bit, como los escaneos). Las imágenes incrustadas en el contenido de la página (`BI … EI`, poco comunes) se cuentan pero no se extraen.
+
+**Topes y archivos dañados.** La memoria que pide una imagen depende de los datos que trae, no del tamaño que declara:
+
+- Si a los datos de una imagen de PDF les falta más de la mitad de lo que su tamaño exige, no se extrae (`note`: datos incompletos); si falta menos (un escaneo cortado), se completa con ceros. Una máscara suave sin datos suficientes se ignora.
+- Los datos con predictor PNG se copian sin recomprimir solo si un lector estricto los aceptaría (zlib con su suma Adler-32, filas completas, filtros 0 a 4); si no, se decodifican y se vuelven a comprimir. Las paletas se completan en negro hasta cubrir todos los índices posibles.
+- Por documento: a lo sumo 10.000 imágenes distintas en `images`, 100.000 lugares entre todas y 128 MB extraídos (`doc2json::read_with_image_budget` en Rust acepta otro tope). Lo que pasa de ahí queda fuera o con `note`, y con un aviso en `warnings`.
+- La misma imagen se reconoce aunque la citen de otra forma: en PDF por el número de objeto (sin la generación, que no cambia lo que se lee); en Word por la ruta de la parte sin distinguir mayúsculas. Las imágenes vinculadas (`TargetMode="External"`) no se leen del paquete aunque su destino se parezca a una parte de él.
+
+**Protocolo del `.wasm`.** `doc_convert(ptr, n, modo)`: el byte bajo de `modo` es la operación y los bits 8 a 31 su parámetro, un reparto común a todas las salidas: 0 JSON, 1 JSON completo, 2 Markdown, 3 fragmentos (parámetro: tamaño máximo en caracteres), 4 JSON con imágenes y 5 JSON completo con imágenes (parámetro: lado mínimo). Este módulo implementa 0, 1, 4 y 5; cualquier otra operación da el error «Modo de conversion desconocido.».
 
 ---
 
@@ -417,6 +426,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - 1.500 PDF (6.127 páginas) y 400 Word reales: ningún fallo ni cuelgue; 51 ms por archivo en promedio.
 - 460 archivos dañados a propósito (truncados, con bytes alterados, con tramos borrados): todos terminan en lectura parcial o en un error claro.
 - Fax y JBIG2: la memoria se reserva según los tamaños declarados en el archivo, así que se acotan antes (fax: hasta 2²⁰ columnas y 200 millones de píxeles; JBIG2: hasta 2²⁰ símbolos, y un presupuesto de píxeles y de cálculo proporcional al tamaño de la página). Las cuentas con datos del archivo se hacen en 64 bits o con tope, para que en wasm32 no desborden. Las pruebas incluyen cabeceras armadas para cada caso y miles de flujos alterados al azar, sin fallos y en menos de 2 s cada uno.
+- Imágenes fabricadas para agotar la memoria (un diccionario de 1 MB dibujado 400 veces, 5.000 × 5.000 píxeles declarados con 150 bytes, máscaras y paletas cortas, PNG por dentro con filtros o sumas inválidas, la misma imagen citada con otra generación o con otras mayúsculas): `tests/imagenes_memoria.rs` mide la memoria con un asignador que cuenta, y `tests/imagenes.rs` el resultado.
 - En todas las herramientas, el archivo generado en el navegador es idéntico byte a byte al del ejecutable.
 
 Los scripts de comparación y los archivos con que se hizo esta validación no forman parte de este repositorio.
