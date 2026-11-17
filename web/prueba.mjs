@@ -48,6 +48,13 @@ for (const nombre of ['procedimiento.docx', 'procedimiento.pdf']) {
 }
 
 comprobar('docToChunks rechaza un tamano fuera de rango', /maxChars/.test(await mensajeDeError(doc.docToChunks(new Uint8Array(4), { maxChars: -1 }))));
+for (const malo of ['abc', NaN, 1.5, 0, '2000', 0x1000000]) {
+  comprobar(`docToChunks rechaza maxChars ${String(malo)}`, /maxChars/.test(await mensajeDeError(doc.docToChunks(new Uint8Array(4), { maxChars: malo }))));
+}
+{
+  const html = await doc.docToMarkdown(await readFile(path.join(ejemplo, 'procedimiento.docx')));
+  comprobar('docToMarkdown no deja etiquetas HTML del texto', !/<(?!br>|!-- pagina)/.test(html));
+}
 
 comprobar('doc2json rechaza un archivo que no es documento', /no reconocido/.test(await mensajeDeError(doc.docToJson(new TextEncoder().encode('hola mundo')))));
 comprobar('doc2json rechaza un archivo vacio', /vac/.test(await mensajeDeError(doc.docToJson(new Uint8Array(0)))));

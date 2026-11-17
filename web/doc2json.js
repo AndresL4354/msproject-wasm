@@ -72,9 +72,17 @@ export async function docToJson(archivo, opciones) {
   return JSON.parse(await docToJsonText(archivo, opciones));
 }
 
-/** Convierte un .docx o un .pdf en Markdown: titulos, listas, tablas GFM y notas al pie. */
+// Operaciones de doc_convert (byte bajo del modo; el parametro va en los bits 8 a 31):
+// 0 JSON, 1 JSON completo, 2 Markdown, 3 fragmentos (tamano maximo), 4 y 5 JSON con imagenes.
+const MARKDOWN = 2;
+const FRAGMENTOS = 3;
+
+/**
+ * Convierte un .docx o un .pdf en Markdown: titulos, listas, tablas GFM y notas al pie. El texto
+ * del documento va escapado (no trae HTML ni enlaces que no sean http, https o mailto).
+ */
 export function docToMarkdown(archivo) {
-  return convertir(archivo, 2);
+  return convertir(archivo, MARKDOWN);
 }
 
 /**
@@ -82,7 +90,10 @@ export function docToMarkdown(archivo) {
  * la ruta de titulos de su seccion y las paginas que cubren. Listo para indexar o enviar a un modelo.
  */
 export async function docToChunks(archivo, opciones) {
-  const n = Math.floor((opciones && opciones.maxChars) || 0);
-  if (n < 0 || n > 0xffffff) throw new RangeError('maxChars debe estar entre 1 y 16777215.');
-  return JSON.parse(await convertir(archivo, 3 + n * 256));
+  const valor = opciones == null ? undefined : opciones.maxChars;
+  if (valor !== undefined && !(Number.isInteger(valor) && valor >= 1 && valor <= 0xffffff)) {
+    throw new RangeError('maxChars debe ser un entero entre 1 y 16777215.');
+  }
+  // 0 = tamano por defecto. El modo cabe en 32 bits sin signo; WebAssembly lo recibe igual.
+  return JSON.parse(await convertir(archivo, FRAGMENTOS + (valor || 0) * 256));
 }

@@ -1,7 +1,20 @@
 //! Interfaz WebAssembly "a mano" (sin wasm-bindgen), con el mismo protocolo que mpp2xlsx:
 //!   1. `ptr = doc_alloc(n)` y copiar los bytes del documento en la memoria del modulo.
-//!   2. `estado = doc_convert(ptr, n, modo)`: modo 0 = JSON, 1 = JSON completo, 2 = Markdown,
-//!      3 = fragmentos en JSON (el tamano maximo en caracteres va en los bits altos: `3 | (n << 8)`).
+//!   2. `estado = doc_convert(ptr, n, modo)`. El byte bajo de `modo` es la operacion y los bits
+//!      8 a 31 su parametro (`operacion | (parametro << 8)`):
+//!
+//!      | operacion | salida                     | parametro                               |
+//!      |-----------|----------------------------|-----------------------------------------|
+//!      | 0         | JSON                       | -                                       |
+//!      | 1         | JSON completo              | -                                       |
+//!      | 2         | Markdown                   | -                                       |
+//!      | 3         | fragmentos en JSON         | tamano maximo en caracteres (0 = 2000)  |
+//!      | 4         | JSON con imagenes          | lado minimo de las imagenes             |
+//!      | 5         | JSON completo con imagenes | lado minimo de las imagenes             |
+//!
+//!      Este modulo implementa 0 a 3; 4 y 5 quedan reservadas para la extraccion de imagenes.
+//!      Una operacion que el modulo no conoce da error ("Modo de conversion desconocido."), nunca
+//!      otra salida.
 //!   3. Leer `doc_result_len()` bytes desde `doc_result_ptr()`:
 //!      con estado 0 es el JSON; con estado 1 es el mensaje de error, ambos en UTF-8.
 //!   4. `doc_free(ptr, n)`.
@@ -42,6 +55,7 @@ pub unsafe extern "C" fn doc_convert(ptr: *const u8, len: usize, mode: u32) -> u
         1 => crate::to_json(input, true),
         2 => crate::to_markdown(input),
         3 => crate::to_chunks_json(input, (mode >> 8) as usize),
+        // 4 y 5 (imagenes) y cualquier otra: no se adivina otra salida.
         _ => Err("Modo de conversion desconocido.".to_string()),
     };
     let (status, bytes) = match result {

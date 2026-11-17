@@ -21,12 +21,16 @@ export declare function docToJson(file: FileInput, options?: JsonOptions): Promi
 /**
  * Convierte un .docx o un .pdf en Markdown: titulos con `#`, listas con su numeracion, tablas GFM,
  * notas al pie como `[^1]` y, en Word, negrita, cursiva y enlaces. En PDF cada pagina empieza con
- * `<!-- pagina N -->`.
+ * `<!-- pagina N -->`. El texto del documento va escapado: no trae etiquetas HTML ni enlaces, y los
+ * enlaces de Word solo salen si son `http`, `https` o `mailto`.
  */
 export declare function docToMarkdown(file: FileInput): Promise<string>;
 
 export interface ChunkOptions {
-  /** Tamano maximo de cada fragmento, en caracteres. Por defecto 2000 (unos 500 tokens en castellano); minimo 200. */
+  /**
+   * Tamano maximo de cada fragmento, en caracteres: un entero de 1 a 16777215 (otro valor da
+   * `RangeError`). Por defecto 2000 (unos 500 tokens en castellano); los menores que 200 se toman como 200.
+   */
   maxChars?: number;
 }
 
