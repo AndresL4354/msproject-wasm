@@ -58,11 +58,18 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
 }
 
 /// Lee un documento y extrae ademas sus imagenes: cada una de `Document::images` trae sus
-/// bytes en `data` (o el motivo por el que no, en `note`).
+/// bytes en `data` (o el motivo por el que no, en `note`). Entre todas suman a lo sumo
+/// `image::MAX_EXTRACTED` bytes (128 MB); las que no caben quedan con una nota y un aviso.
 pub fn read_with_images(bytes: &[u8]) -> Result<Document, String> {
+    read_with_image_budget(bytes, image::MAX_EXTRACTED)
+}
+
+/// Como `read_with_images`, con otro tope de bytes entre todas las imagenes (por ejemplo, uno
+/// menor donde hay poca memoria).
+pub fn read_with_image_budget(bytes: &[u8], max_bytes: usize) -> Result<Document, String> {
     match detect(bytes)? {
-        Format::Docx => docx::read_opts(bytes, true),
-        Format::Pdf => pdf::read_opts(bytes, true),
+        Format::Docx => docx::read_opts(bytes, Some(max_bytes)),
+        Format::Pdf => pdf::read_opts(bytes, Some(max_bytes)),
     }
 }
 

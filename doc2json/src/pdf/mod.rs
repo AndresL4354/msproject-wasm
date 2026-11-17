@@ -15,11 +15,12 @@ pub mod layout;
 pub mod object;
 
 use crate::doc::{Document, Image, Line, Meta, OutlineItem, Page, Place};
-use crate::image::ImageSet;
+use crate::image::{Budget, ImageSet};
 use content::{FontCache, Interp};
 use document::{date_string, text_string, Pdf};
 use object::{Dict, Obj};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 const IDENTITY: content::Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
@@ -137,11 +138,12 @@ fn annotations(pdf: &Pdf, page: &document::PageInfo, interp: &mut Interp) {
 }
 
 pub fn read(bytes: &[u8]) -> Result<Document, String> {
-    read_opts(bytes, false)
+    read_opts(bytes, None)
 }
 
-/// Lee el PDF; con `extract` agrega los bytes de cada imagen (JPEG, JPEG 2000, TIFF o PNG).
-pub fn read_opts(bytes: &[u8], extract: bool) -> Result<Document, String> {
+/// Lee el PDF; con `extract` (tope de bytes entre todas las imagenes) agrega los bytes de cada
+/// imagen (JPEG, JPEG 2000, TIFF o PNG).
+pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, String> {
     let pdf = Pdf::open(bytes)?;
     let pages = pdf.pages();
     if pages.is_empty() {
@@ -171,6 +173,8 @@ pub fn read_opts(bytes: &[u8], extract: bool) -> Result<Document, String> {
     let mut page_lines: Vec<Vec<layout::TLine>> = Vec::with_capacity(pages.len());
     let (mut empty_pages, mut unmapped, mut total_chars) = (Vec::new(), 0usize, 0usize);
     let mut set = ImageSet::default();
+    // El objeto de cada imagen de `set.list`, en el mismo orden (compartido con el cache del PDF).
+    let mut objs: Vec<Rc<Obj>> = Vec::new();
     let mut inline_images = 0usize;
     for (i, page) in pages.iter().enumerate() {
         let data = pdf.page_content(page);
@@ -185,14 +189,22 @@ pub fn read_opts(bytes: &[u8], extract: bool) -> Result<Document, String> {
             let place = Place { page: Some(i as u32 + 1), x: Some(x), y: Some(y), w, h };
             // Un objeto sin numero (no deberia pasar con flujos) cuenta como imagen propia.
             let key = match u.key {
-                Some((n, g)) => format!("{} {}", n, g),
+                Some(n) => n.to_string(),
                 None => format!("p{} {}", i + 1, k),
             };
+            let dict = match u.obj.as_dict() {
+                Some(d) => d,
+                None => continue,
+            };
+            let before = set.list.len();
             set.add(&key, Some(place), "", || {
-                let (format, note) = images::classify(&pdf, &u.dict);
-                let (width, height) = images::size(&pdf, &u.dict).map_or((None, None), |(w, h)| (Some(w), Some(h)));
+                let (format, note) = images::classify(&pdf, dict);
+                let (width, height) = images::size(&pdf, dict).map_or((None, None), |(w, h)| (Some(w), Some(h)));
                 Image { format, width, height, note, ..Image::default() }
             });
+            if set.list.len() > before {
+                objs.push(u.obj.clone());
+            }
         }
         let (lines, width, height) = layout::lines(text.items, page.bbox, page.rotate);
         let lines = layout::reorder_columns(lines, width);
@@ -227,20 +239,25 @@ pub fn read_opts(bytes: &[u8], extract: bool) -> Result<Document, String> {
         layout::blocks(lines, i as u32 + 1, body, &sizes, &mut doc.content);
     }
 
+    doc.warnings.extend(set.warnings());
     doc.images = set.list;
-    if extract {
-        for (img, key) in doc.images.iter_mut().zip(&set.keys) {
-            let obj = key.split_once(' ').and_then(|(n, _)| n.parse::<u32>().ok()).map(|n| pdf.object(n));
-            match obj.map(|o| images::extract(&pdf, &o)) {
-                Some(Ok((format, data))) => {
+    if let Some(limit) = extract {
+        let mut budget = Budget::new(limit);
+        for (img, obj) in doc.images.iter_mut().zip(&objs) {
+            if budget.exhausted() {
+                budget.skip(img);
+                continue;
+            }
+            match images::extract(&pdf, obj) {
+                Ok((format, data)) => {
                     img.format = format;
                     img.note = None;
-                    img.data = Some(data);
+                    budget.store(img, data);
                 }
-                Some(Err(note)) => img.note = Some(note),
-                None => img.note = Some("No se pudo ubicar el objeto de la imagen.".into()),
+                Err(note) => img.note = Some(note),
             }
         }
+        doc.warnings.extend(budget.warning());
         if inline_images > 0 {
             doc.warnings.push(format!("{} imagenes incrustadas en el contenido de las paginas (BI ... EI) no se extraen.", inline_images));
         }
