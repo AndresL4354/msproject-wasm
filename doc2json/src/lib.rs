@@ -79,16 +79,29 @@ pub fn read_with_limits(bytes: &[u8], limits: budget::Limits) -> Result<Document
     Ok(d)
 }
 
-/// Deja como maximo `max` caracteres de texto: primero el contenido y despues las partes
-/// secundarias (encabezados, pies, notas, comentarios), en ese orden. Las paginas de un PDF
-/// repiten el texto del contenido, asi que se cuentan aparte, con su propio maximo. Devuelve si
-/// se descarto algo.
+/// Deja como maximo `max` caracteres de texto: primero el contenido, despues las partes
+/// secundarias (encabezados, pies, notas, comentarios) y al final los metadatos de texto y los
+/// marcadores del PDF, en ese orden. En los bloques cuentan tambien el texto alternativo de las
+/// imagenes y la etiqueta de notas y comentarios (numero o autor). Las paginas de un PDF repiten
+/// el texto del contenido, asi que se cuentan aparte, con su propio maximo. Devuelve si se
+/// descarto algo.
 fn limit_text(d: &mut Document, max: usize) -> bool {
     let mut left = max;
     let mut cut = limit_blocks(&mut d.content, &mut left);
     for (_, blocks) in d.extras.iter_mut() {
         cut |= limit_blocks(blocks, &mut left);
     }
+    for (_, m) in d.meta.iter_mut() {
+        if let doc::Meta::Text(s) = m {
+            cut |= limit_str(s, &mut left);
+        }
+    }
+    // Los metadatos y marcadores vacios no existian: son los que no cupieron.
+    d.meta.retain(|(_, m)| !matches!(m, doc::Meta::Text(s) if s.is_empty()));
+    for o in d.outline.iter_mut() {
+        cut |= limit_str(&mut o.title, &mut left);
+    }
+    d.outline.retain(|o| !o.title.is_empty());
     let mut left = max;
     for p in d.pages.iter_mut() {
         let n = p.text.chars().count();
@@ -102,19 +115,42 @@ fn limit_text(d: &mut Document, max: usize) -> bool {
     cut
 }
 
-/// Deja en `blocks` como maximo `left` caracteres (contados como en el texto plano, con la
-/// numeracion delante) y descuenta lo que queda. El bloque que cruza el limite se corta por
-/// dentro (el texto, o las filas de una tabla) y los siguientes se descartan.
+/// Deja en `s` lo que quepa en `left` caracteres y lo descuenta. Devuelve si se descarto algo.
+fn limit_str(s: &mut String, left: &mut usize) -> bool {
+    let n = s.chars().count();
+    if n <= *left {
+        *left -= n;
+        return false;
+    }
+    *s = s.chars().take(*left).collect();
+    *left = 0;
+    true
+}
+
+/// Caracteres de un bloque: su texto plano (con la numeracion delante), o el texto alternativo
+/// si es una imagen, mas su etiqueta (numero de la nota o autor del comentario).
+fn block_chars(b: &doc::Block) -> usize {
+    let text = if b.kind == doc::Kind::Image { b.text.chars().count() } else { doc::block_text(b).chars().count() };
+    text + b.label.as_deref().map_or(0, |l| l.chars().count())
+}
+
+/// Deja en `blocks` como maximo `left` caracteres (contados con `block_chars`) y descuenta lo
+/// que queda. El bloque que cruza el limite se corta por dentro (la etiqueta, el texto o las
+/// filas de una tabla) y los siguientes se descartan.
 fn limit_blocks(blocks: &mut Vec<doc::Block>, left: &mut usize) -> bool {
     for i in 0..blocks.len() {
-        let n = doc::block_text(&blocks[i]).chars().count();
+        let n = block_chars(&blocks[i]);
         if n <= *left {
             *left -= n;
             continue;
         }
-        let room = std::mem::take(left);
+        let mut room = std::mem::take(left);
         blocks.truncate(i + 1);
         let b = &mut blocks[i];
+        // La etiqueta (el autor de un comentario) va antes que el texto.
+        if let Some(l) = b.label.as_mut() {
+            limit_str(l, &mut room);
+        }
         let keep = if b.kind == doc::Kind::Table {
             let mut used = 0usize;
             let n = b.rows.iter().take_while(|r| {
@@ -129,7 +165,8 @@ fn limit_blocks(blocks: &mut Vec<doc::Block>, left: &mut usize) -> bool {
             let marker = b.marker.as_deref().filter(|m| !m.is_empty()).map_or(0, |m| m.chars().count() + 1);
             b.text = b.text.chars().take(room.saturating_sub(marker)).collect();
             b.runs.clear();
-            !b.text.is_empty()
+            // Una imagen queda aunque su texto alternativo no quepa: ella misma no es texto.
+            b.kind == doc::Kind::Image || !b.text.is_empty()
         };
         if !keep {
             blocks.pop();

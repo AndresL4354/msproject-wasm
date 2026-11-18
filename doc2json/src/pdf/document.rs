@@ -562,11 +562,18 @@ impl<'a> Pdf<'a> {
             }
             p
         };
-        let mut data = raw.to_vec();
-        for (i, name) in names.iter().enumerate() {
-            data = filters::apply(name, &data, &parms_at(i))?;
-        }
-        Some(data)
+        // Los parametros se resuelven antes: resolverlos puede abrir otros flujos (de objetos).
+        let parms: Vec<Parms> = (0..names.len()).map(parms_at).collect();
+        // Un flujo se cuenta una sola vez en el presupuesto de la lectura aunque se descomprima
+        // varias (un formulario dibujado en cada pagina, un contenido compartido): se identifica
+        // por la posicion de sus datos en el archivo.
+        crate::budget::once(start, || {
+            let mut data = raw.to_vec();
+            for (name, p) in names.iter().zip(&parms) {
+                data = filters::apply(name, &data, p)?;
+            }
+            Some(data)
+        })
     }
 
     pub fn is_encrypted(&self) -> bool {

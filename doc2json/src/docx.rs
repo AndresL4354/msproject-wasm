@@ -828,8 +828,13 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     }
     let first = |k: &str, default: &str| parts.get(k).and_then(|v| v.first().cloned()).unwrap_or_else(|| resolve(&dir, default));
     // El cuerpo se descomprime antes que estilos y numeracion: si un archivo agota el presupuesto
-    // de descompresion (`budget`) en esas partes, el texto ya esta leido.
-    let src = zip.read_text(&main).ok_or("No se pudo leer el contenido del documento.")?;
+    // de descompresion (`budget`) en esas partes, el texto ya esta leido. Y al reves: el cuerpo se
+    // lee con una octava parte del presupuesto apartada para ellas, asi un cuerpo que lo agota no
+    // las deja sin nada y la parte leida conserva titulos y listas.
+    crate::budget::reserve(crate::budget::limits().max_decompressed / 8);
+    let src = zip.read_text(&main);
+    crate::budget::release();
+    let src = src.ok_or("No se pudo leer el contenido del documento.")?;
     r.load_styles(&first("styles", "styles.xml"));
     r.load_numbering(&first("numbering", "numbering.xml"));
     let mut doc = Document { kind: "docx", ..Document::default() };

@@ -322,16 +322,26 @@ fn docx_con_notas(nota: usize, comentario: usize) -> Vec<u8> {
     zip_varias(&[parte("word/document.xml", &cuerpo("Cuerpo corto")), parte("word/footnotes.xml", &notas), parte("word/comments.xml", &comentarios)])
 }
 
+/// Caracteres de todo el texto de un documento: bloques (con el texto alternativo de las imagenes
+/// y la etiqueta de notas y comentarios), metadatos de texto y marcadores.
 fn caracteres(d: &doc2json::Document) -> usize {
     let bloques = d.content.iter().chain(d.extras.iter().flat_map(|(_, b)| b.iter()));
-    bloques.map(|b| doc2json::doc::block_text(b).chars().count()).sum()
+    let bloques: usize = bloques
+        .map(|b| {
+            let texto = if b.kind == doc2json::doc::Kind::Image { b.text.chars().count() } else { doc2json::doc::block_text(b).chars().count() };
+            texto + b.label.as_deref().map_or(0, |l| l.chars().count())
+        })
+        .sum();
+    let meta: usize = d.meta.iter().map(|(_, m)| if let doc2json::doc::Meta::Text(s) = m { s.chars().count() } else { 0 }).sum();
+    bloques + meta + d.outline.iter().map(|o| o.title.chars().count()).sum::<usize>()
 }
 
 #[test]
 fn el_limite_de_texto_cuenta_notas_y_comentarios() {
     let archivo = docx_con_notas(5_000, 5_000);
     let completo = doc2json::read(&archivo).unwrap();
-    assert_eq!(caracteres(&completo), 12 + 5_000 + 5_000);
+    // Las etiquetas cuentan: el numero de la nota ("1") y el autor del comentario ("Ana").
+    assert_eq!(caracteres(&completo), 12 + 1 + 5_000 + 3 + 5_000);
     let d = doc2json::read_with_limits(&archivo, Limits { max_chars: 1_000, ..Limits::default() }).unwrap();
     assert_eq!(caracteres(&d), 1_000);
     assert_eq!(d.content[0].text, "Cuerpo corto");
@@ -594,4 +604,125 @@ fn los_flujos_de_objetos_cuentan_en_el_presupuesto() {
     assert!(avisa(&d, 4), "{:?}", d.warnings);
     // El relleno va al final del flujo: los objetos se leen igual.
     assert_eq!(textos(&d), ["Hola mundo"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flujos repetidos, reserva para estilos y numeracion, y texto fuera de los bloques
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn un_formulario_repetido_en_muchas_paginas_se_cuenta_una_vez() {
+    // Un membrete (formulario) de ~1 MB descomprimido que se dibuja en las 12 paginas: se cuenta
+    // una sola vez, asi que 3 MB alcanzan y todas las paginas lo traen, como sin limites.
+    let membrete = flujo(
+        "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Filter /FlateDecode",
+        &zlib_bomba(1_000_000),
+    );
+    let paginas = 12;
+    let kids: Vec<String> = (0..paginas).map(|i| format!("{} 0 R", 6 + i)).collect();
+    let mut objs: Vec<(usize, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), paginas).into_bytes()),
+        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (4, membrete),
+        (5, flujo("", b"/Membrete Do")),
+    ];
+    for i in 0..paginas {
+        let pagina = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Membrete 4 0 R >> >> /Contents 5 0 R >>";
+        objs.push((6 + i, pagina.as_bytes().to_vec()));
+    }
+    let archivo = ensamblar(&objs, true);
+    let d = doc2json::read_with_limits(&archivo, limites(3)).unwrap();
+    assert!(!avisa(&d, 3), "{:?}", d.warnings);
+    assert_eq!(textos(&d), vec!["Hola mundo"; paginas]);
+    // Un formulario que por si solo pasa el presupuesto se sigue cortando, con su aviso, y cada
+    // repeticion entrega lo mismo que la primera vez (lo que cupo) sin descontar de nuevo.
+    let d = doc2json::read_with_limits(&archivo, Limits { max_decompressed: 500_000, ..Limits::default() }).unwrap();
+    assert!(d.warnings.iter().any(|w| w.contains("limite de datos descomprimidos")), "{:?}", d.warnings);
+    assert_eq!(textos(&d), vec!["Hola mundo"; paginas]);
+}
+
+/// Estilos (T1 = "heading 1") y numeracion (lista 1, "1.") de un .docx, comprimidos.
+fn estilos_y_numeracion() -> Vec<(&'static str, Vec<u8>, usize)> {
+    let estilos = format!(
+        "<?xml version=\"1.0\"?><w:styles {}><w:style w:styleId=\"T1\"><w:name w:val=\"heading 1\"/></w:style></w:styles>",
+        W
+    );
+    let numeracion = format!(
+        "<?xml version=\"1.0\"?><w:numbering {}><w:abstractNum w:abstractNumId=\"0\"><w:lvl w:ilvl=\"0\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%1.\"/></w:lvl></w:abstractNum><w:num w:numId=\"1\"><w:abstractNumId w:val=\"0\"/></w:num></w:numbering>",
+        W
+    );
+    vec![parte("word/styles.xml", &estilos), parte("word/numbering.xml", &numeracion)]
+}
+
+#[test]
+fn un_cuerpo_que_agota_el_presupuesto_deja_estilos_y_numeracion() {
+    // Un titulo y un item de lista, y despues un parrafo de 40 MB: con 8 MB el cuerpo se corta,
+    // pero estilos y numeracion tienen su parte reservada y la parte leida conserva su forma.
+    let pre = format!(
+        "<?xml version=\"1.0\"?><w:document {}><w:body><w:p><w:pPr><w:pStyle w:val=\"T1\"/></w:pPr><w:r><w:t>Titulo</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr><w:r><w:t>Uno</w:t></w:r></w:p><w:p><w:r><w:t>",
+        W
+    );
+    let suf = b"</w:t></w:r></w:p></w:body></w:document>";
+    let mut entradas = vec![("word/document.xml", deflate(pre.as_bytes(), b'a', 40_000_000, suf), pre.len() + 40_000_000 + suf.len())];
+    entradas.extend(estilos_y_numeracion());
+    let archivo = zip_varias(&entradas);
+    let d = doc2json::read_with_limits(&archivo, limites(8)).unwrap();
+    assert!(d.warnings.iter().any(|w| w.contains("limite de datos descomprimidos (8 MB)")), "{:?}", d.warnings);
+    assert_eq!((d.content[0].kind, d.content[0].level, d.content[0].text.as_str()), (doc2json::doc::Kind::Heading, 1, "Titulo"));
+    assert_eq!((d.content[1].kind, d.content[1].marker.as_deref()), (doc2json::doc::Kind::ListItem, Some("1.")));
+    // El parrafo largo llega hasta donde empieza la reserva.
+    assert!(d.content.len() == 3 && d.content[2].text.len() > 4 << 20, "{}", d.content.len());
+}
+
+#[test]
+fn el_limite_de_texto_cuenta_texto_alternativo_autores_y_metadatos() {
+    let largo = "x".repeat(5_000);
+    let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"r\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/imagen.png\"/></Relationships>";
+    let imagen = format!(
+        "<?xml version=\"1.0\"?><w:document {} xmlns:wp=\"wp\" xmlns:a=\"a\" xmlns:r=\"r\"><w:body><w:p><w:r><w:t>Cuerpo corto</w:t></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id=\"1\" name=\"Imagen\" descr=\"{}\"/><a:graphic><a:blip r:embed=\"rId1\"/></a:graphic></wp:inline></w:drawing></w:r></w:p></w:body></w:document>",
+        W, largo
+    );
+    let comentario = format!(
+        "<?xml version=\"1.0\"?><w:comments {}><w:comment w:id=\"0\" w:author=\"{}\"><w:p><w:r><w:t>hola</w:t></w:r></w:p></w:comment></w:comments>",
+        W, largo
+    );
+    let core = format!("<?xml version=\"1.0\"?><cp:coreProperties xmlns:cp=\"cp\" xmlns:dc=\"dc\"><dc:title>{}</dc:title></cp:coreProperties>", largo);
+    // (caso, archivo, caracteres que quedan con un limite de 1.000). La imagen queda con su texto
+    // alternativo cortado; el comentario cuyo autor no cabe se descarta entero (sin texto).
+    let casos: Vec<(&str, Vec<u8>, usize)> = vec![
+        ("texto alternativo", zip_varias(&[parte("word/document.xml", &imagen), parte("word/_rels/document.xml.rels", rels)]), 1_000),
+        ("autor de un comentario", zip_varias(&[parte("word/document.xml", &cuerpo("Cuerpo corto")), parte("word/comments.xml", &comentario)]), 12),
+        ("metadatos de Word", zip_varias(&[parte("word/document.xml", &cuerpo("Cuerpo corto")), parte("docProps/core.xml", &core)]), 1_000),
+    ];
+    for (nombre, archivo, quedan) in casos {
+        // Sin limite chico se lee todo: el archivo de la prueba trae los 5.000 caracteres.
+        assert!(caracteres(&doc2json::read(&archivo).unwrap()) > 5_000, "{}", nombre);
+        let d = doc2json::read_with_limits(&archivo, Limits { max_chars: 1_000, ..Limits::default() }).unwrap();
+        assert_eq!(caracteres(&d), quedan, "{}", nombre);
+        assert_eq!(d.content[0].text, "Cuerpo corto", "{}: el cuerpo va primero", nombre);
+        assert!(d.warnings.iter().any(|w| w.contains("limite de 1000 caracteres")), "{}: {:?}", nombre, d.warnings);
+    }
+    // PDF: titulo de los metadatos y marcadores.
+    let objs = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec()),
+        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>".to_vec()),
+        (5, flujo("", TEXTO)),
+        (6, b"<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 1 >>".to_vec()),
+        (7, format!("<< /Title ({}) /Parent 6 0 R /Dest [4 0 R /Fit] >>", largo).into_bytes()),
+        (8, format!("<< /Title ({}) >>", largo).into_bytes()),
+    ];
+    let mut archivo = ensamblar(&objs, true);
+    // El diccionario Info se declara en el trailer.
+    let fin = archivo.windows(11).rposition(|w| w == b"/Root 1 0 R").unwrap();
+    archivo.splice(fin..fin, b"/Info 8 0 R ".iter().copied());
+    let completo = doc2json::read(&archivo).unwrap();
+    assert_eq!(completo.outline.len(), 1);
+    assert!(caracteres(&completo) > 10_000);
+    let d = doc2json::read_with_limits(&archivo, Limits { max_chars: 1_000, ..Limits::default() }).unwrap();
+    assert_eq!(caracteres(&d), 1_000);
+    assert_eq!(textos(&d), ["Hola mundo"]);
+    assert!(d.warnings.iter().any(|w| w.contains("limite de 1000 caracteres")), "{:?}", d.warnings);
 }

@@ -11,9 +11,14 @@
 //! El texto tambien se acota mientras se lee (`take_text`), no solo al final: asi un .docx con
 //! millones de caracteres no los junta en memoria si el limite es menor.
 //!
+//! Un flujo que se descomprime varias veces en la misma lectura (un formulario de PDF dibujado en
+//! cada pagina) se cuenta una sola vez (`once`). Y una parte se puede apartar para lo que se lee
+//! despues (`reserve`): en Word, estilos y numeracion no quedan en cero si el cuerpo agota el resto.
+//!
 //! El estado es por hilo y por lectura: `read_with_limits` lo abre y lo cierra.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -61,6 +66,17 @@ struct State {
     spent: Spent,
     /// Caracteres que aun se pueden juntar.
     chars_left: usize,
+    /// Bytes apartados para lo que se lee despues (`reserve`): no estan disponibles por ahora.
+    reserved: usize,
+    /// Topes que tuvo cada flujo ya contado (`once`), en el orden en que se pidieron.
+    seen: HashMap<usize, Vec<usize>>,
+    /// Flujo en curso de `once`: se anotan sus topes (primera vez) o se repiten (las siguientes).
+    once: Option<Once>,
+}
+
+enum Once {
+    Record(Vec<usize>),
+    Replay(std::vec::IntoIter<usize>),
 }
 
 thread_local! {
@@ -69,7 +85,7 @@ thread_local! {
 
 /// Abre el presupuesto de una lectura.
 pub fn begin(limits: Limits) {
-    STATE.with(|s| *s.borrow_mut() = State { active: true, limits: Some(limits), spent: Spent::default(), chars_left: limits.max_chars });
+    STATE.with(|s| *s.borrow_mut() = State { active: true, limits: Some(limits), chars_left: limits.max_chars, ..State::default() });
 }
 
 /// Cierra el presupuesto y devuelve lo gastado y que topes se alcanzaron.
@@ -85,10 +101,22 @@ pub fn limits() -> Limits {
 /// Cuanto se puede descomprimir ahora, sin pasar `cap` (el tope por flujo).
 pub fn room(cap: usize) -> usize {
     STATE.with(|s| {
-        let st = s.borrow();
-        match (st.active, st.limits) {
-            (true, Some(l)) => l.max_decompressed.saturating_sub(st.spent.decompressed).min(cap),
-            _ => cap,
+        let mut st = s.borrow_mut();
+        let st = &mut *st;
+        let limit = match (st.active, st.limits) {
+            (true, Some(l)) => l.max_decompressed,
+            _ => return cap,
+        };
+        match st.once.as_mut() {
+            // Repeticion de un flujo ya contado: el mismo tope que la primera vez, sin descontar.
+            Some(Once::Replay(caps)) => caps.next().unwrap_or(0).min(cap),
+            once => {
+                let room = limit.saturating_sub(st.spent.decompressed).saturating_sub(st.reserved).min(cap);
+                if let Some(Once::Record(caps)) = once {
+                    caps.push(room);
+                }
+                room
+            }
         }
     })
 }
@@ -97,13 +125,56 @@ pub fn room(cap: usize) -> usize {
 pub fn spend(bytes: usize, cut: bool) {
     STATE.with(|s| {
         let mut st = s.borrow_mut();
-        if st.active {
+        // Una repeticion (`once`) ya se conto la primera vez.
+        if st.active && !matches!(st.once, Some(Once::Replay(_))) {
             st.spent.decompressed = st.spent.decompressed.saturating_add(bytes);
             if cut {
                 st.spent.decompressed_hit = true;
             }
         }
     })
+}
+
+/// Descomprime un flujo (`decode`) contandolo una sola vez en la lectura: `key` lo identifica
+/// (en PDF, la posicion de sus datos en el archivo). La primera vez descuenta del presupuesto y
+/// anota los topes que tuvo; las siguientes repiten esos mismos topes sin descontar, asi entregan
+/// lo mismo que la primera (tambien si entonces se corto). Un formulario dibujado en cientos de
+/// paginas cuenta como uno. Cada repeticion ocupa a lo mas lo mismo que la primera vez; el tiempo
+/// de volver a descomprimirla no se acota aqui (igual que sin presupuesto).
+pub fn once<T>(key: usize, decode: impl FnOnce() -> T) -> T {
+    let started = STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        // Sin lectura abierta, o dentro de otro `once`, no hay nada que anotar aparte.
+        if !st.active || st.once.is_some() {
+            return false;
+        }
+        st.once = Some(match st.seen.get(&key) {
+            Some(caps) => Once::Replay(caps.clone().into_iter()),
+            None => Once::Record(Vec::new()),
+        });
+        true
+    });
+    let out = decode();
+    if started {
+        STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            if let Some(Once::Record(caps)) = st.once.take() {
+                st.seen.insert(key, caps);
+            }
+        });
+    }
+    out
+}
+
+/// Aparta `bytes` del presupuesto de descompresion hasta `release`: lo que se lea mientras tanto
+/// no puede usarlos. En Word, el cuerpo se lee con una parte apartada para estilos y numeracion.
+pub fn reserve(bytes: usize) {
+    STATE.with(|s| s.borrow_mut().reserved = bytes)
+}
+
+/// Devuelve lo apartado con `reserve`.
+pub fn release() {
+    STATE.with(|s| s.borrow_mut().reserved = 0)
 }
 
 /// La parte de `s` que cabe en el limite de caracteres de la lectura en curso (todo `s` si no hay
@@ -192,5 +263,35 @@ mod tests {
         assert_eq!((l.max_decompressed, l.max_pages, l.max_chars), (32 << 20, 500, 1000));
         // En wasm32 (usize de 32 bits) los MB enormes se saturan en vez de desbordar.
         assert_eq!(Limits::from_units(u32::MAX, 1, 1).max_decompressed, (u32::MAX as usize).saturating_mul(1 << 20));
+    }
+
+    /// Un "descompresor" de prueba: pide su tope y entrega hasta `n` bytes, como inflate.
+    fn descomprimir(n: usize) -> usize {
+        let cap = room(1000);
+        let out = n.min(cap);
+        spend(out, n > cap);
+        out
+    }
+
+    #[test]
+    fn un_flujo_repetido_se_cuenta_una_vez_con_los_mismos_topes() {
+        begin(Limits { max_decompressed: 100, ..Limits::default() });
+        assert_eq!(once(7, || descomprimir(60)), 60);
+        // Las repeticiones entregan lo mismo sin descontar; otro flujo usa lo que queda.
+        assert_eq!(once(7, || descomprimir(60)), 60);
+        assert_eq!(once(9, || descomprimir(60)), 40);
+        // El flujo que se corto la primera vez se repite cortado igual, aunque ya no quede nada.
+        assert_eq!(once(9, || descomprimir(60)), 40);
+        assert_eq!(end(), Spent { decompressed: 100, decompressed_hit: true, text_hit: false });
+    }
+
+    #[test]
+    fn lo_reservado_no_se_usa_hasta_devolverlo() {
+        begin(Limits { max_decompressed: 100, ..Limits::default() });
+        reserve(30);
+        assert_eq!(descomprimir(1000), 70);
+        release();
+        assert_eq!(room(1000), 30);
+        end();
     }
 }
