@@ -2,6 +2,9 @@
 //!
 //! Incluye un compresor DEFLATE propio y pequeno (LZ77 + codigos Huffman fijos): no es el mas
 //! eficiente, pero reduce el XML de las hojas varias veces sin agregar dependencias.
+//!
+//! Licencia: ademas de la LGPL-2.1-or-later del resto de mpp2xlsx, este archivo se ofrece bajo
+//! MIT o Apache-2.0, a eleccion, para que doc2json pueda reutilizar el compresor.
 
 const fn crc_table() -> [u32; 256] {
     let mut table = [0u32; 256];
