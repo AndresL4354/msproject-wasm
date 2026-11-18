@@ -85,7 +85,13 @@ pub struct Interp<'p, 'a> {
     glyph: (f64, f64),
     /// El ultimo glifo del tramo actual es una ligadura (fi, fl, ff...).
     ligature: bool,
+    /// Tramo con anchos de fuente exagerados: por cada letra ubicada aparte dentro de una palabra,
+    /// su avance real dividido por el ancho que declara la fuente (los ultimos `MAX_SCALES`).
+    scales: Vec<f64>,
 }
+
+/// Escalas de anchos que se recuerdan por tramo.
+const MAX_SCALES: usize = 16;
 
 /// Un glifo que da varias letras de una ligadura tipografica, o la ligadura misma.
 fn is_ligature(text: &str) -> bool {
@@ -109,6 +115,29 @@ fn unligature(text: &str) -> String {
     out
 }
 
+/// `text` con un espacio en cada posicion de `at` (crecientes, en el borde de un caracter), armado
+/// en una sola pasada: insertar uno a uno desplaza el resto de la cadena cada vez.
+fn with_spaces(text: &str, at: &[(usize, f64)]) -> String {
+    let mut out = String::with_capacity(text.len() + at.len());
+    let mut from = 0;
+    for &(pos, _) in at {
+        out.push_str(&text[from..pos]);
+        out.push(' ');
+        from = pos;
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
+/// Mediana de unos pocos valores.
+fn median(v: &[f64]) -> f64 {
+    let mut s = [0.0f64; MAX_SCALES];
+    let s = &mut s[..v.len()];
+    s.copy_from_slice(v);
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[s.len() / 2]
+}
+
 /// Desde este hueco (relativo al tamano de letra) hay un espacio entre palabras.
 const WORD_GAP: f64 = 0.15;
 /// Huecos entre este valor y `WORD_GAP` son dudosos: en una linea justificada apretada son
@@ -126,32 +155,82 @@ fn is_regular(b: u8) -> bool {
     !is_ws(b) && !is_delim(b)
 }
 
-/// Los operadores que el interprete usa (texto, matrices, estado, formularios e imagenes
-/// incrustadas). Los demas solo consumen sus argumentos.
-fn text_op(w: &[u8]) -> Option<&'static str> {
-    Some(match w {
-        b"BT" => "BT",
-        b"Tf" => "Tf",
-        b"Td" => "Td",
-        b"TD" => "TD",
-        b"Tm" => "Tm",
-        b"T*" => "T*",
-        b"Tc" => "Tc",
-        b"Tw" => "Tw",
-        b"Tz" => "Tz",
-        b"TL" => "TL",
-        b"Ts" => "Ts",
-        b"Tj" => "Tj",
-        b"'" => "'",
-        b"\"" => "\"",
-        b"TJ" => "TJ",
-        b"cm" => "cm",
-        b"q" => "q",
-        b"Q" => "Q",
-        b"Do" => "Do",
-        b"BI" => "BI",
-        _ => return None,
-    })
+/// Operadores de dibujo: trazos, recortes, colores y el estado grafico que no toca al texto. Un
+/// dibujo vectorial trae millones, y se descartan sin convertir sus operandos. Cualquier otro
+/// operador, conocido o no, pasa por `exec`: uno que se le agregue despues (por ejemplo el
+/// contenido marcado, `BMC`/`BDC`/`EMC`) funciona sin tocar esta lista. Ninguno de estos puede
+/// tener una rama en `exec` (lo vigila una prueba).
+fn drawing_op(w: &[u8]) -> bool {
+    matches!(
+        w,
+        // Trazos y recortes.
+        b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re" | b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"n" | b"W" | b"W*" | b"sh"
+        // Colores.
+        | b"g" | b"G" | b"rg" | b"RG" | b"k" | b"K" | b"cs" | b"CS" | b"sc" | b"SC" | b"scn" | b"SCN"
+        // Estado grafico que no toca al texto.
+        | b"w" | b"J" | b"j" | b"M" | b"d" | b"ri" | b"i"
+    )
+}
+
+/// Tope de operandos de un operador: los que sobran se descartan, asi un flujo que repite
+/// millones de operandos no agota la memoria.
+const MAX_ARGS: usize = 256;
+
+/// Lo que sigue en un flujo de contenido, despues de sus operandos.
+#[derive(Debug, PartialEq)]
+enum Next<'c> {
+    /// Un operador para `exec`.
+    Op(&'c str),
+    /// Un operador de dibujo, o un delimitador suelto: sus operandos se descartan.
+    Skip,
+    End,
+}
+
+/// Lee los operandos hasta el proximo operador y los deja en `args`, a lo sumo `MAX_ARGS`. Los
+/// numeros quedan sin convertir (`Obj::Null`, con su posicion en `args` y en el flujo en `spans`):
+/// solo los de los operadores que `exec` usa hacen falta.
+fn next_op<'c>(lx: &mut Lexer<'c>, args: &mut Vec<Obj>, spans: &mut Vec<(usize, usize, usize)>) -> Next<'c> {
+    let d: &'c [u8] = lx.d;
+    loop {
+        lx.skip_ws();
+        let b = match lx.peek() {
+            Some(b) => b,
+            None => return Next::End,
+        };
+        let arg = if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
+            let start = lx.pos;
+            while matches!(lx.peek(), Some(b'+' | b'-' | b'.' | b'0'..=b'9')) {
+                lx.pos += 1;
+            }
+            if args.len() < MAX_ARGS {
+                spans.push((args.len(), start, lx.pos));
+                args.push(Obj::Null);
+            }
+            continue;
+        } else if is_regular(b) {
+            let start = lx.pos;
+            while matches!(lx.peek(), Some(c) if is_regular(c)) {
+                lx.pos += 1;
+            }
+            match &d[start..lx.pos] {
+                b"true" => Obj::Bool(true),
+                b"false" => Obj::Bool(false),
+                b"null" => Obj::Null,
+                w if drawing_op(w) => return Next::Skip,
+                w => return std::str::from_utf8(w).map_or(Next::Skip, Next::Op),
+            }
+        } else {
+            match lx.object() {
+                // ">>", "]", ")", "{" o "}" sueltos: ningun operador de `exec` los usa.
+                Some(Obj::Op(_)) => return Next::Skip,
+                Some(o) => o,
+                None => return Next::End,
+            }
+        };
+        if args.len() < MAX_ARGS {
+            args.push(arg);
+        }
+    }
 }
 
 /// Un numero de un flujo de contenido, como lo lee `Lexer` (tolera signos repetidos, "--5").
@@ -171,7 +250,7 @@ fn number(raw: &[u8]) -> Obj {
 
 impl<'p, 'a> Interp<'p, 'a> {
     pub fn new(pdf: &'p Pdf<'a>, fonts: &'p FontCache) -> Interp<'p, 'a> {
-        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, doubt: Vec::new(), tight: 0, inserted: Vec::new(), glyph: (0.0, 0.0), ligature: false }
+        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, doubt: Vec::new(), tight: 0, inserted: Vec::new(), glyph: (0.0, 0.0), ligature: false, scales: Vec::new() }
     }
 
     fn font(&self, resources: &Dict, name: &str) -> Option<Rc<Font>> {
@@ -192,18 +271,18 @@ impl<'p, 'a> Interp<'p, 'a> {
         let doubt = std::mem::take(&mut self.doubt);
         let tight = std::mem::replace(&mut self.tight, 0);
         let inserted = std::mem::take(&mut self.inserted);
+        self.scales.clear();
         if let Some(mut item) = self.cur.take() {
             // Una linea justificada que separa las palabras solo por su posicion (sin caracteres
-            // de espacio; los que hay los puso un hueco ancho) puede apretarlas por debajo del espacio comun. Sus huecos son casi
-            // iguales entre si y las letras de cada palabra van juntas; un hueco dudoso suelto,
-            // o letras todas separadas (interletra amplia), no son espacios.
+            // de espacio; los que hay los puso un hueco ancho) puede apretarlas por debajo del
+            // espacio comun. Sus huecos son casi iguales entre si y las letras de cada palabra van
+            // juntas; un hueco dudoso suelto, o letras todas separadas (interletra amplia), no son
+            // espacios.
             if doubt.len() >= 3 && item.text.matches(' ').count() == inserted.len() && tight >= 2 * doubt.len() {
                 let (lo, hi) = doubt.iter().fold((f64::MAX, 0.0f64), |(lo, hi), d| (lo.min(d.1), hi.max(d.1)));
                 // Los espacios que ya hay, de la misma familia: la linea entera va justificada igual.
                 if hi <= lo * 1.15 && inserted.iter().all(|g| *g <= hi * 1.15) {
-                    for (pos, _) in doubt.iter().rev() {
-                        item.text.insert(*pos, ' ');
-                    }
+                    item.text = with_spaces(&item.text, &doubt);
                 }
             }
             if !item.text.trim().is_empty() {
@@ -274,8 +353,31 @@ impl<'p, 'a> Interp<'p, 'a> {
                         along += cur.tail;
                     } else if forward > 0.2 * size && forward < 1.2 * size {
                         // Anchos de la fuente mayores que los glifos reales: cada letra, ubicada
-                        // aparte, parece montarse en la anterior aunque avanza. Va pegada a ella.
+                        // aparte, parece montarse en la anterior aunque avanza. Va pegada a ella,
+                        // salvo que avance claramente mas que las demas. Si las letras ya vistas
+                        // del tramo avanzan todas en la misma proporcion de su ancho declarado
+                        // (al menos cuatro, dentro de un 5 %), esa escala da el ancho real de la
+                        // anterior, y lo que sobra es un espacio entre palabras. Si la proporcion
+                        // varia (anchos declarados iguales y letras reales de distinto ancho), una
+                        // letra ancha no se distingue de un espacio y no se separa nada.
+                        let declared = (cur.x1 - self.glyph.0) * cur.dx + (cur.y1 - self.glyph.1) * cur.dy - cur.tail;
                         along = 0.0;
+                        if declared > 0.0 {
+                            let (lo, hi) = self.scales.iter().fold((f64::MAX, 0.0f64), |(lo, hi), s| (lo.min(*s), hi.max(*s)));
+                            if self.scales.len() >= 4 && hi <= lo * 1.05 {
+                                let gap = forward - declared * median(&self.scales);
+                                if gap > WORD_GAP * size {
+                                    along = gap;
+                                }
+                            }
+                            // Solo las uniones dentro de una palabra miden la escala.
+                            if along == 0.0 {
+                                if self.scales.len() == MAX_SCALES {
+                                    self.scales.remove(0);
+                                }
+                                self.scales.push(forward / declared);
+                            }
+                        }
                     }
                 }
                 let across = (-(sx - cur.x1) * cur.dy + (sy - cur.y1) * cur.dx).abs();
@@ -291,7 +393,12 @@ impl<'p, 'a> Interp<'p, 'a> {
                         cur.text.push(' ');
                         self.inserted.push(along / size);
                     } else if along > DOUBT_GAP * size && !cur.text.ends_with(' ') && !text.starts_with(' ') {
-                        self.doubt.push((cur.text.len(), along / size));
+                        // Entre dos cifras, un hueco fino agrupa los miles ("1 234 567") o las
+                        // partes de un codigo: no separa palabras.
+                        let digits = cur.text.ends_with(|c: char| c.is_ascii_digit()) && text.starts_with(|c: char| c.is_ascii_digit());
+                        if !digits {
+                            self.doubt.push((cur.text.len(), along / size));
+                        }
                     } else if along.abs() <= TIGHT_GAP * size {
                         self.tight += 1;
                     }
@@ -324,69 +431,25 @@ impl<'p, 'a> Interp<'p, 'a> {
     fn exec(&mut self, content: &[u8], resources: &Dict, st: &mut State) {
         let mut lx = Lexer::new(content, 0);
         let mut args: Vec<Obj> = Vec::new();
-        // Numeros de `args` aun sin convertir (posicion en `args`, inicio y fin en el flujo): un
-        // dibujo vectorial trae millones, y solo los de los operadores de texto hacen falta.
+        // Numeros de `args` aun sin convertir (posicion en `args`, inicio y fin en el flujo).
         let mut spans: Vec<(usize, usize, usize)> = Vec::new();
         let mut saved: Vec<State> = Vec::new();
         let mut tm = IDENTITY;
         let mut tlm = IDENTITY;
-        let mut owned = String::new();
         loop {
-            lx.skip_ws();
-            let b = match lx.peek() {
-                Some(b) => b,
-                None => break,
-            };
-            let op: &str = if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
-                let start = lx.pos;
-                while matches!(lx.peek(), Some(b'+' | b'-' | b'.' | b'0'..=b'9')) {
-                    lx.pos += 1;
-                }
-                if args.len() < 256 {
-                    spans.push((args.len(), start, lx.pos));
-                    args.push(Obj::Null);
-                }
-                continue;
-            } else if is_regular(b) {
-                // Un operador: los que no se usan para el texto (trazos, colores) se descartan
-                // sin armar nada.
-                let start = lx.pos;
-                while lx.peek().is_some_and(is_regular) {
-                    lx.pos += 1;
-                }
-                match text_op(&content[start..lx.pos]) {
-                    Some(op) => op,
-                    None => {
-                        match &content[start..lx.pos] {
-                            b"true" => args.push(Obj::Bool(true)),
-                            b"false" => args.push(Obj::Bool(false)),
-                            b"null" => args.push(Obj::Null),
-                            _ => {
-                                if self.budget == 0 {
-                                    break;
-                                }
-                                self.budget -= 1;
-                                args.clear();
-                                spans.clear();
-                            }
-                        }
-                        continue;
+            let op = match next_op(&mut lx, &mut args, &mut spans) {
+                Next::Op(op) => op,
+                Next::Skip => {
+                    // Un trazo o un color: se descarta sin armar nada.
+                    if self.budget == 0 {
+                        break;
                     }
+                    self.budget -= 1;
+                    args.clear();
+                    spans.clear();
+                    continue;
                 }
-            } else {
-                match lx.object() {
-                    Some(Obj::Op(op)) => {
-                        owned = op;
-                        owned.as_str()
-                    }
-                    Some(other) => {
-                        if args.len() < 256 {
-                            args.push(other);
-                        }
-                        continue;
-                    }
-                    None => break,
-                }
+                Next::End => break,
             };
             if self.budget == 0 {
                 break;
@@ -513,7 +576,6 @@ impl<'p, 'a> Interp<'p, 'a> {
             }
             args.clear();
         }
-        let _ = owned;
     }
 
     fn xobject(&mut self, resources: &Dict, name: &str, st: &State) {
@@ -547,5 +609,73 @@ impl<'p, 'a> Interp<'p, 'a> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Los operandos y el operador que siguen en `src`.
+    fn leer(src: &str) -> (Vec<Obj>, Next<'_>) {
+        let mut lx = Lexer::new(src.as_bytes(), 0);
+        let (mut args, mut spans) = (Vec::new(), Vec::new());
+        let next = next_op(&mut lx, &mut args, &mut spans);
+        for (k, a, z) in spans {
+            args[k] = number(&src.as_bytes()[a..z]);
+        }
+        (args, next)
+    }
+
+    #[test]
+    fn operandos_con_tope() {
+        // `true`, `false` y `null` cuentan para el tope igual que los numeros y las cadenas.
+        for relleno in ["null", "true", "false", "1", "(x)"] {
+            let src = format!("{} 7 (fin) Tj", format!("{} ", relleno).repeat(3 * MAX_ARGS));
+            let (args, next) = leer(&src);
+            assert_eq!(next, Next::Op("Tj"));
+            assert_eq!(args.len(), MAX_ARGS, "{}", relleno);
+        }
+        let (args, _) = leer("true false null 2.5 -3 /F1 (a) Tj");
+        assert_eq!(args, vec![Obj::Bool(true), Obj::Bool(false), Obj::Null, Obj::Real(2.5), Obj::Int(-3), Obj::Name("F1".into()), Obj::Str(b"a".to_vec())]);
+    }
+
+    #[test]
+    fn solo_el_dibujo_se_descarta() {
+        assert_eq!(leer("0 0 10 10 re").1, Next::Skip);
+        assert_eq!(leer("1 0 0 rg").1, Next::Skip);
+        assert_eq!(leer("]").1, Next::Skip);
+        // Los operadores que `exec` no usa hoy (contenido marcado, modo de relleno del texto, fin
+        // de texto) le llegan igual, con sus operandos.
+        assert_eq!(leer("/P << /MCID 3 >> BDC"), (vec![Obj::Name("P".into()), Obj::Dict(Dict(vec![("MCID".to_string(), Obj::Int(3))]))], Next::Op("BDC")));
+        assert_eq!(leer("/Artifact BMC").1, Next::Op("BMC"));
+        assert_eq!(leer("EMC").1, Next::Op("EMC"));
+        assert_eq!(leer("3 Tr").1, Next::Op("Tr"));
+        assert_eq!(leer("ET").1, Next::Op("ET"));
+        assert_eq!(leer("  ").1, Next::End);
+    }
+
+    #[test]
+    fn ningun_operador_de_dibujo_tiene_rama_en_exec() {
+        // Una rama de `exec` para un operador de `drawing_op` nunca se ejecutaria.
+        let src = include_str!("content.rs");
+        let exec = &src[src.find("fn exec(").unwrap()..src.find("fn xobject(").unwrap()];
+        let mut ramas = Vec::new();
+        for line in exec.lines().map(str::trim_start).filter(|l| l.starts_with('"') && l.contains("=>")) {
+            for op in line.split("=>").next().unwrap().split('|') {
+                ramas.push(op.trim().trim_matches('"').to_string());
+            }
+        }
+        assert!(ramas.iter().any(|o| o == "Tj") && ramas.iter().any(|o| o == "Do"), "{:?}", ramas);
+        for op in &ramas {
+            assert!(!drawing_op(op.as_bytes()), "`{}` tiene una rama en exec pero drawing_op lo descarta", op);
+        }
+    }
+
+    #[test]
+    fn espacios_en_una_pasada() {
+        assert_eq!(with_spaces("ÉsteNiñoVa", &[(5, 0.1), (10, 0.1)]), "Éste Niño Va");
+        assert_eq!(with_spaces("ab", &[]), "ab");
+        assert_eq!(with_spaces("ab", &[(0, 0.1), (2, 0.1)]), " ab ");
     }
 }

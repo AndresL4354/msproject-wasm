@@ -195,19 +195,25 @@ fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Opti
             if distance > out.len() || out.len() + len > MAX_OUTPUT {
                 return None;
             }
-            let start = out.len() - distance;
-            if distance >= len {
-                // Sin solaparse con lo que se va agregando: se copia de una vez.
-                out.extend_from_within(start..start + len);
-            } else {
-                for k in 0..len {
-                    let v = out[start + k];
-                    out.push(v);
-                }
-            }
+            copy_back(out, distance, len);
         }
         if out.len() > MAX_OUTPUT {
             return None;
+        }
+    }
+}
+
+/// Agrega al final de `out` los `len` bytes que empiezan `distance` bytes atras (`distance` ya
+/// validada). Copia exactamente `len`: si la salida tiene un tope, se le pasa el largo que cabe.
+fn copy_back(out: &mut Vec<u8>, distance: usize, len: usize) {
+    let start = out.len() - distance;
+    if distance >= len {
+        // Sin solaparse con lo que se va agregando: se copia de una vez.
+        out.extend_from_within(start..start + len);
+    } else {
+        for k in 0..len {
+            let v = out[start + k];
+            out.push(v);
         }
     }
 }

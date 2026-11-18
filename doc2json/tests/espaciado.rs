@@ -82,3 +82,82 @@ fn ligadura_y_su_espacio_fantasma() {
     // Un espacio de verdad tras una ligadura si separa.
     assert_eq!(texto(HELVETICA, "BT /F1 10 Tf 72 700 Td (o\\256 ce) Tj ET"), "ofi ce");
 }
+
+/// Una fuente que declara para A-Z los anchos dados (milesimas de em), y 278 para el espacio.
+fn fuente_con_anchos(az: &[u32; 26]) -> String {
+    let mut w = vec!["0".to_string(); 33];
+    w[0] = "278".to_string();
+    w.extend(az.iter().map(|v| v.to_string()));
+    format!("<< /Type /Font /Subtype /Type1 /BaseFont /Arial /FirstChar 32 /LastChar 90 /Widths [{}] >>", w.join(" "))
+}
+
+/// Cada letra ubicada aparte con `Tm` en la posicion dada (tamano 10).
+fn letras_ubicadas(letras: &[(char, f64)]) -> String {
+    let mut c = "BT /F1 10 Tf".to_string();
+    for (l, x) in letras {
+        c.push_str(&format!(" 1 0 0 1 {:.2} 700 Tm ({}) Tj", x, l));
+    }
+    c + " ET"
+}
+
+/// Anchos de Helvetica para A-Z.
+const ANCHOS_HELVETICA: [u32; 26] = [667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611];
+
+#[test]
+fn anchos_exagerados_y_palabras_separadas_solo_por_posicion() {
+    // Todas las letras declaran 1500 milesimas y avanzan 6 puntos; entre palabras avanzan 9. Las
+    // letras van pegadas, pero las dos palabras no.
+    let mut letras = Vec::new();
+    let mut x = 72.0;
+    for (i, l) in "SELLERBUYER".chars().enumerate() {
+        if i == 6 {
+            x += 3.0;
+        }
+        letras.push((l, x));
+        x += 6.0;
+    }
+    assert_eq!(texto(&fuente_con_anchos(&[1500; 26]), &letras_ubicadas(&letras)), "SELLER BUYER");
+
+    // Anchos proporcionales declarados al doble de los reales: cada letra avanza su ancho real
+    // de Helvetica y entre palabras se suma el ancho de un espacio.
+    let doble: Vec<u32> = ANCHOS_HELVETICA.iter().map(|w| w * 2).collect();
+    let mut letras = Vec::new();
+    let mut x = 72.0;
+    for palabra in ["SELLER", "BUYER", "WAREHOUSE"] {
+        for l in palabra.chars() {
+            letras.push((l, x));
+            x += ANCHOS_HELVETICA[(l as u8 - b'A') as usize] as f64 / 100.0;
+        }
+        x += 2.78;
+    }
+    assert_eq!(texto(&fuente_con_anchos(&doble.try_into().unwrap()), &letras_ubicadas(&letras)), "SELLER BUYER WAREHOUSE");
+
+    // Anchos declarados iguales y letras reales de distinto ancho: una letra ancha (M, W) no se
+    // distingue de un espacio, asi que la palabra no se parte.
+    let mut letras = Vec::new();
+    let mut x = 72.0;
+    for l in "TIMEWORKMAXIMUMSUBMITTAL".chars() {
+        letras.push((l, x));
+        x += ANCHOS_HELVETICA[(l as u8 - b'A') as usize] as f64 / 100.0;
+    }
+    assert_eq!(texto(&fuente_con_anchos(&[1500; 26]), &letras_ubicadas(&letras)), "TIMEWORKMAXIMUMSUBMITTAL");
+}
+
+#[test]
+fn miles_con_espacio_fino_no_son_espacios() {
+    // Tres huecos iguales de 0,12 em entre cifras, con las demas uniones apretadas: agrupan miles.
+    assert_eq!(texto(HELVETICA, "BT /F1 10 Tf 72 700 Td [(1)-120(234)-120(567)-120(890)]TJ ET"), "1234567890");
+    // En una linea justificada apretada, las palabras se separan y la cifra queda entera.
+    let c = "BT /F1 10 Tf 72 700 Td [(The)-130(total)-130(was)-130(1)-130(234)-130(567)(.)]TJ ET";
+    assert_eq!(texto(HELVETICA, c), "The total was 1234567.");
+}
+
+#[test]
+fn linea_justificada_muy_larga() {
+    // Un solo `TJ` con muchas palabras apretadas: los espacios se agregan de una vez.
+    let n = 100_000;
+    let c = format!("BT /F1 10 Tf 72 700 Td [{}(fin)]TJ ET", "(abcd)-120".repeat(n));
+    let t = texto(HELVETICA, &c);
+    assert_eq!(t.len(), n * 5 + 3);
+    assert!(t.starts_with("abcd abcd ") && t.ends_with("abcd fin"));
+}
