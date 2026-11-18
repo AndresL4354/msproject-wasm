@@ -9,9 +9,10 @@
 //!   las paginas que cubre. Las tablas largas se parten por filas repitiendo el encabezado.
 //!
 //! El texto del documento nunca se vuelve marca: se escapan `<`, `[`, `]`, `` ` ``, las entidades
-//! (`&lt;`), las barras invertidas y lo que al inicio de una linea abriria un titulo, una cita, una
-//! lista o una linea horizontal. Asi el Markdown se puede mostrar como HTML sin que el documento
-//! inyecte etiquetas ni enlaces. Los enlaces de Word solo salen si son `http`, `https` o `mailto`.
+//! (`&lt;`), las barras invertidas y lo que al inicio de una linea (tambien tras un `\r` solo)
+//! abriria un titulo, una cita, una lista o una linea horizontal. Los enlaces de Word solo salen si
+//! son `http`, `https` o `mailto`. Esto evita que el texto se lea como marca, pero no reemplaza a un
+//! sanitizador: para mostrar el Markdown como HTML hay que limpiar igual el HTML resultante.
 
 use crate::doc::{Block, Cell, Document, Kind, MAX_COLSPAN};
 use crate::json::{self, Obj};
@@ -26,6 +27,8 @@ const MAX_PATH_CHARS: usize = 200;
 /// Columnas de una tabla en Markdown. Las celdas que pasan de ahi se juntan en la ultima columna:
 /// asi una fila con miles de celdas no obliga a rellenar todas las demas filas hasta ese ancho.
 const MAX_COLS: usize = 64;
+/// Largo maximo, en caracteres, de una etiqueta de nota que sale como `[^etiqueta]`.
+const MAX_LABEL: usize = 16;
 
 /// Escapa lo que Markdown leeria como marca o HTML dentro de una linea de texto: `<` (etiquetas y
 /// enlaces automaticos), `[` y `]` (enlaces, imagenes y definiciones), `` ` `` (codigo), `&` cuando
@@ -68,9 +71,12 @@ fn escape_start(text: &str) -> String {
         Some('-') | Some('+') | Some('*') | Some('_') if only(first.unwrap_or(' '), 3) => true,
         Some('-') | Some('+') | Some('*') => t.chars().nth(1).map_or(true, |c| c == ' ' || c == '\t'),
         Some(c) if c.is_ascii_digit() => {
-            let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-            let rest = &t[digits.len()..];
-            (rest.starts_with(". ") || rest.starts_with(") ") || rest == "." || rest == ")") && digits.len() <= 9
+            // "1. " y "1) " abren una lista numerada. En CommonMark "\1" no es un escape (la barra
+            // se veria): se escapa el punto o el parentesis, "1\. Objetivo".
+            let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+            let rest = &t[digits..];
+            let list = (rest.starts_with(". ") || rest.starts_with(") ") || rest == "." || rest == ")") && digits <= 9;
+            return if list { format!("{}\\{}", &t[..digits], rest) } else { t.to_string() };
         }
         _ => false,
     };
@@ -81,9 +87,10 @@ fn escape_start(text: &str) -> String {
     }
 }
 
-/// Escapa el inicio de cada linea de un texto de varias lineas.
+/// Escapa el inicio de cada linea de un texto de varias lineas. Un "\r" solo tambien termina una
+/// linea en CommonMark: todos los finales de linea quedan como "\n".
 fn escape_lines(text: &str) -> String {
-    text.split('\n').map(escape_start).collect::<Vec<_>>().join("\n")
+    text.replace("\r\n", "\n").split(['\r', '\n']).map(escape_start).collect::<Vec<_>>().join("\n")
 }
 
 /// Un enlace que se puede publicar: solo `http`, `https` y `mailto`, con los caracteres que
@@ -118,7 +125,8 @@ fn encode_url(s: &str) -> String {
 }
 
 /// Texto con las citas "[n]" de notas que existen como "[^n]" (nota al pie de Markdown) y todo lo
-/// demas escapado.
+/// demas escapado. Un "(" o un ":" pegado a una cita va escapado: para un lector sin notas al pie,
+/// "[^1](javascript:...)" es un enlace y "[^1]: ..." al inicio de una linea, una definicion.
 fn text_md(text: &str, labels: &HashSet<String>) -> String {
     if labels.is_empty() || !text.contains('[') {
         return escape_text(text);
@@ -128,12 +136,20 @@ fn text_md(text: &str, labels: &HashSet<String>) -> String {
     while let Some(i) = rest.find('[') {
         out.push_str(&escape_text(&rest[..i]));
         let after = &rest[i + 1..];
-        match after.find(']') {
+        // El "]" se busca solo en el largo que puede tener una etiqueta: buscarlo en todo el resto
+        // haria cuadratico un texto con muchos "[" sin cerrar.
+        let close = after.char_indices().take(MAX_LABEL + 1).find(|(_, c)| *c == ']').map(|(j, _)| j);
+        match close {
             Some(j) if labels.contains(&after[..j]) => {
                 out.push_str("[^");
                 out.push_str(&after[..j]);
                 out.push(']');
                 rest = &after[j + 1..];
+                if rest.starts_with(['(', ':']) {
+                    out.push('\\');
+                    out.push_str(&rest[..1]);
+                    rest = &rest[1..];
+                }
             }
             _ => {
                 out.push_str("\\[");
@@ -163,6 +179,11 @@ fn inline(b: &Block, labels: &HashSet<String>) -> String {
         let lead = &r.text[..r.text.len() - r.text.trim_start().len()];
         let tail = &r.text[r.text.trim_end().len()..];
         let mut s = text_md(core, labels);
+        // Una cita al final del tramo anterior y un "(" o ":" al inicio de este (los tramos se
+        // separan tambien por el subrayado, que no deja marca): se escapa igual que en un tramo.
+        if lead.is_empty() && out.ends_with(']') && s.starts_with(['(', ':']) {
+            s.insert(0, '\\');
+        }
         if r.italic {
             s = format!("*{}*", s);
         }
@@ -183,10 +204,10 @@ fn cell_text(c: &Cell) -> String {
     if c.merged {
         return String::new();
     }
+    // CommonMark tambien corta la linea en un "\r" solo; las lineas vacias se descartan.
     c.text
         .trim()
-        .replace("\r\n", "\n")
-        .split('\n')
+        .split(['\r', '\n'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| escape_text(s).replace('|', "\\|"))
@@ -239,7 +260,7 @@ impl DropEmptyColumns for Vec<Vec<String>> {
     /// Quita las columnas sin texto en ninguna fila (rejillas de formularios, celdas de relleno).
     fn pipe_drop_empty_columns(self) -> Self {
         let width = self.first().map_or(0, Vec::len);
-        let keep: Vec<bool> = (0..width).map(|j| self.iter().any(|r| r.get(j).is_some_and(|c| !c.is_empty()))).collect();
+        let keep: Vec<bool> = (0..width).map(|j| self.iter().any(|r| r.get(j).map_or(false, |c| !c.is_empty()))).collect();
         if keep.iter().all(|k| *k) || !keep.iter().any(|k| *k) {
             return self;
         }
@@ -272,8 +293,9 @@ fn separator(width: usize) -> String {
 
 fn table_md(rows: &[Vec<Cell>]) -> String {
     let cells = table_cells(rows);
-    let Some(first) = cells.first() else {
-        return String::new();
+    let first = match cells.first() {
+        Some(f) => f,
+        None => return String::new(),
     };
     let mut out = vec![row_line(first), separator(first.len())];
     out.extend(cells[1..].iter().map(|c| row_line(c)));
@@ -295,7 +317,7 @@ fn section(b: &Block) -> Option<(u8, String)> {
                 return None;
             }
             let t = cells[0].text.trim();
-            if t.contains('\n') || t.chars().count() > 80 || t.chars().filter(|c| c.is_alphabetic()).count() < 3 {
+            if t.contains(['\n', '\r']) || t.chars().count() > 80 || t.chars().filter(|c| c.is_alphabetic()).count() < 3 {
                 return None;
             }
             let raw = t.split_whitespace().next().unwrap_or("");
@@ -320,7 +342,7 @@ struct Ctx {
 
 /// Una etiqueta de nota que se puede escribir como `[^etiqueta]` sin romper la sintaxis.
 fn safe_label(l: &str) -> bool {
-    !l.is_empty() && l.chars().count() <= 16 && l.chars().all(|c| c.is_alphanumeric() || "*†‡§¶#-_.".contains(c))
+    !l.is_empty() && l.chars().count() <= MAX_LABEL && l.chars().all(|c| c.is_alphanumeric() || "*†‡§¶#-_.".contains(c))
 }
 
 /// Markdown de un bloque (sin la marca de pagina). Vacio si el bloque no aporta texto.
@@ -356,7 +378,7 @@ fn block_md(b: &Block, cx: &Ctx) -> String {
                 Some(n) => {
                     // Un nombre con ":" antes de la primera "/" se leeria como esquema ("javascript:").
                     let n = encode_url(n.trim());
-                    let local = if n.split('/').next().is_some_and(|p| p.contains(':')) { format!("./{}", n) } else { n };
+                    let local = if n.split('/').next().map_or(false, |p| p.contains(':')) { format!("./{}", n) } else { n };
                     format!("![{}]({})", alt, local)
                 }
                 None if !alt.is_empty() => format!("*\\[Imagen: {}\\]*", alt),
@@ -598,15 +620,29 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
         }
         let len = md.chars().count();
         if let Some((level, title)) = section(blk) {
-            // Un titulo abre fragmento nuevo, salvo que el actual sea muy corto (se juntan).
-            if b.chars >= MIN_CHUNK {
+            // Un titulo abre fragmento nuevo, salvo que el actual sea muy corto y quepan juntos.
+            if b.chars >= MIN_CHUNK || b.chars + len + 2 > b.max {
                 b.emit();
             }
-            while path.last().is_some_and(|(l, _)| *l >= level) {
+            while path.last().map_or(false, |(l, _)| *l >= level) {
                 path.pop();
             }
             path.push((level, path_title(&title)));
-            b.push(&md, Kind::Heading, blk.page, &names(&path));
+            let here = names(&path);
+            if len > b.max {
+                // Un titulo mas largo que el fragmento se parte como un parrafo: la primera parte
+                // conserva la marca de titulo y las demas se escapan al inicio de la linea. La
+                // ultima queda abierta para el contenido de la seccion.
+                for (i, piece) in split_text(&md, b.max - 1).iter().enumerate() {
+                    if i > 0 {
+                        b.emit();
+                    }
+                    let piece = if i == 0 { piece.clone() } else { escape_start(piece) };
+                    b.push(&piece, Kind::Paragraph, blk.page, &here);
+                }
+                continue;
+            }
+            b.push(&md, Kind::Heading, blk.page, &here);
             continue;
         }
         let here = names(&path);
@@ -779,7 +815,9 @@ mod tests {
     #[test]
     fn escapa_lo_que_markdown_leeria_como_marca() {
         assert_eq!(escape_start("# no es titulo"), "\\# no es titulo");
-        assert_eq!(escape_start("1. no es lista"), "\\1. no es lista");
+        assert_eq!(escape_start("1. no es lista"), "1\\. no es lista");
+        assert_eq!(escape_start("12) tampoco"), "12\\) tampoco");
+        assert_eq!(escape_start("3.2 no es lista"), "3.2 no es lista");
         assert_eq!(escape_start("- tampoco"), "\\- tampoco");
         assert_eq!(escape_start("2024 fue un buen anio"), "2024 fue un buen anio");
         assert_eq!(escape_start("-5 grados"), "-5 grados");

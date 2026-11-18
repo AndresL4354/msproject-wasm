@@ -105,7 +105,7 @@ Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de c
 
 Los mismos bloques salen también como **Markdown** (`--markdown`, `docToMarkdown`): títulos con `#` según su nivel, listas con su numeración o viñeta e indentación, tablas GFM (las celdas combinadas dejan su lugar vacío, sin filas ni columnas en blanco), notas al pie como `[^1]` y, en Word, **negrita**, *cursiva* y enlaces. En PDF cada página empieza con `<!-- pagina N -->`, para citar de dónde sale cada parte.
 
-El texto del documento **nunca se vuelve marca ni HTML**: se escapan `<`, `[`, `]`, `` ` ``, las entidades (`&lt;`), las barras invertidas y lo que al inicio de una línea abriría un título, una cita, una lista o una línea horizontal. Los enlaces de Word solo salen si son `http`, `https` o `mailto`; los demás (`javascript:`, `data:`, `file:`…) quedan como texto. Así el Markdown se puede mostrar como HTML sin que un documento inyecte etiquetas o enlaces. Una celda no ocupa más de 64 columnas y una tabla no pasa de 64: lo que sobra se junta en la última columna, sin perder texto.
+El texto del documento **nunca se vuelve marca ni HTML**: se escapan `<`, `[`, `]`, `` ` ``, las entidades (`&lt;`), las barras invertidas y lo que al inicio de una línea (también después de un `\r` suelto) abriría un título, una cita, una lista o una línea horizontal; una cita de nota (`[^1]`) no se vuelve enlace ni definición con lo que la sigue. Los enlaces de Word solo salen si son `http`, `https` o `mailto`; los demás (`javascript:`, `data:`, `file:`…) quedan como texto. Este escape evita que el texto del documento se lea como marca, pero **no reemplaza a un sanitizador**: si el Markdown se va a mostrar como HTML, conviértalo con un renderizador que no deje pasar HTML y limpie el resultado antes de insertarlo en la página. Una celda no ocupa más de 64 columnas y una tabla no pasa de 64: lo que sobra se junta en la última columna, sin perder texto.
 
 Y como **fragmentos** listos para indexar o enviar a un modelo (`--fragmentos[=N]`, `docToChunks`), de hasta N caracteres (2000 por defecto, unos 500 tokens en castellano):
 
@@ -115,7 +115,8 @@ Y como **fragmentos** listos para indexar o enviar a un modelo (`--fragmentos[=N
 ```
 
 - Cada fragmento empieza en un título cuando se puede y trae en `path` los títulos de las secciones que lo contienen; en PDF, `pages` con la primera y la última página.
-- Nunca corta un bloque, salvo que el bloque solo sea más grande que el fragmento: un párrafo se corta al final de una oración, una tabla por filas repitiendo el encabezado, y una fila con una celda enorme en filas de continuación con las mismas columnas.
+- Nunca corta un bloque, salvo que el bloque solo sea más grande que el fragmento: un párrafo se corta al final de una oración, una tabla por filas repitiendo el encabezado, una fila con una celda enorme en filas de continuación con las mismas columnas, y un título muy largo como un párrafo.
+- Ningún fragmento pasa el tamaño pedido (200 caracteres como mínimo). Las pruebas lo comprueban con tablas muy anchas, filas y títulos más largos que el fragmento y documentos armados al azar.
 - Una sección más corta que 200 caracteres se junta con la siguiente; un título queda con el bloque que lo sigue: si ese bloque no cabe, el título pasa con él al fragmento siguiente.
 - En `path` cada título va en una línea y con 200 caracteres como máximo (el texto del fragmento lo trae completo).
 - Muchas plantillas escriben los títulos de sección como una tabla de una sola celda ("1. OBJETIVO"): se tratan como título, con el nivel que dé su numeración, si el texto está numerado ("3.2 Responsables") o en mayúsculas. Un recuadro con una advertencia ("Use casco en todo momento") sigue siendo tabla.
@@ -393,7 +394,6 @@ node web/prueba.mjs
 **doc2json**
 
 - **No hace OCR.** Un PDF escaneado (solo imagen) no tiene texto que extraer; se informa en `warnings`.
-- Fragmentos: el tamaño máximo se respeta siempre, salvo una fila de una tabla muy ancha (decenas de columnas con texto) con un tamaño chico, donde ni repartiéndola cabe junto al encabezado. Probado con 896 documentos reales: 0 fragmentos sobre el máximo con 2000 caracteres y 1 de 57.558 con 800.
 - En PDF la estructura es una deducción. Funciona bien en documentos de oficina, informes y certificados; puede equivocarse con diseños muy libres (afiches, planos, revistas a varias columnas con recuadros).
 - Las tablas de PDF se detectan por alineación del texto, no por sus líneas dibujadas. Una tabla con celdas de varias líneas puede salir partida en más filas.
 - No abre PDF con cifrado AES-256 ni los que piden contraseña para abrirse: da un mensaje claro.

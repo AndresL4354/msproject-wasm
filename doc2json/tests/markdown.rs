@@ -38,16 +38,27 @@ fn zip(partes: &[(&str, &str)]) -> Vec<u8> {
     out
 }
 
+const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
 /// Un .docx minimo con ese cuerpo y, si hace falta, relaciones del documento.
 fn docx(cuerpo: &str, rels: &str) -> Vec<u8> {
-    let w = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
-    let documento = format!(r#"<?xml version="1.0"?><w:document {}><w:body>{}</w:body></w:document>"#, w, cuerpo);
+    docx_con_notas(cuerpo, rels, "")
+}
+
+/// Como `docx`, con notas al pie (`word/footnotes.xml`) si `notas` no esta vacio.
+fn docx_con_notas(cuerpo: &str, rels: &str, notas: &str) -> Vec<u8> {
+    let documento = format!(r#"<?xml version="1.0"?><w:document {}><w:body>{}</w:body></w:document>"#, W, cuerpo);
     let rels_doc = format!(r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{}</Relationships>"#, rels);
-    zip(&[
+    let notas_xml = format!(r#"<?xml version="1.0"?><w:footnotes {}>{}</w:footnotes>"#, W, notas);
+    let mut partes = vec![
         ("_rels/.rels", r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#),
-        ("word/document.xml", &documento),
-        ("word/_rels/document.xml.rels", &rels_doc),
-    ])
+        ("word/document.xml", documento.as_str()),
+        ("word/_rels/document.xml.rels", rels_doc.as_str()),
+    ];
+    if !notas.is_empty() {
+        partes.push(("word/footnotes.xml", notas_xml.as_str()));
+    }
+    zip(&partes)
 }
 
 fn parrafo(texto: &str) -> String {
@@ -228,6 +239,163 @@ fn una_tabla_muy_ancha_respeta_el_tamano_de_los_fragmentos() {
         let juntas = palabras(&c.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join("\n"));
         for w in &todo {
             assert!(juntas.binary_search(w).is_ok(), "max {}: falta {}", max, w);
+        }
+    }
+}
+
+/// Nota al pie con id 1 y un parrafo que la cita: con ella, `[1]` en el texto pasa a `[^1]`.
+const NOTA: &str = r#"<w:footnote w:id="1"><w:p><w:r><w:t>Solo equipos electricos.</w:t></w:r></w:p></w:footnote>"#;
+const CITA: &str = r#"<w:p><w:r><w:t>Texto con nota</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
+
+#[test]
+fn una_cita_de_nota_no_abre_un_enlace_ni_una_definicion() {
+    // "[^1](javascript:...)" es un enlace para un lector sin notas al pie, y "[^1]: ..." al inicio
+    // de una linea es una definicion que reemplazaria la nota (o el destino de sus citas).
+    // Tambien con la cita y el "(" en tramos distintos: el subrayado los separa sin dejar marca.
+    let tramos = r#"<w:p><w:r><w:rPr><w:u w:val="single"/></w:rPr><w:t>Otra</w:t><w:footnoteReference w:id="1"/></w:r><w:r><w:t>(javascript:alert(3))</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> fin</w:t></w:r></w:p>"#;
+    let cuerpo = [CITA, &parrafo("[1](javascript:alert(1)) y [1]:x"), &parrafo("[1]: javascript:alert(2)"), tramos].concat();
+    let bytes = docx_con_notas(&cuerpo, "", NOTA);
+    let md = doc2json::to_markdown(&bytes).unwrap();
+    assert!(md.contains("Texto con nota[^1]"), "{}", md);
+    assert!(!md.contains("[^1]("), "{}", md);
+    assert!(md.contains("[^1]\\(javascript:alert(1)) y [^1]\\:x"), "{}", md);
+    assert!(md.contains("Otra[^1]\\(javascript:alert(3)) **fin**"), "{}", md);
+    // La unica definicion de la nota es la que arma el conversor al final.
+    let definiciones: Vec<&str> = md.lines().filter(|l| l.starts_with("[^1]:")).collect();
+    assert_eq!(definiciones, ["[^1]: Solo equipos electricos."], "{}", md);
+    let d = doc2json::read(&bytes).unwrap();
+    for c in doc2json::markdown::chunks(&d, 200) {
+        assert!(!c.text.contains("[^1]("), "{}", c.text);
+        assert!(c.path == ["Notas"] || !c.text.lines().any(|l| l.starts_with("[^1]:")), "{}", c.text);
+    }
+}
+
+#[test]
+fn muchos_corchetes_sin_cerrar_con_una_nota_es_lineal() {
+    // Cada "[" busca su "]" solo en el largo que puede tener una etiqueta: antes recorria todo el
+    // resto del texto (un millon de corchetes: ~5 * 10^11 comparaciones).
+    let cuerpo = [CITA, &parrafo(&"[".repeat(1_000_000))].concat();
+    let d = doc2json::read(&docx_con_notas(&cuerpo, "", NOTA)).unwrap();
+    let inicio = Instant::now();
+    let md = doc2json::markdown::to_markdown(&d);
+    assert!(inicio.elapsed().as_secs() < 3, "{:?}", inicio.elapsed());
+    assert_eq!(md.matches("\\[").count(), 1_000_000);
+}
+
+#[test]
+fn un_numero_al_inicio_se_escapa_sin_dejar_la_barra_visible() {
+    // En CommonMark "\1" no es un escape (la barra se ve): se escapa el punto o el parentesis.
+    let cuerpo = [parrafo("1. Objetivo"), parrafo("2) Alcance"), parrafo("10. Fin"), parrafo("2024. Un buen anio"), parrafo("3.2 Responsables")].concat();
+    let md = doc2json::to_markdown(&docx(&cuerpo, "")).unwrap();
+    assert_eq!(md, "1\\. Objetivo\n\n2\\) Alcance\n\n10\\. Fin\n\n2024\\. Un buen anio\n\n3.2 Responsables\n");
+}
+
+#[test]
+fn un_retorno_de_carro_suelto_no_abre_marcas_ni_rompe_la_tabla() {
+    // CommonMark tambien termina una linea en un "\r" solo (sin "\n").
+    let tabla = format!("<w:tbl><w:tr>{}{}</w:tr><w:tr>{}{}</w:tr></w:tbl>", celda("A", ""), celda("B", ""), celda("x&#13;# no titulo", ""), celda("y&#13;&#13;z", ""));
+    let recuadro = format!("<w:tbl><w:tr>{}</w:tr></w:tbl>", celda("OBJETIVO&#13;# NO TITULO", ""));
+    let cuerpo = [parrafo("linea&#13;# no titulo&#13;- no item&#13;1. no lista"), tabla, recuadro].concat();
+    let bytes = docx(&cuerpo, "");
+    let md = doc2json::to_markdown(&bytes).unwrap();
+    assert!(!md.contains('\r'), "{:?}", md);
+    for linea in md.split(['\n', '\r']) {
+        assert!(!linea.starts_with('#') && !linea.starts_with("- ") && !linea.starts_with("1. "), "{:?}\n{:?}", linea, md);
+    }
+    assert!(md.contains("linea\n\\# no titulo\n\\- no item\n1\\. no lista"), "{:?}", md);
+    // Dentro de una celda "#" no abre nada: basta con que la fila siga en una sola linea.
+    assert!(md.contains("| x<br># no titulo | y<br>z |"), "{:?}", md);
+    assert!(md.contains("| OBJETIVO<br># NO TITULO |"), "{:?}", md);
+    let d = doc2json::read(&bytes).unwrap();
+    for c in doc2json::markdown::chunks(&d, 200) {
+        assert!(!c.text.contains('\r') && c.path.is_empty(), "{:?}", c);
+    }
+}
+
+fn titulo(texto: &str) -> String {
+    format!(r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t xml:space="preserve">{}</w:t></w:r></w:p>"#, texto)
+}
+
+#[test]
+fn un_titulo_largo_no_pasa_el_tamano_del_fragmento() {
+    // Un titulo que casi llena el fragmento despues de una seccion corta (se juntaban y pasaban el
+    // maximo) y otro mas largo que el fragmento mismo (salia entero).
+    let corto = "Texto corto. ".repeat(10);
+    let medio = "Otro titulo que casi llena el fragmento ".repeat(12);
+    let largo = "Titulo extenso de la seccion ".repeat(40);
+    let cuerpo = [parrafo(&corto), titulo(&medio), parrafo("Mas texto."), titulo(&largo), parrafo("Texto de la seccion.")].concat();
+    let d = doc2json::read(&docx(&cuerpo, "")).unwrap();
+    for max in [200, 300, 500, 600] {
+        let c = doc2json::markdown::chunks(&d, max);
+        assert!(c.iter().all(|x| x.text.chars().count() <= max), "{}: {:?}", max, c.iter().map(|x| x.text.chars().count()).collect::<Vec<_>>());
+        let todo = c.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert_eq!(todo.matches("Texto corto").count(), 10);
+        assert_eq!(todo.matches("Otro titulo").count(), 12);
+        assert_eq!(todo.matches("Titulo extenso").count(), 40);
+        // El texto de la seccion sigue con la ruta de su titulo.
+        let seccion = c.iter().find(|x| x.text.contains("Texto de la seccion.")).unwrap();
+        assert!(seccion.path.len() == 1 && seccion.path[0].starts_with("Titulo extenso"), "{}: {:?}", max, seccion.path);
+    }
+}
+
+/// Generador pseudoaleatorio con semilla fija (xorshift): la prueba da siempre lo mismo.
+struct Azar(u64);
+
+impl Azar {
+    fn hasta(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % n as u64) as usize
+    }
+
+    fn texto(&mut self, palabras: usize) -> String {
+        const P: [&str; 16] = ["casco", "bloqueo", "1.", "#", "-", "[1]", "<b>", "ñandú", "🦺", "Riesgo.", "\\", "|", "`x`", "&lt;", "OBJETIVO", "verificar"];
+        (0..palabras).map(|_| P[self.hasta(P.len())]).collect::<Vec<_>>().join(" ")
+    }
+}
+
+#[test]
+fn ningun_fragmento_pasa_el_maximo() {
+    // Documentos armados al azar con todo tipo de bloques y largos: titulos mas largos que el
+    // fragmento, secciones cortas, tablas anchas y angostas, imagenes, listas y notas.
+    use doc2json::doc::{Block, Cell, Document};
+    let mut azar = Azar(0x2545_F491_4F6C_DD1D);
+    for _ in 0..300 {
+        let mut content = Vec::new();
+        for _ in 0..azar.hasta(25) + 1 {
+            let largo = [1, 4, 20, 80, 300][azar.hasta(5)];
+            let palabras = azar.hasta(largo) + 1;
+            let texto = azar.texto(palabras);
+            content.push(match azar.hasta(7) {
+                0 => Block { kind: Kind::Heading, level: azar.hasta(4) as u8 + 1, text: texto, ..Block::default() },
+                1 => Block { kind: Kind::Title, text: texto, ..Block::default() },
+                2 => Block { kind: Kind::ListItem, ordered: true, marker: Some("1.".into()), level: azar.hasta(3) as u8, text: texto, ..Block::default() },
+                3 => {
+                    let (filas, columnas) = (azar.hasta(6) + 1, azar.hasta(10) + 1);
+                    let mut rows = Vec::new();
+                    for _ in 0..filas {
+                        let mut fila = Vec::new();
+                        for _ in 0..columnas {
+                            let palabras = azar.hasta(largo) + 1;
+                            fila.push(Cell { text: azar.texto(palabras), colspan: 1, rowspan: 1, merged: false });
+                        }
+                        rows.push(fila);
+                    }
+                    Block { kind: Kind::Table, rows, ..Block::default() }
+                }
+                4 => Block { kind: Kind::Image, name: Some("media/imagen 1.png".into()), text: texto, ..Block::default() },
+                5 => Block { kind: Kind::Table, rows: vec![vec![Cell { text: "3.2 RESPONSABLES".into(), colspan: 1, rowspan: 1, merged: false }]], ..Block::default() },
+                _ => Block { kind: Kind::Paragraph, text: texto, ..Block::default() },
+            });
+        }
+        let palabras = azar.hasta(200) + 1;
+        let notas = vec![Block { label: Some("1".into()), text: azar.texto(palabras), ..Block::default() }];
+        let d = Document { kind: "docx", content, extras: vec![("footnotes", notas)], ..Document::default() };
+        for max in [200, 257, 400, 1000] {
+            for c in doc2json::markdown::chunks(&d, max) {
+                assert!(c.text.chars().count() <= max, "{}: {}\n{}", max, c.text.chars().count(), c.text);
+            }
         }
     }
 }
