@@ -13,9 +13,78 @@ use super::filters::{self, Parms};
 use super::object::{Dict, Obj};
 use crate::inflate;
 use crate::png::{self, Color, Spec};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Tope de pixeles por imagen al extraer (5.000 x 5.000): mas alla, la memoria no compensa.
 pub const MAX_PIXELS: u64 = 25_000_000;
+
+/// Bytes de la tabla de una paleta que se pueden usar: 256 entradas de hasta 4 componentes.
+const MAX_LOOKUP: usize = 256 * 4;
+
+/// Mascara suave decodificada: transparencia en 8 bits y color `/Matte` (0-255), si lo trae.
+struct Mask {
+    alpha: Vec<u8>,
+    matte: Option<Vec<f64>>,
+}
+
+/// Lo que varias imagenes comparten y se decodifica una sola vez por documento: las tablas de
+/// las paletas `/Indexed` y las mascaras suaves, por numero de objeto.
+pub struct Shared {
+    /// Tablas de paletas, recortadas a `MAX_LOOKUP` bytes.
+    lookups: HashMap<u32, Rc<Vec<u8>>>,
+    /// Mascaras ya decodificadas (`None` si no sirven). Cada una se guarda solo mientras le
+    /// queden imagenes por usarla, segun `mask_uses`.
+    masks: HashMap<u32, Option<Rc<Mask>>>,
+    mask_uses: HashMap<u32, usize>,
+}
+
+impl Shared {
+    /// Cuenta cuantas de las imagenes `objs` usan cada mascara suave.
+    pub fn new(objs: &[Rc<Obj>]) -> Shared {
+        let mut mask_uses = HashMap::new();
+        for o in objs {
+            if let Some(Obj::Ref(n, _)) = o.as_dict().and_then(|d| d.get("SMask")) {
+                *mask_uses.entry(*n).or_insert(0) += 1;
+            }
+        }
+        Shared { lookups: HashMap::new(), masks: HashMap::new(), mask_uses }
+    }
+
+    /// Tabla de colores de una paleta. La de un objeto indirecto se lee una sola vez.
+    fn lookup(&mut self, pdf: &Pdf, l: &Obj) -> Rc<Vec<u8>> {
+        let key = match l {
+            Obj::Ref(n, _) => Some(*n),
+            _ => None,
+        };
+        if let Some(t) = key.and_then(|n| self.lookups.get(&n)) {
+            return t.clone();
+        }
+        let table = resolved(pdf, l, |o| match o {
+            Obj::Str(s) => s[..s.len().min(MAX_LOOKUP)].to_vec(),
+            s @ Obj::Stream { .. } => {
+                let mut t = pdf.stream_data(s).unwrap_or_default();
+                t.truncate(MAX_LOOKUP);
+                t.shrink_to_fit();
+                t
+            }
+            _ => Vec::new(),
+        });
+        let table = Rc::new(table);
+        if let Some(n) = key {
+            self.lookups.insert(n, table.clone());
+        }
+        table
+    }
+}
+
+/// Aplica `f` al objeto final de `o`. A diferencia de `Pdf::resolve`, no copia un objeto directo.
+fn resolved<R>(pdf: &Pdf, o: &Obj, f: impl FnOnce(&Obj) -> R) -> R {
+    match o {
+        Obj::Ref(..) => f(&pdf.resolve(o)),
+        other => f(other),
+    }
+}
 
 const NOTE_JBIG2: &str = "Imagen JBIG2 (tipica de escaneos en blanco y negro): no se convierte.";
 
@@ -68,9 +137,10 @@ fn inverted(pdf: &Pdf, d: &Dict) -> bool {
     }
 }
 
-fn space(pdf: &Pdf, obj: &Obj, depth: usize) -> Space {
-    let o = pdf.resolve(obj);
-    match &*o {
+/// Espacio de color. Sin `shared` no se lee la tabla de una paleta (para clasificar basta saber
+/// que es indexado): `Space::Indexed` queda vacio.
+fn space(pdf: &Pdf, obj: &Obj, depth: usize, shared: Option<&mut Shared>) -> Space {
+    resolved(pdf, obj, |o| match o {
         Obj::Name(n) => match n.as_str() {
             "DeviceGray" | "G" | "CalGray" => Space::Gray,
             "DeviceRGB" | "RGB" | "CalRGB" => Space::Rgb,
@@ -96,13 +166,16 @@ fn space(pdf: &Pdf, obj: &Obj, depth: usize) -> Space {
                     }
                 }
                 "Indexed" | "I" => {
-                    let base = a.get(1).map(|b| space(pdf, b, depth + 1)).unwrap_or(Space::Other("Indexed".into()));
-                    let hival = a.get(2).and_then(|v| pdf.resolve(v).as_i64()).unwrap_or(0).clamp(0, 255) as usize;
-                    let lookup: Vec<u8> = match a.get(3).map(|l| pdf.resolve(l)).as_deref() {
-                        Some(Obj::Str(s)) => s.clone(),
-                        Some(s @ Obj::Stream { .. }) => pdf.stream_data(s).unwrap_or_default(),
-                        _ => Vec::new(),
+                    let base = a.get(1).map(|b| space(pdf, b, depth + 1, None)).unwrap_or(Space::Other("Indexed".into()));
+                    if !matches!(base, Space::Rgb | Space::Cmyk | Space::Tint | Space::Gray) {
+                        return Space::Other("Indexed".into());
+                    }
+                    let shared = match shared {
+                        Some(s) => s,
+                        None => return Space::Indexed(Vec::new()),
                     };
+                    let hival = a.get(2).and_then(|v| resolved(pdf, v, |x| x.as_i64())).unwrap_or(0).clamp(0, 255) as usize;
+                    let lookup = a.get(3).map(|l| shared.lookup(pdf, l)).unwrap_or_default();
                     let n = base.components();
                     let mut palette = Vec::with_capacity((hival + 1) * 3);
                     for i in 0..=hival {
@@ -111,20 +184,19 @@ fn space(pdf: &Pdf, obj: &Obj, depth: usize) -> Space {
                             Space::Rgb => [at(0), at(1), at(2)],
                             Space::Cmyk => cmyk([at(0), at(1), at(2), at(3)]),
                             Space::Tint => [255 - at(0); 3],
-                            Space::Gray => [at(0); 3],
-                            _ => return Space::Other("Indexed".into()),
+                            _ => [at(0); 3],
                         };
                         palette.extend_from_slice(&rgb);
                     }
                     Space::Indexed(palette)
                 }
                 "Separation" => Space::Tint,
-                "DeviceN" if a.get(1).and_then(|x| pdf.resolve(x).as_array().map(|v| v.len())) == Some(1) => Space::Tint,
+                "DeviceN" if a.get(1).and_then(|x| resolved(pdf, x, |v| v.as_array().map(|v| v.len()))) == Some(1) => Space::Tint,
                 other => Space::Other(other.to_string()),
             }
         }
         _ => Space::Other("desconocido".into()),
-    }
+    })
 }
 
 fn cmyk(c: [u8; 4]) -> [u8; 3] {
@@ -140,22 +212,23 @@ fn filter_names(pdf: &Pdf, d: &Dict) -> Vec<String> {
     }
 }
 
-fn image_space(pdf: &Pdf, d: &Dict) -> Space {
+fn image_space(pdf: &Pdf, d: &Dict, shared: Option<&mut Shared>) -> Space {
     if flag(pdf, d, "ImageMask") || flag(pdf, d, "IM") {
         return Space::Gray;
     }
     match d.get("ColorSpace").or_else(|| d.get("CS")) {
-        Some(cs) => space(pdf, cs, 0),
+        Some(cs) => space(pdf, cs, 0, shared),
         None => Space::Other("sin espacio de color".into()),
     }
 }
 
-/// Formato con que se entregaria la imagen y, si no se puede entregar, por que. No decodifica.
+/// Formato con que se entregaria la imagen y, si no se puede entregar, por que. No decodifica
+/// nada, tampoco la tabla de una paleta.
 pub fn classify(pdf: &Pdf, d: &Dict) -> (&'static str, Option<String>) {
     if let Some(f) = filter_names(pdf, d).iter().find_map(|n| image_filter(n)) {
         return (f, (f == "jbig2").then(|| NOTE_JBIG2.to_string()));
     }
-    match image_space(pdf, d) {
+    match image_space(pdf, d, None) {
         Space::Other(name) => ("desconocido", Some(format!("Espacio de color {} no soportado.", name))),
         _ => ("png", None),
     }
@@ -189,8 +262,32 @@ pub fn place(m: [f64; 6], bbox: [f64; 4], rotate: i64) -> (f64, f64, f64, f64) {
     (r(x0), r(ph - y1), r(x1 - x0), r(y1 - y0))
 }
 
+/// Bytes que costara extraer la imagen segun lo que declara, sin leer sus datos: sus pixeles
+/// decodificados (y los de su mascara suave, si la trae) o, si se entrega tal cual (JPEG, JPEG
+/// 2000, fax o JBIG2), el largo del flujo. 0 si `extract` la rechaza sin leer nada.
+pub fn work(pdf: &Pdf, obj: &Obj) -> usize {
+    let (d, len) = match obj {
+        Obj::Stream { dict, len, .. } => (dict, *len),
+        _ => return 0,
+    };
+    let (w, h) = match size(pdf, d) {
+        Some((w, h)) if w as u64 * h as u64 <= MAX_PIXELS => (w, h),
+        _ => return 0,
+    };
+    if filter_names(pdf, d).iter().any(|n| image_filter(n).is_some()) {
+        return len;
+    }
+    let space = image_space(pdf, d, None);
+    if let Space::Other(_) = space {
+        return 0;
+    }
+    let pixels = image_bytes(w, h, space.components(), bits(pdf, d)).unwrap_or(usize::MAX);
+    let mask = if d.get("SMask").is_some() { w as usize * h as usize } else { 0 };
+    pixels.saturating_add(mask)
+}
+
 /// Extrae la imagen: formato y bytes del archivo, o el motivo por el que no se entrega.
-pub fn extract(pdf: &Pdf, obj: &Obj) -> Result<(&'static str, Vec<u8>), String> {
+pub fn extract(pdf: &Pdf, shared: &mut Shared, obj: &Obj) -> Result<(&'static str, Vec<u8>), String> {
     let d = match obj {
         Obj::Stream { dict, .. } => dict,
         _ => return Err("El objeto no es una imagen.".into()),
@@ -198,6 +295,12 @@ pub fn extract(pdf: &Pdf, obj: &Obj) -> Result<(&'static str, Vec<u8>), String> 
     let (w, h) = size(pdf, d).ok_or("La imagen no declara su tamano.")?;
     if w as u64 * h as u64 > MAX_PIXELS {
         return Err(format!("Imagen demasiado grande para extraerla ({} x {} pixeles).", w, h));
+    }
+    // Un espacio de color que no se convierte se rechaza antes de decodificar (`work` la cuenta en 0).
+    if !filter_names(pdf, d).iter().any(|n| image_filter(n).is_some()) {
+        if let Space::Other(name) = image_space(pdf, d, None) {
+            return Err(format!("Espacio de color {} no soportado.", name));
+        }
     }
     let (mut data, chain) = pdf.stream_parts(obj).ok_or("No se pudieron leer los datos de la imagen.")?;
     let last = chain.len().saturating_sub(1);
@@ -210,13 +313,13 @@ pub fn extract(pdf: &Pdf, obj: &Obj) -> Result<(&'static str, Vec<u8>), String> 
             };
         }
         if i == last && matches!(name.as_str(), "FlateDecode" | "Fl") {
-            if let Some(png) = passthrough(pdf, d, &data, w, h, parms) {
+            if let Some(png) = passthrough(pdf, shared, d, &data, w, h, parms) {
                 return Ok(("png", png));
             }
         }
         data = filters::apply(name, &data, parms).ok_or_else(|| format!("Filtro {} no soportado.", name))?;
     }
-    pixels_to_png(pdf, d, data, w, h).map(|p| ("png", p))
+    pixels_to_png(pdf, shared, d, data, w, h).map(|p| ("png", p))
 }
 
 fn bits(pdf: &Pdf, d: &Dict) -> u8 {
@@ -230,19 +333,16 @@ fn bits(pdf: &Pdf, d: &Dict) -> u8 {
 }
 
 /// Los datos Flate con predictor PNG ya son el contenido de IDAT de un PNG. Se copian solo si un
-/// lector de PNG estricto los aceptaria: zlib sin diccionario, filas completas, tipos de filtro
-/// 0 a 4 y suma Adler-32 correcta. Si no, `None` y la imagen se decodifica y se vuelve a comprimir.
-fn passthrough(pdf: &Pdf, d: &Dict, data: &[u8], w: u32, h: u32, p: &Parms) -> Option<Vec<u8>> {
+/// lector de PNG estricto los aceptaria: zlib que pasa `inflate::zlib_strict` (sin diccionario,
+/// bloques bien formados, sin bytes entre el final y la suma Adler-32, y esa suma correcta),
+/// filas completas y tipos de filtro 0 a 4. Si no, `None` y la imagen se decodifica y se vuelve
+/// a comprimir.
+fn passthrough(pdf: &Pdf, shared: &mut Shared, d: &Dict, data: &[u8], w: u32, h: u32, p: &Parms) -> Option<Vec<u8>> {
     if d.get("SMask").is_some() || p.predictor < 10 || inverted(pdf, d) {
         return None;
     }
-    // Encabezado zlib valido y sin diccionario previo: algunos PDF traen DEFLATE sin el, y un
-    // PNG no admite ninguna de las dos cosas.
-    if data.len() < 6 || data[0] & 0x0F != 8 || ((data[0] as u32) << 8 | data[1] as u32) % 31 != 0 || data[1] & 0x20 != 0 {
-        return None;
-    }
     let bpc = bits(pdf, d);
-    let (color, palette) = match image_space(pdf, d) {
+    let (color, palette) = match image_space(pdf, d, Some(shared)) {
         Space::Gray => (Color::Gray, Vec::new()),
         Space::Rgb if bpc >= 8 => (Color::Rgb, Vec::new()),
         Space::Indexed(pal) if bpc <= 8 => (Color::Palette, pal),
@@ -253,12 +353,8 @@ fn passthrough(pdf: &Pdf, d: &Dict, data: &[u8], w: u32, h: u32, p: &Parms) -> O
     }
     let spec = Spec { width: w, height: h, depth: bpc, color, palette: fit_palette(palette, bpc) };
     let row = png::row_bytes(&spec)?.checked_add(1)?;
-    let rows = inflate::inflate(&data[2..]);
-    let adler = u32::from_be_bytes([data[data.len() - 4], data[data.len() - 3], data[data.len() - 2], data[data.len() - 1]]);
-    let valid = rows.ok
-        && Some(rows.data.len()) == row.checked_mul(h as usize)
-        && rows.data.chunks(row).all(|r| r[0] <= 4)
-        && png::adler32(&rows.data) == adler;
+    let rows = inflate::zlib_strict(data)?;
+    let valid = Some(rows.len()) == row.checked_mul(h as usize) && rows.chunks(row).all(|r| r[0] <= 4);
     valid.then(|| png::from_idat(&spec, data))
 }
 
@@ -344,40 +440,67 @@ fn to_8bit(space: &Space, data: &[u8], w: u32, h: u32, bpc: u8, invert: bool) ->
     Ok((out, if gray { Color::Gray } else { Color::Rgb }))
 }
 
-/// Mascara suave (transparencia) en 8 bits, si tiene el mismo tamano que la imagen, y su color
-/// `/Matte` (0-255) si los colores de la imagen vienen ya mezclados con el.
-fn soft_mask(pdf: &Pdf, d: &Dict, w: u32, h: u32) -> Option<(Vec<u8>, Option<Vec<f64>>)> {
-    let obj = pdf.resolve(d.get("SMask")?);
-    let md = match &*obj {
-        Obj::Stream { dict, .. } => dict,
+/// Mascara suave (transparencia) de la imagen, si tiene su mismo tamano. Una mascara que
+/// comparten varias imagenes se decodifica con la primera y se guarda hasta la ultima.
+fn soft_mask(pdf: &Pdf, shared: &mut Shared, d: &Dict, w: u32, h: u32) -> Option<Rc<Mask>> {
+    // Una mascara es un flujo, y los flujos son siempre objetos indirectos.
+    let entry = d.get("SMask")?;
+    let n = match entry {
+        Obj::Ref(n, _) => *n,
         _ => return None,
     };
-    if size(pdf, md)? != (w, h) {
-        return None;
+    let left = shared.mask_uses.get_mut(&n).map_or(0, |c| {
+        *c = c.saturating_sub(1);
+        *c
+    });
+    let obj = pdf.resolve(entry);
+    let fits = match &*obj {
+        Obj::Stream { dict, .. } => size(pdf, dict) == Some((w, h)),
+        _ => false,
+    };
+    // De otro tamano no se usa ni se decodifica.
+    let mask = if !fits {
+        None
+    } else if let Some(m) = shared.masks.get(&n) {
+        m.clone()
+    } else {
+        decode_mask(pdf, &obj, w, h).map(Rc::new)
+    };
+    if left > 0 && fits {
+        shared.masks.insert(n, mask.clone());
+    } else if left == 0 {
+        shared.masks.remove(&n);
     }
-    let data = pdf.stream_data(&obj)?;
+    mask
+}
+
+/// Decodifica una mascara suave de `w` x `h` en 8 bits, con su color `/Matte` (0-255) si los
+/// colores de la imagen vienen ya mezclados con el.
+fn decode_mask(pdf: &Pdf, obj: &Obj, w: u32, h: u32) -> Option<Mask> {
+    let md = obj.as_dict()?;
+    let data = pdf.stream_data(obj)?;
     // Una mascara sin datos que la respalden se ignora: la imagen sale sin transparencia.
     enough(data.len(), image_bytes(w, h, 1, bits(pdf, md))).ok()?;
     let matte = pdf.array(md, "Matte").map(|m| m.iter().map(|v| v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).collect());
-    to_8bit(&Space::Gray, &data, w, h, bits(pdf, md), inverted(pdf, md)).ok().map(|(a, _)| (a, matte))
+    to_8bit(&Space::Gray, &data, w, h, bits(pdf, md), inverted(pdf, md)).ok().map(|(alpha, _)| Mask { alpha, matte })
 }
 
-fn pixels_to_png(pdf: &Pdf, d: &Dict, mut data: Vec<u8>, w: u32, h: u32) -> Result<Vec<u8>, String> {
+fn pixels_to_png(pdf: &Pdf, shared: &mut Shared, d: &Dict, mut data: Vec<u8>, w: u32, h: u32) -> Result<Vec<u8>, String> {
     let bpc = bits(pdf, d);
-    let space = image_space(pdf, d);
+    let space = image_space(pdf, d, Some(shared));
     let invert = inverted(pdf, d);
     if let Space::Other(name) = &space {
         return Err(format!("Espacio de color {} no soportado.", name));
     }
     enough(data.len(), image_bytes(w, h, space.components(), bpc))?;
-    if let Some((alpha, matte)) = soft_mask(pdf, d, w, h) {
+    if let Some(mask) = soft_mask(pdf, shared, d, w, h) {
         let (pixels, color) = to_8bit(&space, &data, w, h, bpc, invert)?;
         let ch = color.channels();
         // Con /Matte el color guardado es m + a * (c - m): se recupera c = m + (guardado - m) / a.
-        let matte = matte.filter(|m| m.len() == ch && matches!(space, Space::Gray | Space::Rgb));
-        let mut out = Vec::with_capacity(pixels.len() + alpha.len());
-        for (px, a) in pixels.chunks(ch).zip(alpha) {
-            match &matte {
+        let matte = mask.matte.as_ref().filter(|m| m.len() == ch && matches!(space, Space::Gray | Space::Rgb));
+        let mut out = Vec::with_capacity(pixels.len() + mask.alpha.len());
+        for (px, &a) in pixels.chunks(ch).zip(&mask.alpha) {
+            match matte {
                 Some(m) if a > 0 => {
                     let f = 255.0 / a as f64;
                     out.extend(px.iter().zip(m).map(|(&c, &mv)| (mv + (c as f64 - mv) * f).round().clamp(0.0, 255.0) as u8));

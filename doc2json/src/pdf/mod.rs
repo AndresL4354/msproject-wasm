@@ -184,14 +184,10 @@ pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, Strin
         let mut text = interp.out;
         unmapped += text.unmapped;
         inline_images += text.inline_images;
-        for (k, u) in std::mem::take(&mut text.uses).into_iter().enumerate() {
+        for u in std::mem::take(&mut text.uses) {
             let (x, y, w, h) = images::place(u.ctm, page.bbox, page.rotate);
             let place = Place { page: Some(i as u32 + 1), x: Some(x), y: Some(y), w, h };
-            // Un objeto sin numero (no deberia pasar con flujos) cuenta como imagen propia.
-            let key = match u.key {
-                Some(n) => n.to_string(),
-                None => format!("p{} {}", i + 1, k),
-            };
+            let key = u.key.to_string();
             let dict = match u.obj.as_dict() {
                 Some(d) => d,
                 None => continue,
@@ -243,16 +239,20 @@ pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, Strin
     doc.images = set.list;
     if let Some(limit) = extract {
         let mut budget = Budget::new(limit);
+        let mut shared = images::Shared::new(&objs);
         for (img, obj) in doc.images.iter_mut().zip(&objs) {
-            if budget.exhausted() {
+            // El tope cuenta el trabajo: lo que la imagen declara se descuenta antes de
+            // decodificarla, y una imagen que ya no cabe no se decodifica.
+            let work = images::work(&pdf, obj);
+            if !budget.reserve(work) {
                 budget.skip(img);
                 continue;
             }
-            match images::extract(&pdf, obj) {
+            match images::extract(&pdf, &mut shared, obj) {
                 Ok((format, data)) => {
                     img.format = format;
                     img.note = None;
-                    budget.store(img, data);
+                    budget.store(img, data, work);
                 }
                 Err(note) => img.note = Some(note),
             }

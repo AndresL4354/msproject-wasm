@@ -79,7 +79,8 @@ function modoImagenes(opciones) {
  * Convierte un .docx o un .pdf en un objeto con metadatos, bloques de contenido y texto plano.
  * Con `images: true` cada imagen de `images` trae sus bytes en `data` (PNG, JPEG, TIFF...; ver
  * `format` y `mime`); con `minSide` se omiten los bytes de las imagenes con un lado menor a eso.
- * Entre todas se extraen a lo sumo 128 MB por documento: las demas quedan con `note`.
+ * Entre todas cuestan a lo sumo 128 MB por documento, contados por lo que cada una declara antes
+ * de leerla (en PDF, sus pixeles decodificados): las demas no se leen y quedan con `note`.
  */
 export async function docToJson(archivo, opciones) {
   if (!opciones || !opciones.images) return JSON.parse(await docToJsonText(archivo, opciones));

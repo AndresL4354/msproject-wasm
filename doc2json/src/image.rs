@@ -8,7 +8,8 @@ use std::collections::HashMap;
 pub const MAX_IMAGES: usize = 10_000;
 /// Tope de lugares (veces que se dibujan) entre todas las imagenes del documento.
 pub const MAX_PLACES: usize = 100_000;
-/// Tope de bytes extraidos entre todas las imagenes del documento.
+/// Tope de bytes entre todas las imagenes del documento: cuenta lo que cada una declara antes de
+/// leerla (pixeles decodificados en PDF, tamano descomprimido en Word) o, si es mas, lo que entrega.
 pub const MAX_EXTRACTED: usize = 128 << 20;
 
 /// Imagenes del documento, una por archivo u objeto, en orden de aparicion.
@@ -90,7 +91,8 @@ pub fn part_key(path: &str) -> String {
     path.trim_start_matches('/').to_ascii_lowercase()
 }
 
-/// Bytes extraidos entre todas las imagenes de un documento, con su tope.
+/// Bytes que cuestan las imagenes de un documento, con su tope. Cada imagen se descuenta antes de
+/// leerla, por lo que declara: una que ya no cabe no se lee ni se decodifica.
 pub struct Budget {
     used: usize,
     limit: usize,
@@ -107,9 +109,23 @@ impl Budget {
         self.used >= self.limit
     }
 
-    /// Entrega los bytes en la imagen si caben en el tope; si no, deja una nota.
-    pub fn store(&mut self, img: &mut Image, data: Vec<u8>) {
-        match self.used.checked_add(data.len()) {
+    /// Descuenta `work`, lo que la imagen declara que costara leerla, antes de leerla. `false` si
+    /// no cabe: la imagen no se lee. Lo descontado no se devuelve aunque la imagen luego no se
+    /// entregue, porque el trabajo ya se hizo.
+    pub fn reserve(&mut self, work: usize) -> bool {
+        match self.used.checked_add(work) {
+            Some(total) if !self.exhausted() && total <= self.limit => {
+                self.used = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Entrega los bytes en la imagen, para la que ya se reservaron `reserved` bytes. Lo que pase
+    /// de lo reservado tambien se descuenta; si eso ya no cabe, deja una nota.
+    pub fn store(&mut self, img: &mut Image, data: Vec<u8>, reserved: usize) {
+        match self.used.checked_add(data.len().saturating_sub(reserved)) {
             Some(total) if total <= self.limit => {
                 self.used = total;
                 img.data = Some(data);
@@ -310,13 +326,29 @@ mod tests {
 
         let mut budget = Budget::new(10);
         let (mut x, mut y, mut z) = (Image::default(), Image::default(), Image::default());
-        budget.store(&mut x, vec![0; 6]);
-        budget.store(&mut y, vec![0; 6]);
-        budget.store(&mut z, vec![0; 4]);
+        budget.store(&mut x, vec![0; 6], 0);
+        budget.store(&mut y, vec![0; 6], 0);
+        budget.store(&mut z, vec![0; 4], 0);
         assert_eq!((x.data.is_some(), y.data.is_some(), z.data.is_some()), (true, false, true));
         assert!(y.note.as_deref().unwrap().contains("tope"));
         assert!(budget.exhausted());
         assert!(budget.warning().unwrap().starts_with("1 imagenes"));
+
+        // Lo reservado se descuenta antes de leer y no se devuelve; al entregar solo se suma lo
+        // que pase de lo reservado.
+        let mut budget = Budget::new(10);
+        assert!(budget.reserve(4));
+        assert!(!budget.reserve(7));
+        let mut a = Image::default();
+        budget.store(&mut a, vec![0; 2], 4);
+        assert!(a.data.is_some());
+        assert!(budget.reserve(6));
+        assert!(budget.exhausted() && !budget.reserve(0));
+        let mut budget = Budget::new(10);
+        assert!(budget.reserve(4));
+        let mut b = Image::default();
+        budget.store(&mut b, vec![0; 11], 4);
+        assert!(b.data.is_none());
         assert_eq!(part_key("/word/MEDIA/Image1.PNG"), part_key("word/media/image1.png"));
     }
 }
