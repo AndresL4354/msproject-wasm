@@ -107,6 +107,9 @@ pub struct Interp<'p, 'a> {
     overflow: usize,
     /// Numero del ultimo artefacto abierto.
     scopes: u32,
+    /// Largo de `marked` y valor de `overflow` al empezar el flujo en curso (pagina, anotacion o
+    /// formulario): un `EMC` que sobra no cierra lo que abrio quien invoco el flujo.
+    flow: (usize, usize),
 }
 
 fn num(o: Option<&Obj>) -> f64 {
@@ -115,7 +118,7 @@ fn num(o: Option<&Obj>) -> f64 {
 
 impl<'p, 'a> Interp<'p, 'a> {
     pub fn new(pdf: &'p Pdf<'a>, fonts: &'p FontCache) -> Interp<'p, 'a> {
-        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, marked: Vec::new(), overflow: 0, scopes: 0 }
+        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, marked: Vec::new(), overflow: 0, scopes: 0, flow: (0, 0) }
     }
 
     /// Cierra el contenido marcado que haya quedado abierto (antes de las anotaciones, que van aparte).
@@ -295,7 +298,9 @@ impl<'p, 'a> Interp<'p, 'a> {
     pub fn run(&mut self, content: &[u8], resources: &Dict, ctm: Matrix) {
         let mut st = State { ctm, font: None, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, ts: 0.0 };
         let (base, overflow, from) = (self.marked.len(), self.overflow, self.out.items.len());
+        let outer = std::mem::replace(&mut self.flow, (base, overflow));
         self.exec(content, resources, &mut st);
+        self.flow = outer;
         self.flush();
         self.close_unbalanced(base, overflow, from);
     }
@@ -410,9 +415,12 @@ impl<'p, 'a> Interp<'p, 'a> {
                 "BMC" => self.begin_marked(args.first().and_then(|a| a.as_name()), None, resources),
                 "BDC" => self.begin_marked(args.first().and_then(|a| a.as_name()), args.get(1), resources),
                 "EMC" => {
-                    if self.overflow > 0 {
+                    // Un EMC que sobra en este flujo se ignora: no cierra el contenido marcado de
+                    // la pagina que invoca al formulario.
+                    let (base, overflow) = self.flow;
+                    if self.overflow > overflow {
                         self.overflow -= 1;
-                    } else {
+                    } else if self.marked.len() > base {
                         self.marked.pop();
                     }
                 }
@@ -479,9 +487,11 @@ impl<'p, 'a> Interp<'p, 'a> {
                 inner.ctm = mul(matrix, st.ctm);
                 // El contenido marcado de un formulario tiene que cerrarse dentro de el.
                 let (base, overflow, from) = (self.marked.len(), self.overflow, self.out.items.len());
+                let outer = std::mem::replace(&mut self.flow, (base, overflow));
                 self.depth += 1;
                 self.exec(&data, &res, &mut inner);
                 self.depth -= 1;
+                self.flow = outer;
                 self.close_unbalanced(base, overflow, from);
             }
             _ => {}

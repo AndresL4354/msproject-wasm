@@ -212,3 +212,170 @@ fn figura_con_imagen_cuenta_una_sola_vez() {
     let stats = &desde[..desde.find('}').unwrap() + 1];
     assert!(stats.contains("\"images\":1"), "{}", stats);
 }
+
+/// Corre `f` y falla si tarda mas de `segundos`. Los casos de costo cuadratico tardaban minutos.
+fn a_tiempo<T>(segundos: u64, f: impl FnOnce() -> T) -> T {
+    let t = std::time::Instant::now();
+    let r = f();
+    assert!(t.elapsed() < std::time::Duration::from_secs(segundos), "tardo {:?}", t.elapsed());
+    r
+}
+
+fn largo_del_texto(d: &doc2json::Document) -> usize {
+    d.content.iter().map(|b| b.text.len()).sum()
+}
+
+#[test]
+fn texto_alternativo_compartido_tiene_un_tope() {
+    // 10.000 elementos que apuntan a una misma cadena de 8 KB: cada uno se quedaba con su copia
+    // (80 MB; con 64.000 de 64 KB, varios GB). Pasado el tope, los demas se leen sin ese texto.
+    let larga = format!("({})", "x".repeat(8 * 1024));
+    let elementos = "<< /S /P /ActualText 8 0 R >> << /S /Figure /Alt 8 0 R >> ".repeat(5_000);
+    let mas = [format!("<< /S /Document /K [9 0 R {}] >>", elementos), larga, "<< /S /P /Pg 3 0 R /K 0 >>".into()];
+    let d = doc2json::read(&etiquetado(&marcado(0, 72, 700, "Parrafo real."), "7 0 R", &mas)).unwrap();
+    assert!(largo_del_texto(&d) <= 20 << 20, "{} bytes", largo_del_texto(&d));
+    assert_eq!(d.content.first().map(|b| b.text.as_str()), Some("Parrafo real."));
+    assert!(d.warnings.iter().any(|w| w.contains("texto alternativo")), "{:?}", d.warnings);
+}
+
+#[test]
+fn atributos_compartidos_se_leen_una_vez() {
+    // 20.000 elementos con el mismo /A, un arreglo de 20.000 diccionarios: se recorria entero por
+    // cada elemento (400 millones de diccionarios).
+    let n = 20_000;
+    let atributos = format!("[{}]", "<< /O /Layout >> ".repeat(n));
+    let elementos = "<< /S /Span /A 8 0 R >> ".repeat(n);
+    let mas = [format!("<< /S /Document /K [9 0 R {}] >>", elementos), atributos, "<< /S /P /Pg 3 0 R /K 0 >>".into()];
+    let d = a_tiempo(5, || doc2json::read(&etiquetado(&marcado(0, 72, 700, "Parrafo real."), "7 0 R", &mas)).unwrap());
+    assert_eq!(textos(&d), ["Parrafo real."]);
+}
+
+#[test]
+fn rolemap_grande_no_se_recorre_por_cada_elemento() {
+    // /RoleMap de 80.000 tipos y 80.000 elementos del ultimo: cada busqueda recorria el mapa entero.
+    let n = 80_000;
+    let mapa: String = (0..n).map(|i| format!("/R{:06} /P ", i)).collect();
+    let elementos = format!("<< /S /R{:06} >> ", n - 1).repeat(n);
+    let raiz = format!("<< /Type /StructTreeRoot /RoleMap << {} >> /K 7 0 R >>", mapa);
+    let mas = [format!("<< /S /Document /K [8 0 R {}] >>", elementos), format!("<< /S /R{:06} /Pg 3 0 R /K 0 >>", n - 1)];
+    let d = a_tiempo(5, || doc2json::read(&etiquetado_con(&marcado(0, 72, 700, "Parrafo con tipo propio."), &raiz, "", &mas)).unwrap());
+    assert!(etiquetado_si(&d));
+    assert_eq!(textos(&d), ["Parrafo con tipo propio."]);
+}
+
+/// PDF etiquetado de `n` paginas: la primera (objeto 3) con `contenido` y las demas con texto
+/// suelto ("x", sin marcar). 1 catalogo, 2 paginas, 3 primera pagina, 4 su
+/// contenido, 5 raiz de la estructura, 6 fuente, 7 contenido de las demas paginas, `mas` desde el
+/// 8 y las demas paginas al final.
+fn paginas(n: usize, contenido: &str, raiz: &str, mas: &[String]) -> Vec<u8> {
+    let primera = 8 + mas.len();
+    let kids: String = std::iter::once("3 0 R ".to_string()).chain((0..n - 1).map(|i| format!("{} 0 R ", primera + i))).collect();
+    let pagina = |c: usize| format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R /Resources << /Font << /F1 6 0 R >> >> >>", c);
+    let mut objs = vec![
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R /MarkInfo << /Marked true >> >>".to_string(),
+        format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids, n),
+        pagina(4),
+        stream("", contenido),
+        raiz.to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+        stream("", "BT /F1 10 Tf 72 400 Td (x) Tj ET"),
+    ];
+    objs.extend(mas.iter().cloned());
+    objs.extend((0..n - 1).map(|_| pagina(7)));
+    pdf(&objs)
+}
+
+#[test]
+fn texto_suelto_de_muchas_paginas_no_es_cuadratico() {
+    // 10.000 paginas con texto suelto y 100.000 bloques: cada pagina buscaba su lugar entre todos
+    // los bloques y los corria para abrirlo (paginas x bloques).
+    let n = 10_000;
+    let c = marcado(0, 72, 700, &"y".repeat(12_000));
+    let elementos = "<< /S /P /ActualText (a) >> ".repeat(100_000);
+    let mas = [format!("<< /S /Document /K [9 0 R {}] >>", elementos), "<< /S /P /Pg 3 0 R /K 0 >>".into()];
+    let d = a_tiempo(5, || doc2json::read(&paginas(n, &c, "<< /Type /StructTreeRoot /K 8 0 R >>", &mas)).unwrap());
+    assert!(etiquetado_si(&d));
+    assert_eq!(d.content.len(), 1 + 100_000 + n - 1);
+    assert_eq!(d.content.iter().filter(|b| b.text == "x").count(), n - 1);
+}
+
+#[test]
+fn texto_suelto_va_despues_de_los_bloques_de_su_pagina() {
+    // Bloques del arbol en las paginas 2 y 3, el de la 3 primero en /K. El texto suelto de la
+    // pagina 1 va al comienzo, y el de cada pagina despues del ultimo bloque de esa pagina o de una
+    // anterior.
+    let suelto = |t: &str| format!("BT /F1 10 Tf 72 400 Td ({}) Tj ET\n", t);
+    let pagina = |c: usize| format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R /Resources << /Font << /F1 13 0 R >> >> >>", c);
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 3 0 R /MarkInfo << /Marked true >> >>".to_string(),
+        "<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R] /Count 3 >>".into(),
+        "<< /Type /StructTreeRoot /K 7 0 R >>".into(),
+        pagina(8),
+        pagina(9),
+        pagina(10),
+        "<< /S /Document /K [11 0 R 12 0 R] >>".into(),
+        stream("", &suelto("x")),
+        stream("", &(marcado(0, 72, 700, "Parrafo de la pagina dos.") + &suelto("w"))),
+        stream("", &(marcado(0, 72, 700, "Parrafo de la pagina tres.") + &suelto("z"))),
+        "<< /S /P /Pg 6 0 R /K 0 >>".into(),
+        "<< /S /P /Pg 5 0 R /K 0 >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
+    ];
+    let d = doc2json::read(&pdf(&objs)).unwrap();
+    assert!(etiquetado_si(&d));
+    assert_eq!(textos(&d), ["x", "Parrafo de la pagina tres.", "Parrafo de la pagina dos.", "w", "z"]);
+}
+
+fn extra<'d>(d: &'d doc2json::Document, clave: &str) -> Vec<&'d str> {
+    d.extras.iter().filter(|(k, _)| *k == clave).flat_map(|(_, b)| b.iter().map(|b| b.text.as_str())).collect()
+}
+
+#[test]
+fn bmc_bdc_y_emc_llegan_al_interprete() {
+    // Los tres operadores del contenido marcado, con propiedades en linea y por nombre: si el
+    // interprete deja de verlos (p. ej. al filtrar operadores), el PDF deja de leerse etiquetado.
+    let c = "/Artifact << /Type /Pagination /Subtype /Header >> BDC BT /F1 10 Tf 72 760 Td (Encabezado del documento) Tj ET EMC\n".to_string()
+        + "/P /MC0 BDC BT /F1 10 Tf 72 700 Td (Texto con propiedades por nombre.) Tj ET EMC\n"
+        + "/Artifact BMC BT /F1 10 Tf 72 30 Td (Pie del documento) Tj ET EMC\n";
+    let raiz = "<< /Type /StructTreeRoot /K 7 0 R >>";
+    let d = doc2json::read(&etiquetado_con(&c, raiz, "/Properties << /MC0 << /MCID 0 >> >>", &["<< /S /P /Pg 3 0 R /K 0 >>".into()])).unwrap();
+    assert!(etiquetado_si(&d));
+    assert_eq!(textos(&d), ["Texto con propiedades por nombre."]);
+    assert_eq!(extra(&d, "headers"), ["Encabezado del documento"]);
+    assert_eq!(extra(&d, "footers"), ["Pie del documento"]);
+}
+
+#[test]
+fn emc_sobrante_en_un_formulario_no_cierra_el_contenido_de_la_pagina() {
+    // El formulario cierra dos veces lo que no abrio: antes cerraba el contenido marcado de la
+    // pagina y el resto del parrafo (o del pie) quedaba fuera de su elemento.
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 612 792]", "EMC EMC");
+    let recursos = "/XObject << /Fm1 8 0 R >>";
+    let raiz = "<< /Type /StructTreeRoot /K 7 0 R >>";
+    let c = "/P << /MCID 0 >> BDC BT /F1 10 Tf 72 700 Td (Inicio del parrafo, antes del formulario.) Tj ET\n/Fm1 Do\nBT /F1 10 Tf 72 300 Td (Final del mismo parrafo.) Tj ET EMC\n";
+    let d = doc2json::read(&etiquetado_con(c, raiz, recursos, &["<< /S /P /Pg 3 0 R /K 0 >>".into(), form.clone()])).unwrap();
+    assert_eq!(textos(&d), ["Inicio del parrafo, antes del formulario. Final del mismo parrafo."]);
+    // Un pie de pagina que invoca al formulario sigue siendo artefacto despues de el.
+    let c = marcado(0, 72, 700, "Contenido de la pagina.") + "/Artifact << /Type /Pagination /Subtype /Footer >> BDC BT /F1 10 Tf 72 40 Td (Pie) Tj ET /Fm1 Do BT /F1 10 Tf 300 40 Td (Uso interno) Tj ET EMC\n";
+    let d = doc2json::read(&etiquetado_con(&c, raiz, recursos, &["<< /S /P /Pg 3 0 R /K 0 >>".into(), form])).unwrap();
+    assert_eq!(textos(&d), ["Contenido de la pagina."]);
+    assert!(extra(&d, "footers").iter().any(|t| t.contains("Uso interno")), "{:?}", extra(&d, "footers"));
+}
+
+#[test]
+fn mas_de_256_niveles_y_emc_sobrantes() {
+    // 300 niveles dentro del parrafo: pasado el tope de 256 solo se cuentan, y sus EMC no cierran
+    // el parrafo. Un formulario con un EMC de mas en el medio y los EMC que sobran al final no
+    // cambian nada.
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 612 792]", "EMC");
+    let c = "/P << /MCID 0 >> BDC BT /F1 10 Tf 72 700 Td (Antes de los niveles.) Tj ET\n".to_string()
+        + &"/Span BMC ".repeat(300)
+        + "BT /F1 10 Tf 72 680 Td (Adentro.) Tj ET /Fm1 Do\n"
+        + &"EMC ".repeat(300)
+        + "BT /F1 10 Tf 72 660 Td (Despues de los niveles.) Tj ET EMC\nEMC EMC\n"
+        + &marcado(1, 72, 600, "Otro parrafo.");
+    let raiz = "<< /Type /StructTreeRoot /K [7 0 R 8 0 R] >>";
+    let mas = ["<< /S /P /Pg 3 0 R /K 0 >>".to_string(), "<< /S /P /Pg 3 0 R /K 1 >>".into(), form];
+    let d = doc2json::read(&etiquetado_con(&c, raiz, "/XObject << /Fm1 9 0 R >>", &mas)).unwrap();
+    assert_eq!(textos(&d), ["Antes de los niveles. Adentro. Despues de los niveles.", "Otro parrafo."]);
+}

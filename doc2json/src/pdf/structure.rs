@@ -24,6 +24,15 @@ const MAX_NODES: usize = 500_000;
 const MAX_DEPTH: usize = 64;
 const MAX_HOPS: usize = 8;
 
+/// Presupuesto de `/Alt` y `/ActualText` de todo el documento, en bytes de las cadenas. Miles de
+/// elementos pueden apuntar a una misma cadena larga y cada uno se queda con su copia: pasado el
+/// tope, el elemento sigue sin ese texto (con `/ActualText` vale el de su contenido).
+const MAX_TEXT: usize = 16 << 20;
+
+/// Largo maximo de un nombre en PDF (ISO 32000-1, anexo C). Uno mas largo no es un tipo estandar
+/// ni se busca en `/RoleMap`.
+const MAX_NAME: usize = 127;
+
 /// Limites de las tablas: columnas de una fila y celdas de una tabla y de todo el documento. Las
 /// celdas combinadas se rellenan en las filas de abajo, asi que unos pocos atributos `RowSpan` y
 /// `ColSpan` pueden pedir millones de celdas; una tabla que se pasa va como parrafos.
@@ -85,26 +94,108 @@ fn has_note(node: &Node) -> bool {
 
 struct Reader<'p, 'a> {
     pdf: &'p Pdf<'a>,
-    rolemap: Option<Dict>,
+    /// `/RoleMap` en un mapa: en el diccionario cada busqueda recorre todas sus entradas.
+    rolemap: HashMap<String, String>,
     page_index: &'p HashMap<u32, usize>,
     visited: HashSet<u32>,
     nodes: usize,
+    /// `RowSpan` y `ColSpan` de los atributos que son objetos indirectos, que pueden compartir
+    /// miles de elementos: cada uno se recorre una sola vez.
+    attrs: HashMap<u32, Spans>,
+    /// Lo que queda de `MAX_TEXT`.
+    text_left: usize,
+    warnings: Vec<String>,
+}
+
+/// `RowSpan` y `ColSpan` declarados en unos atributos.
+type Spans = (Option<i64>, Option<i64>);
+
+/// Tipo estandar con ese nombre.
+fn standard(name: &str) -> Option<&'static str> {
+    STANDARD.iter().copied().find(|s| *s == name)
+}
+
+/// `/RoleMap` como mapa. Si una clave se repite vale la primera, como en `Dict::get`.
+fn rolemap(d: Option<Dict>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (k, v) in d.map(|d| d.0).unwrap_or_default() {
+        if let Obj::Name(v) = v {
+            if k.len() <= MAX_NAME && v.len() <= MAX_NAME {
+                map.entry(k).or_insert(v);
+            }
+        }
+    }
+    map
 }
 
 impl<'p, 'a> Reader<'p, 'a> {
-    /// Traduce un tipo propio del documento a uno estandar con /RoleMap (puede encadenarse).
-    fn role(&self, name: &str) -> String {
-        let mut cur = name.to_string();
+    /// Traduce un tipo propio del documento a uno estandar con /RoleMap (puede encadenarse). Un
+    /// tipo que no llega a uno estandar queda vacio: se lee como un tramo en linea (igual que un
+    /// tipo desconocido), y ningun nodo guarda una copia de un nombre largo.
+    fn role<'s>(&'s self, name: &'s str) -> &'static str {
+        let mut cur = name;
         for _ in 0..8 {
-            if STANDARD.contains(&cur.as_str()) {
-                break;
+            if cur.len() > MAX_NAME {
+                return "";
             }
-            match self.rolemap.as_ref().and_then(|m| m.get(&cur)).and_then(|o| o.as_name()) {
-                Some(next) if next != cur => cur = next.to_string(),
+            if let Some(s) = standard(cur) {
+                return s;
+            }
+            match self.rolemap.get(cur) {
+                Some(next) if next != cur => cur = next.as_str(),
                 _ => break,
             }
         }
-        cur
+        standard(cur).unwrap_or("")
+    }
+
+    /// `/Alt` o `/ActualText` de un elemento, si cabe en lo que queda de `MAX_TEXT`.
+    fn text(&mut self, d: &Dict, key: &str) -> Option<String> {
+        let obj = self.pdf.get(d, key);
+        let raw = obj.as_bytes()?;
+        if raw.len() > self.text_left {
+            // Se avisa una vez (es el unico aviso del lector); las cadenas cortas que sigan aun caben.
+            if self.warnings.is_empty() {
+                self.warnings.push("El PDF etiquetado trae demasiado texto alternativo (/Alt, /ActualText): pasado el tope, esos elementos se leen sin el.".into());
+            }
+            return None;
+        }
+        self.text_left -= raw.len();
+        Some(text_string(raw).trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    /// `RowSpan` y `ColSpan` de `/A`: un diccionario de atributos o un arreglo de ellos (con
+    /// numeros de revision). Los objetos indirectos se leen una vez y se recuerdan.
+    fn spans(&mut self, o: &Obj, in_array: bool) -> Spans {
+        let n = match o {
+            Obj::Ref(n, _) => *n,
+            _ => return self.spans_of(o, in_array),
+        };
+        if let Some(s) = self.attrs.get(&n) {
+            return *s;
+        }
+        let r = self.pdf.resolve(o);
+        let s = self.spans_of(&r, in_array);
+        self.attrs.insert(n, s);
+        s
+    }
+
+    fn spans_of(&mut self, o: &Obj, in_array: bool) -> Spans {
+        match o {
+            Obj::Array(list) if !in_array => {
+                let mut out: Spans = (None, None);
+                for it in list {
+                    let (r, c) = self.spans(it, true);
+                    out = (r.or(out.0), c.or(out.1));
+                }
+                out
+            }
+            Obj::Array(_) => (None, None),
+            _ => match o.as_dict() {
+                Some(a) => (self.pdf.get(a, "RowSpan").as_i64(), self.pdf.get(a, "ColSpan").as_i64()),
+                None => (None, None),
+            },
+        }
     }
 
     fn page_of(&self, d: &Dict) -> Option<usize> {
@@ -176,51 +267,37 @@ impl<'p, 'a> Reader<'p, 'a> {
 
     fn elem(&mut self, d: &Dict, page: Option<usize>, depth: usize) -> Option<Node> {
         self.nodes += 1;
-        let role = self.role(&self.pdf.name(d, "S")?);
+        let role = self.role(self.pdf.get(d, "S").as_name()?);
         if role == "Artifact" {
             return None;
         }
         let page = self.page_of(d).or(page);
-        let text = |key: &str| self.pdf.get(d, key).as_bytes().map(text_string).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let (alt, actual) = (text("Alt"), text("ActualText"));
+        let (alt, actual) = (self.text(d, "Alt"), self.text(d, "ActualText"));
         // Atributos de celda: /A puede ser un diccionario o un arreglo (con numeros de revision).
-        let (mut rowspan, mut colspan) = (1u32, 1u32);
-        let attrs = self.pdf.get(d, "A");
-        let mut look = |o: &Obj| {
-            if let Some(a) = self.pdf.resolve(o).as_dict() {
-                if let Some(r) = self.pdf.get(a, "RowSpan").as_i64() {
-                    rowspan = r.clamp(1, 1000) as u32;
-                }
-                if let Some(c) = self.pdf.get(a, "ColSpan").as_i64() {
-                    colspan = c.clamp(1, 1000) as u32;
-                }
-            }
+        let (rowspan, colspan) = match d.get("A") {
+            Some(a) => self.spans(a, false),
+            None => (None, None),
         };
-        match &*attrs {
-            Obj::Array(list) => list.iter().for_each(&mut look),
-            Obj::Dict(_) => look(&attrs),
-            _ => {}
-        }
-        let mut node = Node { role, alt, actual, rowspan, colspan, kids: Vec::new() };
+        let span = |v: Option<i64>| v.map_or(1, |v| v.clamp(1, 1000) as u32);
+        let mut node = Node { role: role.to_string(), alt, actual, rowspan: span(rowspan), colspan: span(colspan), kids: Vec::new() };
         if let Some(k) = d.get("K") {
-            let k = k.clone();
-            self.kids(&k, page, depth, 0, &mut node.kids);
+            self.kids(k, page, depth, 0, &mut node.kids);
         }
         Some(node)
     }
 }
 
-/// Arbol de estructura del documento, o `None` si el PDF no esta etiquetado.
-pub fn tree(pdf: &Pdf, page_index: &HashMap<u32, usize>) -> Option<Node> {
+/// Arbol de estructura del documento con los avisos de su lectura, o `None` si el PDF no esta
+/// etiquetado.
+pub fn tree(pdf: &Pdf, page_index: &HashMap<u32, usize>) -> Option<(Node, Vec<String>)> {
     let root = pdf.dict(&pdf.catalog(), "StructTreeRoot")?;
-    let mut r = Reader { pdf, rolemap: pdf.dict(&root, "RoleMap"), page_index, visited: HashSet::new(), nodes: 0 };
+    let mut r = Reader { pdf, rolemap: rolemap(pdf.dict(&root, "RoleMap")), page_index, visited: HashSet::new(), nodes: 0, attrs: HashMap::new(), text_left: MAX_TEXT, warnings: Vec::new() };
     let mut node = Node { role: "Document".into(), ..Node::default() };
-    let k = root.get("K")?.clone();
-    r.kids(&k, None, 0, 0, &mut node.kids);
+    r.kids(root.get("K")?, None, 0, 0, &mut node.kids);
     if node.kids.is_empty() {
         None
     } else {
-        Some(node)
+        Some((node, r.warnings))
     }
 }
 
@@ -926,7 +1003,7 @@ mod tests {
         let bytes = pdf_con_raiz(&format!("<< /Type /StructTreeRoot /K << /S /P /Pg 3 0 R /K [{}] >> >>", mcids));
         let pdf = Pdf::open(&bytes).unwrap();
         let index: HashMap<u32, usize> = pdf.pages().iter().enumerate().map(|(i, p)| (p.obj, i)).collect();
-        let t = tree(&pdf, &index).unwrap();
+        let (t, _) = tree(&pdf, &index).unwrap();
         assert!(contar(&t) <= MAX_NODES, "{} nodos", contar(&t));
     }
 
@@ -938,7 +1015,7 @@ mod tests {
         let pdf = Pdf::open(&bytes).unwrap();
         let index: HashMap<u32, usize> = pdf.pages().iter().enumerate().map(|(i, p)| (p.obj, i)).collect();
         // Sin panic ni desborde; el MCID esta demasiado adentro y no se toma.
-        let t = tree(&pdf, &index).unwrap();
+        let (t, _) = tree(&pdf, &index).unwrap();
         assert_eq!(contar(&t), 1);
     }
 }

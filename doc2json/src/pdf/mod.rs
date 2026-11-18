@@ -152,6 +152,8 @@ fn tagged_blocks(tree: &structure::Node, stores: &[structure::PageStore], unmark
     if blocks.is_empty() || covered * 2 < total {
         return None;
     }
+    // Bloques del texto suelto de cada pagina, en orden de pagina.
+    let mut extras: Vec<(u32, Vec<crate::doc::Block>)> = Vec::new();
     for (i, store) in stores.iter().enumerate() {
         let mut items: Vec<content::Item> = unmarked[i].clone();
         let mut left: Vec<&i64> = store.by_mcid.keys().filter(|m| !b.used.contains(&(i, **m))).collect();
@@ -167,11 +169,41 @@ fn tagged_blocks(tree: &structure::Node, stores: &[structure::PageStore], unmark
         let mut extra = Vec::new();
         let page = i as u32 + 1;
         layout::blocks(&lines, page, body, sizes, &mut extra);
-        // Despues del ultimo bloque de esa pagina (o de una anterior).
-        let at = blocks.iter().rposition(|x| x.page.map_or(false, |p| p <= page)).map_or(0, |k| k + 1);
-        blocks.splice(at..at, extra);
+        if !extra.is_empty() {
+            extras.push((page, extra));
+        }
     }
-    Some((blocks, b.notes, b.warnings))
+    // Cada pagina va despues del ultimo bloque de esa pagina o de una anterior. `last[p]` es ese
+    // bloque, calculado en una pasada: buscarlo y abrir lugar en cada pagina costaba paginas x bloques.
+    let mut last: Vec<Option<usize>> = vec![None; stores.len() + 1];
+    for (k, x) in blocks.iter().enumerate() {
+        if let Some(slot) = x.page.and_then(|p| last.get_mut(p as usize)) {
+            *slot = Some(k);
+        }
+    }
+    let mut upto = None;
+    for slot in last.iter_mut() {
+        upto = upto.max(*slot);
+        *slot = upto;
+    }
+    // `last` no baja de una pagina a la siguiente, asi que todo se arma en orden en una pasada; las
+    // paginas sin ningun bloque propio ni anterior van al comienzo.
+    let at = |p: u32| last.get(p as usize).copied().flatten();
+    let mut out = Vec::with_capacity(blocks.len() + extras.iter().map(|(_, e)| e.len()).sum::<usize>());
+    let mut extras = extras.into_iter().peekable();
+    let mut take = |out: &mut Vec<crate::doc::Block>, after: Option<usize>| {
+        while extras.peek().map_or(false, |(p, _)| at(*p) == after) {
+            if let Some((_, extra)) = extras.next() {
+                out.extend(extra);
+            }
+        }
+    };
+    take(&mut out, None);
+    for (k, x) in blocks.into_iter().enumerate() {
+        out.push(x);
+        take(&mut out, Some(k));
+    }
+    Some((out, b.notes, b.warnings))
 }
 
 /// Encabezados y pies de un PDF etiquetado (artefactos de paginacion), como `headers` y `footers`
@@ -315,7 +347,15 @@ pub fn read_with(bytes: &[u8], tags: bool) -> Result<Document, String> {
     // PDF etiquetado: los bloques salen del arbol de estructura. Si no hay arbol, o cubre menos
     // de la mitad del texto (etiquetado roto o parcial), se usa la deduccion por posicion.
     let page_index0: HashMap<u32, usize> = pages.iter().enumerate().filter(|(_, p)| p.obj != 0).map(|(i, p)| (p.obj, i)).collect();
-    let tagged = if tags { structure::tree(&pdf, &page_index0).and_then(|tree| tagged_blocks(&tree, &stores, &unmarked, body, &sizes)) } else { None };
+    let tagged = if tags {
+        structure::tree(&pdf, &page_index0).and_then(|(tree, mut warnings)| {
+            let (blocks, notes, more) = tagged_blocks(&tree, &stores, &unmarked, body, &sizes)?;
+            warnings.extend(more);
+            Some((blocks, notes, warnings))
+        })
+    } else {
+        None
+    };
     match tagged {
         Some((blocks, notes, warnings)) => {
             doc.content = blocks;

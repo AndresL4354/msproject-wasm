@@ -115,7 +115,7 @@ Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de c
 - El texto que no pertenece a ningún elemento (firmas, contenido sin etiquetar) se agrega por posición después de los bloques de su página, para no perder nada. Si el árbol cubre menos de la mitad del texto, se usa el método por posición para todo el documento.
 - `metadata.tagged` vale `true` cuando la estructura salió de las etiquetas.
 
-Límites ante árboles dañados o malintencionados: 500.000 elementos y contenidos marcados, 64 niveles de elementos y 8 arreglos o referencias encadenados entre un elemento y sus hijos (los ciclos se cortan). Una tabla de más de 1.000 columnas o 200.000 celdas, contando el relleno de las combinadas, o que pase de 1.000.000 de celdas sumando todas las del documento, sale como párrafos y con un aviso en `warnings`.
+Límites ante árboles dañados o malintencionados: 500.000 elementos y contenidos marcados, 64 niveles de elementos y 8 arreglos o referencias encadenados entre un elemento y sus hijos (los ciclos se cortan), y 16 MB de texto alternativo (`/Alt` y `/ActualText`) en todo el documento: pasado ese tope, los elementos se leen sin él y queda un aviso en `warnings`. Una tabla de más de 1.000 columnas o 200.000 celdas, contando el relleno de las combinadas, o que pase de 1.000.000 de celdas sumando todas las del documento, sale como párrafos y con un aviso en `warnings`.
 
 Con el `ejemplo/` de este repositorio, los bloques del PDF etiquetado son idénticos a los del `.docx` original (prueba `pdf_etiquetado_igual_al_docx`).
 
