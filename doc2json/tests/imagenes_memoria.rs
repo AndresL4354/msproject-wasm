@@ -94,4 +94,21 @@ fn imagenes_fabricadas_no_agotan_la_memoria() {
     let bytes = pagina("/Im1 Do", stream("/Subtype /Image /Width 5000 /Height 5000 /ColorSpace /DeviceCMYK /BitsPerComponent 8", &[0; 150]));
     let (_, usado) = pico(|| doc2json::read_with_images(&bytes).unwrap());
     assert!(usado < 4 * MB, "CMYK de 150 bytes uso {} MB", usado / MB);
+
+    // 4. Fax de 1 x 100 millones: cabe en el tope de pixeles, pero cada fila ocupa un byte. Antes
+    //    se reservaban 100 MB en el decodificador y otros 100 MB para las filas de la imagen.
+    let fax = |w: u32, h: u32, data: &[u8]| {
+        let dict = format!("/Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {} >>", w, h, w);
+        pagina("/Im1 Do", stream(&dict, data))
+    };
+    let (d, usado) = pico(|| doc2json::read_with_images(&fax(1, 100_000_000, &[0xFF, 0xFF])).unwrap());
+    assert!(d.images[0].note.as_deref().unwrap_or("").contains("demasiado grande"), "{:?}", d.images[0].note);
+    assert!(usado < 4 * MB, "fax de 1 x 100 millones uso {} MB", usado / MB);
+
+    // 5. Fax de 8 x 10 millones con dos bytes: dan 16 filas. Antes se reservaban las 10 millones
+    //    de filas (dos veces) y se armaba un PNG de ese alto; ahora se entrega tal cual, en TIFF.
+    let (d, usado) = pico(|| doc2json::read_with_images(&fax(8, 10_000_000, &[0xFF, 0xFF])).unwrap());
+    assert_eq!(d.images[0].format, "tiff");
+    assert!(d.images[0].note.as_deref().unwrap_or("").contains("16 de 10000000"), "{:?}", d.images[0].note);
+    assert!(usado < 4 * MB, "fax de 8 x 10 millones con 2 bytes uso {} MB", usado / MB);
 }

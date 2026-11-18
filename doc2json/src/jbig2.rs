@@ -15,6 +15,15 @@
 //! de texto (6.4), diccionario de simbolos (6.5) y sintaxis de segmentos (7). El modo MMR usa el
 //! decodificador de fax de `ccitt.rs` (UIT-T T.6).
 //!
+//! Atribucion: el decodificador MQ (`Mq`) sigue la forma de `ArithmeticDecoder` de pdf.js
+//! (Mozilla Foundation, `src/core/arithmetic_decoder.js`, licencia Apache-2.0): el contexto en un
+//! byte (indice y simbolo mas probable), BYTEIN que suma 0xFF00 en la marca de fin o pasado el
+//! final, y DECODE con el intercambio condicional y RENORMD en un bucle. La lectura de enteros
+//! (`Ia`, `Iaid`) se parece a `decodeInteger` y `decodeIAID` del mismo proyecto, aunque ahi el
+//! anexo A deja poco margen. Se reescribio con el registro C unico de T.88 (E.3) en lugar de los
+//! dos registros de 16 bits de pdf.js y se agrego el conteo de lecturas sin datos (`tail`); la
+//! tabla Qe y los procedimientos se tomaron de T.88.
+//!
 //! Los datos vienen del archivo y no son confiables. Cada decodificacion tiene un presupuesto
 //! (`Budget`) de pixeles reservados y de trabajo, proporcional al tamano de la pagina: una
 //! cabecera de pocos bytes no puede pedir gigabytes ni horas de calculo.
@@ -33,12 +42,16 @@ const MQ_TAIL: u32 = 256;
 
 const ERR_BUDGET: &str = "JBIG2: la imagen pide mas memoria o mas calculo que el permitido para su tamano.";
 const ERR_END: &str = "JBIG2: los datos terminan antes de tiempo.";
+const ERR_TOTAL: &str = "JBIG2: se alcanzo el tope de trabajo de decodificacion del documento.";
 
 /// Presupuesto de una decodificacion: pixeles que se pueden reservar (memoria, sumando todos los
 /// mapas de bits) y trabajo (pixeles combinados, simbolos colocados, contextos inicializados).
+/// `total` es lo que le queda al documento entero (pixeles y trabajo juntos): cada imagen tiene un
+/// margen propio, pero mil imagenes chicas no pueden gastarlo mil veces.
 struct Budget {
     pixels: u64,
     work: u64,
+    total: u64,
 }
 
 impl Budget {
@@ -46,20 +59,27 @@ impl Budget {
     /// dos veces la pagina; se permite el doble de eso, mas un margen para paginas chicas.
     fn for_page(w: usize, h: usize) -> Budget {
         let page = (w as u64).saturating_mul(h as u64);
-        Budget { pixels: page.saturating_mul(4).saturating_add(16_000_000), work: page.saturating_mul(8).saturating_add(64_000_000) }
+        Budget { pixels: page.saturating_mul(4).saturating_add(16_000_000), work: page.saturating_mul(8).saturating_add(64_000_000), total: u64::MAX }
     }
 
     /// Reserva un mapa de bits. Cobra sus pixeles y tambien sus filas y columnas como trabajo: uno
     /// de 0 x 4.000 millones no ocupa memoria, pero recorrer sus filas tomaria minutos.
     fn bitmap(&mut self, w: usize, h: usize, fill: u8) -> Result<Bitmap, String> {
-        let n = (w as u64).saturating_mul(h as u64);
-        self.pixels = self.pixels.checked_sub(n).ok_or(ERR_BUDGET)?;
+        self.reserve((w as u64).saturating_mul(h as u64))?;
         self.spend((w as u64).saturating_add(h as u64))?;
         Bitmap::new(w, h, fill)
     }
 
+    /// Cobra `n` bytes de memoria (un mapa de bits ocupa un byte por pixel).
+    fn reserve(&mut self, n: u64) -> Result<(), String> {
+        self.pixels = self.pixels.checked_sub(n).ok_or(ERR_BUDGET)?;
+        self.total = self.total.checked_sub(n).ok_or(ERR_TOTAL)?;
+        Ok(())
+    }
+
     fn spend(&mut self, n: u64) -> Result<(), String> {
         self.work = self.work.checked_sub(n).ok_or(ERR_BUDGET)?;
+        self.total = self.total.checked_sub(n).ok_or(ERR_TOTAL)?;
         Ok(())
     }
 }
@@ -418,23 +438,30 @@ fn generic_context(b: &Bitmap, x: i64, y: i64, g: &Generic) -> usize {
 const SLTP: [usize; 4] = [0x9B25, 0x0795, 0x00E5, 0x0195];
 
 /// Cada pixel es una decision del decodificador: el presupuesto de pixeles acota tambien el tiempo.
+/// Si los datos se acaban antes de la ultima fila es un error: pasado el final, el decodificador
+/// seguiria entregando pixeles inventados.
 fn decode_generic(mq: &mut Mq, cx: &mut [Cx], w: usize, h: usize, g: &Generic, budget: &mut Budget) -> Result<Bitmap, String> {
     let mut b = budget.bitmap(w, h, 0)?;
     let mut ltp = 0u32;
     for y in 0..h {
-        if g.tpgdon {
+        // Prediccion tipica (6.2.5.7): una fila igual a la anterior se marca con un solo bit.
+        let typical = g.tpgdon && {
             ltp ^= mq.bit(&mut cx[SLTP[g.template as usize & 3]]);
-            if ltp == 1 {
-                if y > 0 {
-                    let (prev, cur) = b.px.split_at_mut(y * w);
-                    cur[..w].copy_from_slice(&prev[(y - 1) * w..]);
-                }
-                continue;
+            ltp == 1
+        };
+        if typical {
+            if y > 0 {
+                let (prev, cur) = b.px.split_at_mut(y * w);
+                cur[..w].copy_from_slice(&prev[(y - 1) * w..]);
+            }
+        } else {
+            for x in 0..w {
+                let c = generic_context(&b, x as i64, y as i64, g);
+                b.px[y * w + x] = mq.bit(&mut cx[c]) as u8;
             }
         }
-        for x in 0..w {
-            let c = generic_context(&b, x as i64, y as i64, g);
-            b.px[y * w + x] = mq.bit(&mut cx[c]) as u8;
+        if mq.exhausted() {
+            return Err(ERR_END.into());
         }
     }
     Ok(b)
@@ -456,31 +483,41 @@ struct Refine<'r> {
     at: [(i64, i64); 2],
 }
 
+/// Contexto del pixel (x, y) de un refinamiento (figuras 12 y 13): pixeles ya decodificados de `b`
+/// y pixeles de la referencia alrededor del mismo lugar.
+fn refine_context(b: &Bitmap, r: &Refine, x: i64, y: i64) -> usize {
+    let p = |dx: i64, dy: i64| b.get(x + dx, y + dy);
+    let q = |dx: i64, dy: i64| r.reference.get(x - r.dx + dx, y - r.dy + dy);
+    let c = if r.template == 0 {
+        p(-1, 0)
+            | p(1, -1) << 1
+            | p(0, -1) << 2
+            | p(r.at[0].0, r.at[0].1) << 3
+            | q(1, 1) << 4
+            | q(0, 1) << 5
+            | q(-1, 1) << 6
+            | q(1, 0) << 7
+            | q(0, 0) << 8
+            | q(-1, 0) << 9
+            | q(1, -1) << 10
+            | q(0, -1) << 11
+            | q(r.at[1].0, r.at[1].1) << 12
+    } else {
+        p(-1, 0) | p(1, -1) << 1 | p(0, -1) << 2 | p(-1, -1) << 3 | q(1, 1) << 4 | q(0, 1) << 5 | q(1, 0) << 6 | q(0, 0) << 7 | q(-1, 0) << 8 | q(0, -1) << 9
+    };
+    c as usize
+}
+
 fn decode_refinement(mq: &mut Mq, cx: &mut [Cx], w: usize, h: usize, r: &Refine, budget: &mut Budget) -> Result<Bitmap, String> {
     let mut b = budget.bitmap(w, h, 0)?;
     for y in 0..h as i64 {
         for x in 0..w as i64 {
-            let p = |dx: i64, dy: i64| b.get(x + dx, y + dy);
-            let q = |dx: i64, dy: i64| r.reference.get(x - r.dx + dx, y - r.dy + dy);
-            let c = if r.template == 0 {
-                p(-1, 0)
-                    | p(1, -1) << 1
-                    | p(0, -1) << 2
-                    | p(r.at[0].0, r.at[0].1) << 3
-                    | q(1, 1) << 4
-                    | q(0, 1) << 5
-                    | q(-1, 1) << 6
-                    | q(1, 0) << 7
-                    | q(0, 0) << 8
-                    | q(-1, 0) << 9
-                    | q(1, -1) << 10
-                    | q(0, -1) << 11
-                    | q(r.at[1].0, r.at[1].1) << 12
-            } else {
-                p(-1, 0) | p(1, -1) << 1 | p(0, -1) << 2 | p(-1, -1) << 3 | q(1, 1) << 4 | q(0, 1) << 5 | q(1, 0) << 6 | q(0, 0) << 7 | q(-1, 0) << 8 | q(0, -1) << 9
-            };
-            let v = mq.bit(&mut cx[c as usize]) as u8;
+            let v = mq.bit(&mut cx[refine_context(&b, r, x, y)]) as u8;
             b.px[y as usize * w + x as usize] = v;
+        }
+        // Igual que en la region generica: pasado el final de los datos no se inventan filas.
+        if mq.exhausted() {
+            return Err(ERR_END.into());
         }
     }
     Ok(b)
@@ -803,6 +840,8 @@ struct Segment<'a> {
     data: &'a [u8],
     /// Cantidad de filas del final de una region generica de largo desconocido (7.2.7).
     rows: Option<u32>,
+    /// El largo declarado pasa del final de los datos: el segmento llego cortado.
+    cut: bool,
 }
 
 /// Segmentos en organizacion secuencial (como van dentro de un PDF, sin encabezado de archivo).
@@ -837,6 +876,7 @@ fn segments(d: &[u8]) -> Result<Vec<Segment<'_>>, String> {
         i += if flags & 64 != 0 { 4 } else { 1 };
         let len = be32(d, i).ok_or_else(bad)?;
         i += 4;
+        let mut cut = false;
         let (end, rows) = if len == u32::MAX {
             // Largo desconocido: solo en una region generica inmediata, que termina con su marca
             // de fin y la cantidad de filas.
@@ -848,10 +888,12 @@ fn segments(d: &[u8]) -> Result<Vec<Segment<'_>>, String> {
         } else {
             // En u64: en wasm32, `i + len` en usize desborda con largos cercanos a 4 GB y el fin
             // quedaria antes del principio.
-            ((i as u64 + len as u64).min(d.len() as u64) as usize, None)
+            let full = i as u64 + len as u64;
+            cut = full > d.len() as u64;
+            (full.min(d.len() as u64) as usize, None)
         };
         let data_end = if rows.is_some() { end - 4 } else { end };
-        out.push(Segment { number, kind, refs, data: &d[i..data_end], rows });
+        out.push(Segment { number, kind, refs, data: &d[i..data_end], rows, cut });
         i = end;
         if kind == 51 {
             break;
@@ -893,9 +935,15 @@ fn gather(dicts: &HashMap<u32, Vec<Rc<Bitmap>>>, refs: &[u32], budget: &mut Budg
 }
 
 /// Decodifica la pagina de un flujo JBIG2 de PDF (con sus segmentos globales, si los hay) en un
-/// mapa de `width` x `height` (los del diccionario de la imagen).
-pub fn decode(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize) -> Result<Bitmap, String> {
-    decode_with(data, globals, width, height, &mut Budget::for_page(width, height))
+/// mapa de `width` x `height` (los del diccionario de la imagen). `limit` es el trabajo que le
+/// queda al documento (pixeles reservados mas trabajo, en las unidades de `Budget`): se descuenta
+/// lo gastado, tambien si la decodificacion falla.
+pub fn decode(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize, limit: &mut u64) -> Result<Bitmap, String> {
+    let mut budget = Budget::for_page(width, height);
+    budget.total = *limit;
+    let page = decode_with(data, globals, width, height, &mut budget);
+    *limit = budget.total;
+    page
 }
 
 fn decode_with(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize, budget: &mut Budget) -> Result<Bitmap, String> {
@@ -908,6 +956,10 @@ fn decode_with(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize,
     let mut page: Option<Bitmap> = None;
     let mut page_op = 0u8;
     for s in &all {
+        // Un diccionario o una region cortados darian simbolos o filas inventados: se informa.
+        if s.cut && matches!(s.kind, 0 | 6 | 7 | 38 | 39) {
+            return Err(ERR_END.into());
+        }
         match s.kind {
             48 => {
                 // Informacion de pagina: color por defecto y operador por defecto.
@@ -1004,11 +1056,17 @@ fn decode_with(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize,
                 };
                 let region = if f & 1 != 0 {
                     // MMR: grupo 4 de fax, con 1 = negro igual que JBIG2. El mapa de bits se reserva
-                    // antes, con su tope y el presupuesto.
+                    // antes, con su tope y el presupuesto. El decodificador de fax reserva ademas sus
+                    // filas empaquetadas, de al menos un byte aunque el ancho sea 0: se cobran tambien.
+                    let stride = ccitt::row_bytes(w.max(1));
+                    budget.reserve((stride as u64).saturating_mul(h as u64))?;
                     let mut b = budget.bitmap(w, h, 0)?;
                     let p = ccitt::Params { k: -1, columns: w, rows: h, byte_align: false, end_of_block: true };
-                    let (rows, _) = ccitt::decode(&s.data[18.min(s.data.len())..], &p, h)?;
-                    let stride = w.max(1).div_ceil(8);
+                    let (rows, decoded) = ccitt::decode(&s.data[18.min(s.data.len())..], &p, h)?;
+                    // Las filas que faltan quedarian en blanco sin aviso: se informa.
+                    if decoded < h {
+                        return Err(ERR_END.into());
+                    }
                     for yy in 0..h {
                         for xx in 0..w {
                             b.px[yy * w + xx] = (rows[yy * stride + xx / 8] >> (7 - xx % 8)) & 1;
@@ -1039,6 +1097,12 @@ fn decode_with(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `decode` sin tope de trabajo del documento.
+    fn decode(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize) -> Result<Bitmap, String> {
+        let mut limit = u64::MAX;
+        super::decode(data, globals, width, height, &mut limit)
+    }
 
     /// Codificador MQ (anexo E.2, con la convencion de JBIG2) para armar datos de prueba.
     struct Enc {
@@ -1688,7 +1752,7 @@ mod tests {
             }
             let (w, h) = if rng.below(3) == 0 { (1 + rng.below(300) as usize, 1 + rng.below(300) as usize) } else { (20, 6) };
             let start = std::time::Instant::now();
-            let _ = decode_with(&data, None, w, h, &mut Budget { pixels: 250_000, work: 1_000_000 });
+            let _ = decode_with(&data, None, w, h, &mut Budget { pixels: 250_000, work: 1_000_000, total: u64::MAX });
             assert!(start.elapsed().as_secs() < 2, "caso {}: demasiado lento", case);
         }
     }
@@ -1704,5 +1768,488 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(decode(&s, None, 8, 8).unwrap_err().contains("memoria"));
         assert!(start.elapsed().as_secs() < 1);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Correcciones de la tercera revision y cobertura de plantillas, prediccion tipica,
+    // refinamiento, agregacion y MMR
+    // -----------------------------------------------------------------------------------------
+
+    /// Contextos de enteros de un codificador, uno por procedimiento (IAx), como `Ints`.
+    struct IntEnc {
+        dh: Vec<Cx>,
+        dw: Vec<Cx>,
+        ex: Vec<Cx>,
+        ai: Vec<Cx>,
+        dt: Vec<Cx>,
+        fs: Vec<Cx>,
+        ds: Vec<Cx>,
+        ri: Vec<Cx>,
+        rdw: Vec<Cx>,
+        rdh: Vec<Cx>,
+        rdx: Vec<Cx>,
+        rdy: Vec<Cx>,
+    }
+
+    impl IntEnc {
+        fn new() -> IntEnc {
+            let v = || vec![0u8; 512];
+            IntEnc { dh: v(), dw: v(), ex: v(), ai: v(), dt: v(), fs: v(), ds: v(), ri: v(), rdw: v(), rdh: v(), rdx: v(), rdy: v() }
+        }
+    }
+
+    /// Identificador de simbolo de `len` bits (IAID, A.3).
+    fn encode_iaid(enc: &mut Enc, cx: &mut [Cx], len: u32, id: usize) {
+        let mut prev = 1usize;
+        for i in (0..len).rev() {
+            let d = (id >> i) & 1;
+            enc.encode(&mut cx[prev], d as u32);
+            prev = (prev << 1) | d;
+        }
+    }
+
+    /// Region generica, con prediccion tipica si `g.tpgdon` (6.2.5.7 al reves): una fila igual a
+    /// la anterior (la de arriba de la primera es blanca) se marca con un bit y no se codifica.
+    fn encode_generic(enc: &mut Enc, cx: &mut [Cx], b: &Bitmap, g: &Generic) {
+        let mut ltp = 0u32;
+        for y in 0..b.h {
+            if g.tpgdon {
+                let typical = (0..b.w).all(|x| b.get(x as i64, y as i64) == b.get(x as i64, y as i64 - 1));
+                enc.encode(&mut cx[SLTP[g.template as usize]], typical as u32 ^ ltp);
+                ltp = typical as u32;
+                if typical {
+                    continue;
+                }
+            }
+            for x in 0..b.w {
+                enc.encode(&mut cx[generic_context(b, x as i64, y as i64, g)], b.px[y * b.w + x] as u32);
+            }
+        }
+    }
+
+    fn encode_refinement(enc: &mut Enc, cx: &mut [Cx], target: &Bitmap, r: &Refine) {
+        for y in 0..target.h {
+            for x in 0..target.w {
+                enc.encode(&mut cx[refine_context(target, r, x as i64, y as i64)], target.px[y * target.w + x] as u32);
+            }
+        }
+    }
+
+    /// Dibujo de prueba con filas repetidas de a dos (y las dos primeras en blanco), para que la
+    /// prediccion tipica tenga filas que saltar.
+    fn muestra(w: usize, h: usize) -> Bitmap {
+        let mut b = Bitmap::new(w, h, 0).unwrap();
+        for y in 2..h {
+            for x in 0..w {
+                b.px[y * w + x] = ((x / 2 + (y / 2) * 3) % 5 == 0 || x + y / 2 == 9) as u8;
+            }
+        }
+        b
+    }
+
+    /// Pixeles adaptativos por omision de cada plantilla (6.2.5.4 y tabla 5).
+    fn at_por_omision(template: u8) -> Vec<(i8, i8)> {
+        match template {
+            0 => AT0.to_vec(),
+            1 => vec![(3, -1)],
+            _ => vec![(2, -1)],
+        }
+    }
+
+    /// Segmento de region generica inmediata (aritmetica) con `b` en (x, y).
+    fn generic_segment(number: u32, b: &Bitmap, x: u32, y: u32, template: u8, tpgdon: bool) -> Vec<u8> {
+        let at = at_por_omision(template);
+        let g = Generic { template, tpgdon, at: at.iter().map(|&(x, y)| (x as i64, y as i64)).collect() };
+        let mut enc = Enc::new();
+        let mut cx = generic_cx(template);
+        encode_generic(&mut enc, &mut cx, b, &g);
+        let mut d = Vec::new();
+        for v in [b.w as u32, b.h as u32, x, y] {
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        d.push(0);
+        d.push(template << 1 | (tpgdon as u8) << 3);
+        for (x, y) in at {
+            d.extend_from_slice(&[x as u8, y as u8]);
+        }
+        d.extend(enc.flush());
+        segment(number, 38, &d)
+    }
+
+    /// Pixeles de cada plantilla con sus AT por omision, del bit mas alto al mas bajo del
+    /// contexto, copiados de las figuras 3 a 6 de T.88 (fila por fila, de izquierda a derecha).
+    fn plantilla_de_t88(template: u8) -> Vec<(i64, i64)> {
+        match template {
+            0 => vec![(-2, -2), (-1, -2), (0, -2), (1, -2), (2, -2), (-3, -1), (-2, -1), (-1, -1), (0, -1), (1, -1), (2, -1), (3, -1), (-4, 0), (-3, 0), (-2, 0), (-1, 0)],
+            1 => vec![(-1, -2), (0, -2), (1, -2), (2, -2), (-2, -1), (-1, -1), (0, -1), (1, -1), (2, -1), (3, -1), (-3, 0), (-2, 0), (-1, 0)],
+            2 => vec![(-1, -2), (0, -2), (1, -2), (-2, -1), (-1, -1), (0, -1), (1, -1), (2, -1), (-2, 0), (-1, 0)],
+            _ => vec![(-3, -1), (-2, -1), (-1, -1), (0, -1), (1, -1), (2, -1), (-4, 0), (-3, 0), (-2, 0), (-1, 0)],
+        }
+    }
+
+    /// `muestra(33, 17)` con el vecindario de (16, 9) dibujado para que su contexto sea el de SLTP
+    /// (6.2.5.7): la prediccion tipica comparte ese contexto con un pixel, y un SLTP equivocado
+    /// cambia lo que se decodifica.
+    fn muestra_con_sltp(template: u8) -> Bitmap {
+        let mut src = muestra(33, 17);
+        let t = plantilla_de_t88(template);
+        for (k, &(dx, dy)) in t.iter().enumerate() {
+            let bit = (SLTP[template as usize] >> (t.len() - 1 - k)) & 1;
+            src.px[(9 + dy) as usize * 33 + (16 + dx) as usize] = bit as u8;
+        }
+        src
+    }
+
+    #[test]
+    fn plantillas_1_a_3_y_prediccion_tipica() {
+        for template in 0..4u8 {
+            let src = muestra_con_sltp(template);
+            // El orden de los bits del contexto es el de la figura, no solo el mismo conjunto.
+            let at = at_por_omision(template).iter().map(|&(x, y)| (x as i64, y as i64)).collect();
+            let g = Generic { template, tpgdon: false, at };
+            assert_eq!(generic_context(&src, 16, 9, &g), SLTP[template as usize], "plantilla {}", template);
+            for tpgdon in [false, true] {
+                let mut s = segment(0, 48, &page_info(40, 20));
+                s.extend(generic_segment(1, &src, 3, 2, template, tpgdon));
+                s.extend(segment(2, 49, &[]));
+                let page = decode(&s, None, 40, 20).unwrap();
+                assert!(con_simbolos(&page, &[(3, 2)], &src), "plantilla {}, TPGDON {}", template, tpgdon);
+            }
+        }
+    }
+
+    /// Instancia de una region de texto en la fila de la franja: x, simbolo y, si se refina,
+    /// (RDW, RDH, RDX, RDY, resultado).
+    struct Inst {
+        x: i64,
+        id: usize,
+        refine: Option<(i64, i64, i64, i64, Bitmap)>,
+    }
+
+    /// Region de texto de una franja en la fila `y`, esquina arriba-izquierda (6.4 al reves). Con
+    /// `rcx`, cada instancia lleva su bit de refinamiento (SBREFINE = 1, plantilla 0).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_text(enc: &mut Enc, ints: &mut IntEnc, iaid: &mut [Cx], len: u32, mut rcx: Option<&mut [Cx]>, rat: [(i64, i64); 2], syms: &[&Bitmap], y: i64, insts: &[Inst]) {
+        encode_int(enc, &mut ints.dt, Some(0));
+        encode_int(enc, &mut ints.dt, Some(y));
+        let mut curs = 0;
+        for (k, inst) in insts.iter().enumerate() {
+            if k == 0 {
+                encode_int(enc, &mut ints.fs, Some(inst.x));
+            } else {
+                encode_int(enc, &mut ints.ds, Some(inst.x - curs));
+            }
+            encode_iaid(enc, iaid, len, inst.id);
+            let base = syms[inst.id];
+            let mut w = base.w;
+            if let Some(rcx) = rcx.as_deref_mut() {
+                encode_int(enc, &mut ints.ri, Some(inst.refine.is_some() as i64));
+                if let Some((rdw, rdh, rdx, rdy, target)) = &inst.refine {
+                    for (cx, v) in [(&mut ints.rdw, rdw), (&mut ints.rdh, rdh), (&mut ints.rdx, rdx), (&mut ints.rdy, rdy)] {
+                        encode_int(enc, cx, Some(*v));
+                    }
+                    let r = Refine { template: 0, reference: base, dx: rdw.div_euclid(2) + rdx, dy: rdh.div_euclid(2) + rdy, at: rat };
+                    encode_refinement(enc, rcx, target, &r);
+                    w = target.w;
+                }
+            }
+            curs = inst.x + w as i64 - 1;
+        }
+        encode_int(enc, &mut ints.ds, None);
+    }
+
+    /// Datos de un segmento de region de texto aritmetica de `w` x `h` en (0, 0).
+    fn text_segment(flags: u16, rat: Option<[(i8, i8); 2]>, w: u32, h: u32, instances: u32, coded: Vec<u8>) -> Vec<u8> {
+        let mut d = Vec::new();
+        for v in [w, h, 0, 0] {
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        d.push(0);
+        d.extend_from_slice(&flags.to_be_bytes());
+        for (x, y) in rat.into_iter().flatten() {
+            d.extend_from_slice(&[x as u8, y as u8]);
+        }
+        d.extend_from_slice(&instances.to_be_bytes());
+        d.extend(coded);
+        d
+    }
+
+    /// Simbolo refinado de prueba: `glyph(w, h)` con algunos pixeles cambiados.
+    fn retocado(w: usize, h: usize) -> Bitmap {
+        let mut b = glyph(w, h);
+        b.px[w + 2] ^= 1;
+        b.px[(h - 2) * w + w - 2] ^= 1;
+        b
+    }
+
+    const RAT: [(i8, i8); 2] = [(-1, -1), (-1, -1)];
+
+    fn rat() -> [(i64, i64); 2] {
+        [(RAT[0].0 as i64, RAT[0].1 as i64), (RAT[1].0 as i64, RAT[1].1 as i64)]
+    }
+
+    /// Pagina de 20 x 6: diccionario con `glyph(5, 4)` y region de texto con refinamiento que lo
+    /// coloca tal cual en (2, 1) y refinado a 7 x 5 (RDW = 2, RDH = 1) en (10, 1).
+    fn pagina_con_refinamiento() -> (Vec<u8>, Bitmap) {
+        let mut de = DictEnc::new();
+        de.class(4, &[glyph(5, 4)]);
+        de.runs(&[0, 1]);
+        let base = glyph(5, 4);
+        let target = retocado(7, 5);
+        let (mut enc, mut ints, mut iaid, mut rcx) = (Enc::new(), IntEnc::new(), vec![0u8; 2], refine_cx(0));
+        let insts = [Inst { x: 2, id: 0, refine: None }, Inst { x: 10, id: 0, refine: Some((2, 1, 0, 0, target.clone())) }];
+        encode_text(&mut enc, &mut ints, &mut iaid, 0, Some(&mut rcx[..]), rat(), &[&base], 1, &insts);
+        let mut s = segment(0, 48, &page_info(20, 6));
+        s.extend(segment(1, 0, &de.data(0, 1, 1)));
+        // Banderas: SBREFINE (bit 1), esquina arriba-izquierda (1 << 4), SBRTEMPLATE 0.
+        s.extend(segment_refs(2, 6, &[1], &text_segment(0x0012, Some(RAT), 20, 6, 2, enc.flush())));
+        s.extend(segment(3, 49, &[]));
+        (s, target)
+    }
+
+    #[test]
+    fn region_de_texto_con_refinamiento() {
+        let (s, target) = pagina_con_refinamiento();
+        let page = decode(&s, None, 20, 6).unwrap();
+        let mut expected = Bitmap::new(20, 6, 0).unwrap();
+        expected.compose(&glyph(5, 4), 2, 1, 0);
+        expected.compose(&target, 10, 1, 0);
+        assert_eq!(page.px, expected.px);
+    }
+
+    /// Pagina de 20 x 6 con dos diccionarios: el primero trae `glyph(5, 4)`; el segundo (con
+    /// refinamiento y agregacion, que se refiere al primero) define N0 = el simbolo refinado
+    /// (REFAGGNINST = 1) y N1 = el simbolo y N0 uno al lado del otro (REFAGGNINST = 2), y exporta
+    /// los dos. La region de texto coloca N1 en (2, 1). Devuelve tambien N1.
+    fn pagina_con_agregacion() -> (Vec<u8>, Bitmap) {
+        let mut a = DictEnc::new();
+        a.class(4, &[glyph(5, 4)]);
+        a.runs(&[0, 1]);
+        let s0 = glyph(5, 4);
+        let n0 = retocado(5, 4);
+        let mut n1 = Bitmap::new(11, 4, 0).unwrap();
+        n1.compose(&s0, 0, 0, 0);
+        n1.compose(&n0, 6, 0, 0);
+        // Un solo juego de contextos de enteros para todo el diccionario; IAID de 2 bits (1
+        // simbolo de entrada mas 2 nuevos).
+        let (mut enc, mut ints, mut iaid, mut rcx) = (Enc::new(), IntEnc::new(), vec![0u8; 8], refine_cx(0));
+        encode_int(&mut enc, &mut ints.dh, Some(4));
+        // N0: 5 de ancho, una instancia refinada de S0 sin desplazamiento.
+        encode_int(&mut enc, &mut ints.dw, Some(5));
+        encode_int(&mut enc, &mut ints.ai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, 2, 0);
+        encode_int(&mut enc, &mut ints.rdx, Some(0));
+        encode_int(&mut enc, &mut ints.rdy, Some(0));
+        encode_refinement(&mut enc, &mut rcx, &n0, &Refine { template: 0, reference: &s0, dx: 0, dy: 0, at: rat() });
+        // N1: 11 de ancho, dos instancias (S0 en x = 0 y N0 en x = 6) como region de texto.
+        encode_int(&mut enc, &mut ints.dw, Some(6));
+        encode_int(&mut enc, &mut ints.ai, Some(2));
+        let insts = [Inst { x: 0, id: 0, refine: None }, Inst { x: 6, id: 1, refine: None }];
+        encode_text(&mut enc, &mut ints, &mut iaid, 2, Some(&mut rcx[..]), rat(), &[&s0, &n0], 0, &insts);
+        encode_int(&mut enc, &mut ints.dw, None);
+        // Exportados: se salta S0 y se exportan N0 y N1.
+        encode_int(&mut enc, &mut ints.ex, Some(1));
+        encode_int(&mut enc, &mut ints.ex, Some(2));
+        // Banderas: SDREFAGG (bit 1), plantilla 0, SDRTEMPLATE 0.
+        let mut b = 0x0002u16.to_be_bytes().to_vec();
+        for (x, y) in AT0.iter().chain(RAT.iter()) {
+            b.extend_from_slice(&[*x as u8, *y as u8]);
+        }
+        b.extend_from_slice(&2u32.to_be_bytes());
+        b.extend_from_slice(&2u32.to_be_bytes());
+        b.extend(enc.flush());
+        // Region de texto (sin refinamiento) con N1, que es el simbolo 1 de los exportados.
+        let (mut enc, mut ints, mut iaid) = (Enc::new(), IntEnc::new(), vec![0u8; 4]);
+        encode_text(&mut enc, &mut ints, &mut iaid, 1, None, rat(), &[&n0, &n1], 1, &[Inst { x: 2, id: 1, refine: None }]);
+        let mut s = segment(0, 48, &page_info(20, 6));
+        s.extend(segment(1, 0, &a.data(0, 1, 1)));
+        s.extend(segment_refs(2, 0, &[1], &b));
+        s.extend(segment_refs(3, 6, &[2], &text_segment(0x0010, None, 20, 6, 1, enc.flush())));
+        s.extend(segment(4, 49, &[]));
+        (s, n1)
+    }
+
+    #[test]
+    fn diccionario_con_refinamiento_y_agregacion() {
+        let (s, n1) = pagina_con_agregacion();
+        let page = decode(&s, None, 20, 6).unwrap();
+        assert!(con_simbolos(&page, &[(2, 1)], &n1));
+    }
+
+    /// Pagina de 90 x 14 con una region generica MMR de 80 x 12 en (5, 1): la tira de grupo 4 que
+    /// hizo libtiff para las pruebas de fax (T.6 es el mismo codigo que MMR).
+    fn pagina_mmr(data: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        for v in [80u32, 12, 5, 1] {
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        d.extend_from_slice(&[0, 1]);
+        d.extend_from_slice(data);
+        let mut s = segment(0, 48, &page_info(90, 14));
+        s.extend(segment(1, 38, &d));
+        s.extend(segment(2, 49, &[]));
+        s
+    }
+
+    #[test]
+    fn region_mmr_con_datos_de_libtiff() {
+        use crate::ccitt::tests::{figura, hex, G4_FIGURA};
+        let page = decode(&pagina_mmr(&hex(G4_FIGURA)), None, 90, 14).unwrap();
+        for y in 0..14 {
+            for x in 0..90 {
+                let inside = (5..85).contains(&x) && (1..13).contains(&y);
+                assert_eq!(page.px[y * 90 + x] == 1, inside && figura(x - 5, y - 1), "pixel ({}, {})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn mmr_cortada_se_informa() {
+        // La mitad de la tira da solo las primeras filas: antes las demas quedaban en blanco.
+        use crate::ccitt::tests::{hex, G4_FIGURA};
+        let data = hex(G4_FIGURA);
+        assert!(decode(&pagina_mmr(&data[..data.len() / 2]), None, 90, 14).unwrap_err().contains("terminan antes"));
+    }
+
+    #[test]
+    fn mmr_de_ancho_cero_se_cobra() {
+        // Ancho 0 y 20 millones de filas: el mapa de bits no ocupa nada, pero el decodificador de
+        // fax reserva un byte por fila. Antes no se cobraba y pasaba en una pagina de 64 x 64.
+        let mut d = Vec::new();
+        for v in [0u32, 20_000_000, 0, 0] {
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        d.extend_from_slice(&[0, 1, 0xFF, 0xFF]);
+        let mut s = segment(0, 48, &page_info(64, 64));
+        s.extend(segment(1, 38, &d));
+        assert!(decode(&s, None, 64, 64).unwrap_err().contains("memoria"));
+    }
+
+    /// Dibujo con ruido (xorshift): sus contextos no se vuelven predecibles, y un flujo cortado
+    /// obliga a leer mucho mas alla del final.
+    fn ruido(w: usize, h: usize) -> Bitmap {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let mut b = Bitmap::new(w, h, 0).unwrap();
+        for p in b.px.iter_mut() {
+            *p = (rng.next() % 3 < 1) as u8;
+        }
+        b
+    }
+
+    #[test]
+    fn region_generica_cortada_se_informa() {
+        let src = ruido(64, 64);
+        let g = g0();
+        let mut enc = Enc::new();
+        let mut cx = generic_cx(0);
+        encode_generic(&mut enc, &mut cx, &src, &g);
+        let data = enc.flush();
+        // Completa se decodifica igual; cortada, antes salia con la parte de abajo inventada.
+        let back = decode_generic(&mut Mq::new(&data), &mut generic_cx(0), 64, 64, &g, &mut Budget::for_page(64, 64)).unwrap();
+        assert_eq!(back.px, src.px);
+        let cut = &data[..data.len() / 4];
+        let e = decode_generic(&mut Mq::new(cut), &mut generic_cx(0), 64, 64, &g, &mut Budget::for_page(64, 64)).unwrap_err();
+        assert!(e.contains("terminan antes"), "{}", e);
+    }
+
+    #[test]
+    fn refinamiento_cortado_se_informa() {
+        let reference = ruido(64, 64);
+        let mut target = reference.clone();
+        for (i, p) in target.px.iter_mut().enumerate() {
+            *p ^= (i % 5 == 0) as u8;
+        }
+        let r = Refine { template: 0, reference: &reference, dx: 0, dy: 0, at: rat() };
+        let mut enc = Enc::new();
+        encode_refinement(&mut enc, &mut refine_cx(0), &target, &r);
+        let data = enc.flush();
+        let back = decode_refinement(&mut Mq::new(&data), &mut refine_cx(0), 64, 64, &r, &mut Budget::for_page(64, 64)).unwrap();
+        assert_eq!(back.px, target.px);
+        let cut = &data[..data.len() / 4];
+        let e = decode_refinement(&mut Mq::new(cut), &mut refine_cx(0), 64, 64, &r, &mut Budget::for_page(64, 64)).unwrap_err();
+        assert!(e.contains("terminan antes"), "{}", e);
+    }
+
+    #[test]
+    fn segmento_cortado_se_informa() {
+        // Region generica cuyo segmento declara mas bytes de los que llegaron (un PDF cortado): el
+        // decodificador inventaria el resto con unos. Antes salia sin aviso.
+        let mut s = segment(0, 48, &page_info(40, 20));
+        s.extend(generic_segment(1, &muestra(33, 17), 3, 2, 0, false));
+        s.truncate(s.len() - 8);
+        assert!(decode(&s, None, 40, 20).unwrap_err().contains("terminan antes"));
+    }
+
+    #[test]
+    fn tope_de_trabajo_del_documento() {
+        // Lo que le queda al documento se descuenta, tambien cuando la decodificacion falla.
+        let s = pagina_con_texto(1);
+        let mut limit = 1_000_000_000u64;
+        super::decode(&s, None, 20, 6, &mut limit).unwrap();
+        let used = 1_000_000_000 - limit;
+        assert!(used > 0);
+        let mut limit = used - 1;
+        assert!(super::decode(&s, None, 20, 6, &mut limit).unwrap_err().contains("tope de trabajo"));
+        assert!(limit < used);
+    }
+
+    /// Pagina de `w` x `h` con `src` en (x, y).
+    fn en_pagina(src: &Bitmap, x: i64, y: i64, w: usize, h: usize) -> Bitmap {
+        let mut page = Bitmap::new(w, h, 0).unwrap();
+        page.compose(src, x, y, 0);
+        page
+    }
+
+    #[test]
+    fn vectores_verificados_con_pdfjs() {
+        // Flujos que arma el codificador de estas pruebas, decodificados tambien con pdf.js 4.10.38
+        // (`Jbig2Image` de pdfjs-dist, otra implementacion) con el mismo resultado pixel a pixel.
+        // Quedan fijos: un cambio en los contextos, en SLTP o en el orden de los bits del
+        // decodificador los rompe, aunque el codificador de las pruebas cambie de la misma forma.
+        let vectores = [
+            ("plantilla0_tpgdon0", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000003d00000021000000110000000300000002000003fffdff02fefefea0525fa8d46891104592b47fde6654d1c84244218a7e941b1f400bc1ff3847dfffffac0000000231000100000000"),
+            ("plantilla0_tpgdon1", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000003700000021000000110000000300000002000803fffdff02fefefebe47ab45918e123cb91d8c5cc556c784a93695a2979dbbfed4abffffac0000000231000100000000"),
+            ("plantilla1_tpgdon0", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000003800000021000000110000000300000002000203ffa0515c28e91ff1a651aff5834aae1266132716f68325a37bf1f590123be625e0a2ffffac0000000231000100000000"),
+            ("plantilla1_tpgdon1", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000003100000021000000110000000300000002000a03ffbe43494ab55f84fa782927293747aef7256ce84fd3a729211ad6ffffac0000000231000100000000"),
+            ("plantilla2_tpgdon0", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000003500000021000000110000000300000002000402ffa04e86c0270fa0683867be43305cc77cba7b5869a5105e29fc1cfd8c614dffffac0000000231000100000000"),
+            ("plantilla2_tpgdon1", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000003100000021000000110000000300000002000c02ffbe42f34fcc91230384a7cac937daedd26148fd1e4d17b0ac852fffffac0000000231000100000000"),
+            ("plantilla3_tpgdon0", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000003500000021000000110000000300000002000602ffa0525fa8d514d6f3c1900acf69c0baedb64d81192bec7fb8037d8b1dc97fffffac0000000231000100000000"),
+            ("plantilla3_tpgdon1", "000000003000010000001300000028000000140000012c0000012c000000000000012600010000002c00000021000000110000000300000002000e02ffbe47ab459742e69d0ebdd3f2e42f06e677dbe0e09fffffac0000000231000100000000"),
+            ("refinamiento", "000000003000010000001300000014000000060000012c0000012c000000000000010000010000001b000003fffdff02fefefe0000000100000001554a465bae9fffffac00000002062001010000002800000014000000060000000000000000000012ffffffff00000002a686ae3c51c898355b57ffffac0000000331000100000000"),
+            ("agregacion", "000000003000010000001300000014000000060000012c0000012c000000000000010000010000001b000003fffdff02fefefe0000000100000001554a465bae9fffffac000000020020010100000025000203fffdff02fefefeffffffff0000000200000002554f47d98bd94bfc0f274a5bffffac00000003062002010000001c0000001400000006000000000000000000001000000001a645ffffac0000000431000100000000"),
+            ("texto", "000000003000010000001300000014000000060000012c0000012c000000000000010000010000001b000003fffdff02fefefe0000000100000001554a465bae9fffffac00000002062001010000001d0000001400000006000000000000000000001000000002a671ff7fffac0000000331000100000000"),
+        ];
+        for (name, data) in vectores {
+            let data = crate::ccitt::tests::hex(data);
+            let (built, expected) = match name {
+                "refinamiento" => {
+                    let (s, target) = pagina_con_refinamiento();
+                    let mut e = en_pagina(&glyph(5, 4), 2, 1, 20, 6);
+                    e.compose(&target, 10, 1, 0);
+                    (s, e)
+                }
+                "agregacion" => {
+                    let (s, n1) = pagina_con_agregacion();
+                    (s, en_pagina(&n1, 2, 1, 20, 6))
+                }
+                "texto" => {
+                    let mut e = en_pagina(&glyph(5, 4), 2, 1, 20, 6);
+                    e.compose(&glyph(5, 4), 10, 1, 0);
+                    (pagina_con_texto(1), e)
+                }
+                _ => {
+                    let template = name.as_bytes()[9] - b'0';
+                    let tpgdon = name.ends_with('1');
+                    let src = muestra_con_sltp(template);
+                    let mut s = segment(0, 48, &page_info(40, 20));
+                    s.extend(generic_segment(1, &src, 3, 2, template, tpgdon));
+                    s.extend(segment(2, 49, &[]));
+                    (s, en_pagina(&src, 3, 2, 40, 20))
+                }
+            };
+            assert_eq!(built, data, "{}: el codificador de las pruebas ya no arma el flujo verificado", name);
+            let page = decode(&data, None, expected.w, expected.h).unwrap();
+            assert_eq!(page.px, expected.px, "{}", name);
+        }
     }
 }

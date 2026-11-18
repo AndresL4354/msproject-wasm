@@ -708,6 +708,34 @@ fn tope_de_bytes_extraidos_por_documento() {
 }
 
 #[test]
+fn tope_de_trabajo_de_decodificacion_por_documento() {
+    // 25 faxes de 10.000 x 10.000 (100 millones de pixeles cada uno) que no dan nada: cada uno sale
+    // como TIFF de pocos bytes, asi que el tope de bytes no los frena. El trabajo se cobra antes de
+    // decodificar, por el tamano declarado: con 2.000 millones entran 20 y los 5 siguientes quedan
+    // con una nota. Antes se decodificaban todos.
+    let n = 25;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let fax = "/Subtype /Image /Width 10000 /Height 10000 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 10000 >>";
+    let imgs = (0..n).map(|_| stream(fax, &[0, 0])).collect();
+    let d = read_with_images(&pdf_con(&names, &content, imgs)).unwrap();
+    assert_eq!(d.images.len(), 25);
+    let topadas: Vec<usize> = (0..n).filter(|&i| d.images[i].note.as_deref().unwrap_or("").contains("tope de trabajo")).collect();
+    assert_eq!(topadas, (20..25).collect::<Vec<_>>());
+    assert!(d.images[..20].iter().all(|i| i.format == "tiff" && i.data.is_some()));
+    assert!(d.warnings.iter().any(|w| w.contains("5 imagenes no se decodificaron")), "{:?}", d.warnings);
+    // Los JPEG no se decodifican: no gastan trabajo. Cien de 5.000 x 5.000 (2.500 millones de
+    // pixeles declarados) se entregan todos.
+    let n = 100;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let jpeg = "/Subtype /Image /Width 5000 /Height 5000 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode";
+    let imgs = (0..n).map(|_| stream(jpeg, &JPEG)).collect();
+    let d = read_with_images(&pdf_con(&names, &content, imgs)).unwrap();
+    assert!(d.images.iter().all(|i| i.data.is_some()), "{:?}", d.images.iter().find(|i| i.data.is_none()).map(|i| &i.note));
+}
+
+#[test]
 fn topes_de_imagenes_distintas_y_de_lugares() {
     // 10.001 imagenes distintas: la ultima no figura, con aviso.
     let n = 10_001;

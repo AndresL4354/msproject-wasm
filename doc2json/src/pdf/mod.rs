@@ -243,12 +243,22 @@ pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, Strin
     doc.images = set.list;
     if let Some(limit) = extract {
         let mut budget = Budget::new(limit);
+        // Trabajo de decodificacion que le queda al documento: cada imagen se cobra antes.
+        let mut work = images::MAX_WORK;
+        let mut skipped_work = 0usize;
         for (img, obj) in doc.images.iter_mut().zip(&objs) {
             if budget.exhausted() {
                 budget.skip(img);
                 continue;
             }
-            match images::extract(&pdf, obj) {
+            let cost = images::cost(&pdf, obj);
+            if cost > work {
+                img.note = Some(images::work_note());
+                skipped_work += 1;
+                continue;
+            }
+            work -= cost;
+            match images::extract(&pdf, obj, &mut work) {
                 Ok((format, data, note)) => {
                     img.format = format;
                     img.note = note;
@@ -258,6 +268,9 @@ pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, Strin
             }
         }
         doc.warnings.extend(budget.warning());
+        if skipped_work > 0 {
+            doc.warnings.push(format!("{} imagenes no se decodificaron: superan el tope de trabajo de {} millones de pixeles por documento.", skipped_work, images::MAX_WORK / 1_000_000));
+        }
         if inline_images > 0 {
             doc.warnings.push(format!("{} imagenes incrustadas en el contenido de las paginas (BI ... EI) no se extraen.", inline_images));
         }

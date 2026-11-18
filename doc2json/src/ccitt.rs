@@ -4,7 +4,8 @@
 //! empaquetadas (la fila completa en bytes, el bit mas significativo primero) con 1 = negro;
 //! quien lo usa invierte si necesita otra convencion. Un archivo danado no es un error: se
 //! entrega lo decodificado hasta ahi y el resto de las filas queda en blanco. Si es un error un
-//! tamano declarado fuera de rango: la memoria se reserva segun las columnas y filas declaradas.
+//! tamano declarado fuera de rango. La memoria se reserva segun las columnas y las filas que los
+//! datos pueden dar (cada fila consume al menos un bit), no segun las filas declaradas.
 //!
 //! Escrito a partir de las recomendaciones UIT-T T.4 (codigos de largo de corrida, tablas 2 y 3,
 //! y codificacion de dos dimensiones, 4.2) y T.6 (grupo 4).
@@ -13,6 +14,15 @@
 pub const MAX_COLUMNS: usize = 1 << 20;
 /// Tope de pixeles (columnas por filas) de una decodificacion: 25 MB de filas empaquetadas.
 pub const MAX_PIXELS: u64 = 200_000_000;
+/// Tope de bytes de las filas empaquetadas. Cada fila ocupa bytes completos: con una columna, el
+/// tope de pixeles permitiria 200 millones de filas de un byte (200 MB).
+pub const MAX_BYTES: u64 = 25_000_000;
+
+/// Bytes de una fila de `columns` pixeles, redondeando hacia arriba (sin `div_ceil`, que exige
+/// Rust 1.73, y sin `columns + 7`, que en wasm32 desborda con un ancho cercano a 4.000 millones).
+pub fn row_bytes(columns: usize) -> usize {
+    columns / 8 + usize::from(columns & 7 != 0)
+}
 
 /// Parametros de `/DecodeParms` (con sus valores por defecto de PDF).
 #[derive(Clone, Debug)]
@@ -120,7 +130,7 @@ impl Bits<'_> {
     }
 
     fn align(&mut self) {
-        self.pos = self.pos.div_ceil(8) * 8;
+        self.pos += (8 - self.pos % 8) % 8;
     }
 
     /// Salta un fin de linea (11 ceros y un uno, con ceros de relleno delante) si viene uno.
@@ -155,6 +165,14 @@ struct Decoder<'a> {
 }
 
 impl Decoder<'_> {
+    /// Cambios de color que puede tener una fila real: uno por columna, mas el primero en 0 (fila
+    /// que empieza en negro) y uno repetido al final (en modo horizontal, una ultima corrida negra
+    /// de largo 0). Una corrida de largo 0 no avanza: sin este tope, un flujo de corridas vacias
+    /// haria crecer la lista de cambios con los datos y no con el ancho.
+    fn too_many(&self, changes: &[usize]) -> bool {
+        changes.len() > self.columns.saturating_add(2)
+    }
+
     fn run(&mut self, black: bool) -> Option<usize> {
         let mut total = 0usize;
         loop {
@@ -212,6 +230,9 @@ impl Decoder<'_> {
         while pos < self.columns {
             pos = pos.saturating_add(self.run(black)?).min(self.columns);
             changes.push(pos);
+            if self.too_many(&changes) {
+                return None;
+            }
             black = !black;
         }
         Some(changes)
@@ -258,6 +279,9 @@ impl Decoder<'_> {
                 }
                 Mode::Eol => return None,
             }
+            if self.too_many(&changes) {
+                return None;
+            }
         }
         Some(changes)
     }
@@ -282,18 +306,23 @@ fn paint(row: &mut [u8], changes: &[usize], columns: usize) {
     }
 }
 
-/// Decodifica hasta `height` filas (o `p.rows`). Devuelve las filas (1 = negro) y cuantas
-/// se decodificaron de verdad (las demas quedan en blanco). Es un error que las columnas pasen de
-/// `MAX_COLUMNS` o que columnas por filas pase de `MAX_PIXELS`.
+/// Decodifica hasta `height` filas (o `p.rows`). Devuelve las filas (1 = negro) y cuantas se
+/// decodificaron de verdad (las demas quedan en blanco). Se entregan a lo sumo tantas filas como
+/// bits traen los datos: quien necesite mas, las da por blancas. Es un error que las columnas pasen
+/// de `MAX_COLUMNS`, que columnas por filas pase de `MAX_PIXELS` o que las filas empaquetadas
+/// pasen de `MAX_BYTES`.
 pub fn decode(data: &[u8], p: &Params, height: usize) -> Result<(Vec<u8>, usize), String> {
     let columns = p.columns.max(1);
     let rows = if p.rows > 0 { p.rows } else { height };
+    let stride = row_bytes(columns);
     // En u64: en wasm32 el producto en usize puede desbordar y dar 0 (o poco), y la primera fila
     // quedaria fuera del arreglo.
-    if columns > MAX_COLUMNS || (columns as u64).saturating_mul(rows as u64) > MAX_PIXELS {
+    if columns > MAX_COLUMNS || (columns as u64).saturating_mul(rows as u64) > MAX_PIXELS || (stride as u64).saturating_mul(rows as u64) > MAX_BYTES {
         return Err(format!("Fax demasiado grande para decodificarlo ({} columnas, {} filas).", p.columns, rows));
     }
-    let stride = columns.div_ceil(8);
+    // Cada fila decodificada consume al menos un bit (en dos dimensiones, una fila igual a la
+    // anterior es un solo V0): no se reservan filas que los datos no pueden dar.
+    let rows = rows.min(data.len().saturating_mul(8));
     let mut out = vec![0u8; stride * rows];
     let mut d = Decoder { bits: Bits { data, pos: 0 }, white: table(&WHITE_TERM, &WHITE_MAKEUP), black: table(&BLACK_TERM, &BLACK_MAKEUP), columns };
     // Fila de referencia inicial: toda blanca.
@@ -343,7 +372,11 @@ pub fn decode(data: &[u8], p: &Params, height: usize) -> Result<(Vec<u8>, usize)
                 d.row_1d()
             }
         };
-        let Some(changes) = changes else { break };
+        // Sin `let ... else`, que exige Rust 1.65.
+        let changes = match changes {
+            Some(c) => c,
+            None => break,
+        };
         paint(&mut out[y * stride..(y + 1) * stride], &changes, columns);
         reference.clear();
         reference.extend_from_slice(&changes);
@@ -354,7 +387,7 @@ pub fn decode(data: &[u8], p: &Params, height: usize) -> Result<(Vec<u8>, usize)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Escritor de bits para armar datos de prueba con los mismos codigos.
@@ -444,8 +477,151 @@ mod tests {
         // Sin /Rows, el alto pedido por quien llama tambien cuenta.
         assert!(decode(&data, &g4(1000, 0), usize::MAX).is_err());
         // Dentro del tope, una hoja A3 a 600 dpi se puede decodificar.
+        // Los dos bytes de datos dan a lo sumo 16 filas: solo esas se reservan.
         let (out, n) = decode(&data, &g4(7016, 9921), 9921).unwrap();
-        assert_eq!((out.len(), n > 0), (877 * 9921, true));
+        assert_eq!((out.len(), n > 0), (877 * 16, true));
+    }
+
+    #[test]
+    fn filas_topadas_en_bytes_y_por_los_datos() {
+        // Una columna por 100 millones de filas: 100 millones de pixeles caben en el tope de
+        // pixeles, pero cada fila ocupa un byte. Antes se reservaban 100 MB.
+        let g4 = |columns: usize, rows: usize| Params { k: -1, columns, rows, ..Params::default() };
+        let e = decode(&[0xFF, 0xFF], &g4(1, 100_000_000), 100_000_000).unwrap_err();
+        assert!(e.contains("demasiado grande"), "{}", e);
+        // Ocho columnas por un millon de filas con dos bytes de datos: antes se reservaba un
+        // millon de bytes; ahora solo las 16 filas que dos bytes pueden dar.
+        let (out, n) = decode(&[0, 0], &g4(8, 1_000_000), 1_000_000).unwrap();
+        assert!(out.len() <= 16, "{} bytes", out.len());
+        assert_eq!(n, 0);
+        // Cada fila igual a la anterior es un solo bit (V0): 16 bits dan 16 filas, ninguna se pierde.
+        let (out, n) = decode(&[0xFF, 0xFF], &g4(8, 1_000_000), 1_000_000).unwrap();
+        assert_eq!((out.len(), n), (16, 16));
+    }
+
+    #[test]
+    fn corridas_vacias_cortan_la_fila() {
+        // Imagen de 8 x 1. Grupo 3: 5.000 pares de corridas de largo 0 (no avanzan) y luego 8
+        // blancos. Antes la fila se aceptaba con 10.000 cambios: la lista crecia con los datos.
+        let mut w = W(Vec::new());
+        w.s("000000000001");
+        for _ in 0..5000 {
+            w.run(0, false).run(0, true);
+        }
+        w.run(8, false);
+        let (_, n) = decode(&w.bytes(), &Params { columns: 8, ..Params::default() }, 1).unwrap();
+        assert_eq!(n, 0);
+        // Grupo 4, modo horizontal con corridas vacias, y luego la fila completa en blanco.
+        let mut w = W(Vec::new());
+        for _ in 0..5000 {
+            w.s("001").run(0, false).run(0, true);
+        }
+        w.s("001").run(8, false).run(0, true);
+        let (_, n) = decode(&w.bytes(), &Params { k: -1, columns: 8, ..Params::default() }, 1).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn fila_con_un_cambio_por_columna_y_corrida_final_vacia() {
+        // El tope de cambios no corta filas reales. Cuatro columnas negro, blanco, negro, blanco,
+        // codificadas solo en modo horizontal (como algunos codificadores simples): los cambios son
+        // 0, 1, 2, 3, 4 y 4 (la ultima corrida negra es de largo 0), es decir, columnas + 2.
+        // Codigos de T.4 escritos a mano: H = 001; blanco 0 = 00110101, negro 1 = 010, blanco 1 =
+        // 000111, negro 0 = 0000110111.
+        let mut w = W(Vec::new());
+        w.s("001").s("00110101").s("010");
+        w.s("001").s("000111").s("010");
+        w.s("001").s("000111").s("0000110111");
+        let (out, n) = decode(&w.bytes(), &Params { k: -1, columns: 4, ..Params::default() }, 1).unwrap();
+        assert_eq!((n, out), (1, vec![0b1010_0000]));
+    }
+
+    #[test]
+    fn codigos_escritos_a_mano_desde_t4() {
+        // Los codigos se copiaron de las tablas de T.4 (tabla 2: terminales; tabla 3: de relleno;
+        // tabla 4: modos de dos dimensiones), no de las del decodificador.
+        let mut w = W(Vec::new());
+        // Grupo 3, una dimension, 140 columnas. Fila 1: fin de linea, 64 + 6 blancos (11011 1110)
+        // y 64 + 6 negros (0000001111 0010).
+        w.s("000000000001").s("11011").s("1110").s("0000001111").s("0010");
+        // Fila 2: 0 blancos (00110101), 2 negros (11), 128 + 10 blancos (10010 00111).
+        w.s("000000000001").s("00110101").s("11").s("10010").s("00111");
+        let (out, n) = decode(&w.bytes(), &Params { columns: 140, ..Params::default() }, 2).unwrap();
+        assert_eq!(n, 2);
+        let px = |y: usize, x: usize| out[y * 18 + x / 8] >> (7 - x % 8) & 1;
+        assert!((0..140).all(|x| px(0, x) == (x >= 70) as u8));
+        assert!((0..140).all(|x| px(1, x) == (x < 2) as u8));
+
+        // Grupo 4, 16 columnas. Fila 1: H (001), 4 blancos (1011) y 3 negros (10); otra vez H, 9
+        // blancos (10100) hasta el final y 0 negros (0000110111).
+        let mut w = W(Vec::new());
+        w.s("001").s("1011").s("10").s("001").s("10100").s("0000110111");
+        // Fila 2 respecto de la 1 (cambios en 4 y 7): VL1 (010) da a1 = 3; VR2 (000011) da a1 = 9;
+        // V0 (1) termina la fila en la columna 16. Negro de 3 a 9.
+        w.s("010").s("000011").s("1");
+        // Fila 3: paso (0001) salta el bloque de la fila 2 (b1 = 3, b2 = 9); V0 (1) hasta el final.
+        w.s("0001").s("1");
+        // Fin de bloque: dos fines de linea.
+        w.s("000000000001000000000001");
+        let (out, n) = decode(&w.bytes(), &Params { k: -1, columns: 16, ..Params::default() }, 3).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(out, [0b0000_1110, 0, 0b0001_1111, 0b1000_0000, 0, 0]);
+    }
+
+    /// Dibujos de los vectores de libtiff (los mismos del programa que los genero): 1 = negro.
+    pub(crate) fn figura(x: usize, y: usize) -> bool {
+        match y {
+            0 => (3..70).contains(&x),
+            1 => x % 7 < 2,
+            2 => !(1..=75).contains(&x),
+            3 => false,
+            4 => true,
+            5 | 6 => (10..20).contains(&x) || (30..33).contains(&x),
+            _ => (x + 2 * y) % 11 < 3 || x == y * 5,
+        }
+    }
+
+    fn ancho(x: usize, y: usize) -> bool {
+        match y {
+            0 => x >= 2000,
+            1 => !(1800..2590).contains(&x),
+            _ => matches!(x, 0 | 1000 | 2000),
+        }
+    }
+
+    /// Tira de grupo 4 de `figura` (80 x 12) hecha por libtiff; la usa tambien la prueba de MMR de JBIG2.
+    pub(crate) const G4_FIGURA: &str = "3007d047c3e1f0f87c3e1f0f87c3e1f1684444444445313bd43726a0782e4e109efc234c3cba3919c6719d08208208210820820820828410410410411c41041041050820820820826111d0410412841041041041041084104105001001";
+
+    pub(crate) fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// Nombre, columnas, filas, K, alineado al byte, dibujo y tira en hexadecimal.
+    type Vector = (&'static str, usize, usize, i64, bool, fn(usize, usize) -> bool, &'static str);
+
+    #[test]
+    fn vectores_de_un_codificador_independiente() {
+        // Tiras de TIFF generadas con el codificador de fax de libtiff (Pillow 12.2, compresion
+        // group3 y group4, una sola tira) a partir de `figura` y `ancho`; Pillow las volvio a
+        // leer con libtiff y dio el mismo dibujo. No dependen de las tablas de este archivo.
+        let casos: [Vector; 5] = [
+            ("grupo 4", 80, 12, -1, false, figura, G4_FIGURA),
+            ("grupo 3, una dimension", 80, 12, 0, false, figura, "001803e38009af9e79e79e79e79e798e0026ab686003ba8004d40f05c004e10f050009c21e0a0019d3a73aca74e9d0003d4e9d3a74e9d800374e9d3b13d3a77800bd3a74e9c3aea74d0009ad3a74e9d3a74e"),
+            ("grupo 3, dos dimensiones", 80, 12, 4, false, figura, "001c01f1c00408f87c3e1f0f87c3e1f0f87c3e2800cd56d0c004277a86e0033503c17001138427a0033843c1400208d30f2e8e46719c674007d4e9d3a74e9d800208208208208238820820820a0037a74e9d3875d4e9a001041041041041041084104105"),
+            ("grupo 3 alineado al byte", 80, 12, 0, true, figura, "0001803e38000135f3cf3cf3cf3cf3cf31c001355b430001dd40013503c170013843c140013843c140019d3a73aca74e9d0001ea74e9d3a74ec001ba74e9d89e9d3bc0017a74e9d3875d4e9a000135a74e9d3a74e9c0"),
+            ("grupo 4 con corridas de mas de 1.728", 2600, 3, -1, false, ancho, "2025501b40b9350102966830929a8505350a0a6808002002"),
+        ];
+        for (name, columns, rows, k, byte_align, f, data) in casos {
+            let p = Params { k, columns, rows, byte_align, ..Params::default() };
+            let (out, n) = decode(&hex(data), &p, rows).unwrap();
+            assert_eq!(n, rows, "{}", name);
+            let stride = row_bytes(columns);
+            for y in 0..rows {
+                for x in 0..columns {
+                    assert_eq!(out[y * stride + x / 8] >> (7 - x % 8) & 1 == 1, f(x, y), "{}: pixel ({}, {})", name, x, y);
+                }
+            }
+        }
     }
 
     /// Generador pseudoaleatorio fijo (xorshift), para que las pruebas se repitan igual.
