@@ -9,15 +9,16 @@
 //!
 //! Cada bloque lleva en `page` el numero de su diapositiva. Las notas del orador van aparte, en
 //! `notes`, con el numero de la diapositiva en `label`. Las diapositivas ocultas se omiten, y una
-//! diapositiva referida varias veces se lee una vez.
+//! diapositiva referida varias veces se lee una vez. El texto de toda la presentacion tiene un
+//! tope (`MAX_TEXT`), igual que en Excel.
 //! No se lee el texto de graficos ni de SmartArt.
 
 use crate::doc::*;
 use crate::docx::{letters, part_rels, properties, relationships, resolve, roman};
 use crate::symbols::{classify, translate, translate_str, SymbolFont};
 use crate::xml::{Ev, Tag, Xml};
-use crate::zipread::ZipArchive;
-use std::collections::HashMap;
+use crate::zipread::{part_key, ZipArchive};
+use std::collections::{HashMap, HashSet};
 
 /// Tope de diapositivas distintas que se leen.
 const MAX_SLIDES: usize = 10_000;
@@ -131,10 +132,10 @@ fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
                     sym = SymbolFont::None;
                 }
                 "a:rPr" => {
-                    cur.bold = t.attr("b").is_some_and(|v| v == "1" || v == "true");
-                    cur.italic = t.attr("i").is_some_and(|v| v == "1" || v == "true");
-                    cur.underline = t.attr("u").is_some_and(|v| v != "none");
-                    cur.strike = t.attr("strike").is_some_and(|v| v != "noStrike");
+                    cur.bold = t.on_flag("b");
+                    cur.italic = t.on_flag("i");
+                    cur.underline = matches!(t.attr("u").as_deref(), Some(v) if v != "none");
+                    cur.strike = matches!(t.attr("strike").as_deref(), Some(v) if v != "noStrike");
                 }
                 "a:latin" => latin = classify(&t.attr("typeface").unwrap_or_default()),
                 "a:sym" => sym = classify(&t.attr("typeface").unwrap_or_default()),
@@ -196,7 +197,7 @@ fn text_body(x: &mut Xml, end: &str, role: Role, rels: &HashMap<String, String>,
                             b.level = p.level;
                             if let Some((kind, start)) = &p.auto {
                                 let c = &mut counters[p.level as usize];
-                                if c.as_ref().is_none_or(|c| c.0 != *kind) {
+                                if !matches!(c, Some(c) if c.0 == *kind) {
                                     *c = Some((kind.clone(), *start - 1));
                                 }
                                 if let Some(c) = c {
@@ -418,17 +419,19 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
         }
     }
     if order.is_empty() {
-        // Sin lista de diapositivas: las que haya, por numero (puede haber huecos).
+        // Sin lista de diapositivas: las que haya, por numero (puede haber huecos). `find` usa un
+        // indice, asi que probar cada numero hasta el de entradas del ZIP es lineal.
         let base = if dir.is_empty() { "ppt" } else { &dir };
         order = (1..=zip.entries.len()).map(|n| format!("{}/slides/slide{}.xml", base, n)).filter(|p| zip.find(p).is_some()).collect();
     }
 
     let mut doc = Document { kind: "pptx", ..Document::default() };
     properties(&zip, &mut doc);
-    // Una diapositiva referida varias veces se lee una vez, en su primera posicion.
+    // Una diapositiva referida varias veces se lee una vez, en su primera posicion. La clave es
+    // la de `find`: "slides/Slide1.xml" y "//ppt/slides/slide1.xml" son la misma parte.
     let total = order.len();
-    let mut seen = std::collections::HashSet::new();
-    order.retain(|p| seen.insert(p.clone()));
+    let mut seen = HashSet::new();
+    order.retain(|p| seen.insert(part_key(p)));
     if order.len() < total {
         doc.warnings.push(format!("Se omitieron {} referencias repetidas a diapositivas ya leidas.", total - order.len()));
     }
@@ -439,15 +442,23 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     doc.page_count = Some(order.len());
     let mut notes_list = Vec::new();
     let mut hidden = 0usize;
+    let mut text_left = MAX_TEXT;
     for (i, path) in order.iter().enumerate() {
         let n = i as u32 + 1;
         match slide_blocks(&zip, path, n) {
             Some((_, true)) => hidden += 1,
             Some((blocks, false)) => {
-                doc.content.extend(blocks);
-                if let Some(nb) = notes(&zip, path, n) {
-                    notes_list.push(nb);
+                let note = notes(&zip, path, n);
+                // Una misma parte puede figurar en el ZIP con muchos nombres, y muchas
+                // diapositivas pueden compartir las mismas notas: el texto total tiene tope.
+                let size: usize = blocks.iter().chain(note.as_ref()).map(text_size).sum();
+                if size > text_left {
+                    doc.warnings.push(format!("La presentacion supera el tope de {} MB de texto; se omitieron las diapositivas desde la {}.", MAX_TEXT >> 20, n));
+                    break;
                 }
+                text_left -= size;
+                doc.content.extend(blocks);
+                notes_list.extend(note);
             }
             None => doc.warnings.push(format!("No se pudo leer la diapositiva {}.", n)),
         }

@@ -12,15 +12,17 @@
 //! Una hoja muy dispersa (pocas celdas en un rango grande, como una diagonal) no se arma como
 //! tabla, que tendria filas por columnas celdas casi todas vacias: sale como tabla de dos columnas,
 //! referencia y valor ("B2", "123"), con un aviso. Los topes de celdas leidas y de celdas de
-//! tabla valen para todo el libro, no por hoja, y una hoja referida varias veces se lee una vez.
+//! tabla valen para todo el libro, no por hoja, igual que el del texto total (`MAX_TEXT`), y una
+//! hoja referida varias veces se lee una vez.
 //!
 //! Los nombres de las etiquetas se comparan sin prefijo: algunos programas escriben `<x:row>`.
 
 use crate::doc::*;
 use crate::docx::{part_rels, properties, relationships, resolve};
 use crate::xml::{Ev, Xml};
-use crate::zipread::ZipArchive;
-use std::collections::HashMap;
+use crate::zipread::{part_key, ZipArchive};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 /// Tope de celdas con valor que se leen en todo el libro; el resto se omite con un aviso.
 const MAX_CELLS: usize = 2_000_000;
@@ -313,7 +315,13 @@ fn shared_strings(zip: &ZipArchive, path: Option<&String>) -> Vec<String> {
     while let Some(ev) = x.next() {
         if let Ev::Start(t) = ev {
             if local(t.name) == "si" {
-                out.push(if t.empty { String::new() } else { rich_text(&mut x, t.name) });
+                let mut s = if t.empty { String::new() } else { rich_text(&mut x, t.name) };
+                // Un texto solo de espacios deja la celda vacia: se guarda vacio, para no
+                // recorrerlo de nuevo en cada celda que lo cita.
+                if s.trim().is_empty() {
+                    s.clear();
+                }
+                out.push(s);
             }
         }
     }
@@ -324,8 +332,8 @@ fn shared_strings(zip: &ZipArchive, path: Option<&String>) -> Vec<String> {
 fn styles(zip: &ZipArchive, path: Option<&String>) -> Vec<NumKind> {
     let mut out = Vec::new();
     let Some(src) = path.and_then(|p| zip.read_text(p)) else { return out };
-    // Formatos propios: pocos, se buscan en orden.
-    let mut custom: Vec<(u32, NumKind)> = Vec::new();
+    // Formatos propios por numero; si uno se repite, vale el ultimo.
+    let mut custom: HashMap<u32, NumKind> = HashMap::new();
     let mut x = Xml::new(&src);
     let mut in_xfs = false;
     while let Some(ev) = x.next() {
@@ -333,13 +341,13 @@ fn styles(zip: &ZipArchive, path: Option<&String>) -> Vec<NumKind> {
             Ev::Start(t) => match local(t.name) {
                 "numFmt" => {
                     if let (Some(id), Some(code)) = (t.attr("numFmtId").and_then(|v| v.parse().ok()), t.attr("formatCode")) {
-                        custom.push((id, code_kind(&code)));
+                        custom.insert(id, code_kind(&code));
                     }
                 }
                 "cellXfs" if !t.empty => in_xfs = true,
                 "xf" if in_xfs => {
                     let id: u32 = t.attr("numFmtId").and_then(|v| v.parse().ok()).unwrap_or(0);
-                    out.push(custom.iter().rev().find(|c| c.0 == id).map_or_else(|| builtin_kind(id), |c| c.1));
+                    out.push(custom.get(&id).copied().unwrap_or_else(|| builtin_kind(id)));
                     if !t.empty {
                         x.skip(t.name);
                     }
@@ -359,12 +367,13 @@ struct Ctx<'a> {
     date1904: bool,
 }
 
-/// Valor que muestra una celda segun su tipo (`t`) y su estilo (`s`).
-fn display(ctx: &Ctx, kind: &str, style: usize, raw: &str) -> String {
-    match kind {
-        "s" => raw.trim().parse::<usize>().ok().and_then(|i| ctx.strings.get(i)).cloned().unwrap_or_default(),
+/// Valor que muestra una celda segun su tipo (`t`) y su estilo (`s`). Un texto compartido se
+/// presta, no se copia: lo pueden citar millones de celdas.
+fn display<'a>(ctx: &Ctx<'a>, kind: &str, style: usize, raw: String) -> Cow<'a, str> {
+    Cow::Owned(match kind {
+        "s" => return raw.trim().parse::<usize>().ok().and_then(|i| ctx.strings.get(i)).map_or(Cow::Borrowed(""), |s| Cow::Borrowed(s.as_str())),
         "b" => (if raw.trim() == "1" { "TRUE" } else { "FALSE" }).to_string(),
-        "str" | "inlineStr" | "e" | "d" => raw.to_string(),
+        "str" | "inlineStr" | "e" | "d" => raw,
         _ => match raw.trim().parse::<f64>() {
             Ok(v) => match ctx.kinds.get(style).copied().unwrap_or(NumKind::Plain) {
                 NumKind::Date => excel_date(v, ctx.date1904),
@@ -374,20 +383,24 @@ fn display(ctx: &Ctx, kind: &str, style: usize, raw: &str) -> String {
             },
             Err(_) => raw.trim().to_string(),
         },
-    }
+    })
 }
 
-struct Sheet {
+struct Sheet<'a> {
     /// (fila, columna, valor), en el orden del archivo.
-    cells: Vec<(usize, usize, String)>,
+    cells: Vec<(usize, usize, Cow<'a, str>)>,
     /// (fila inicial, columna inicial, fila final, columna final).
     merges: Vec<(usize, usize, usize, usize)>,
+    /// Se corto por el tope de celdas con valor del libro.
     truncated: bool,
+    /// Se corto por el tope de texto del libro.
+    text_full: bool,
 }
 
-/// Lee las celdas con valor de una hoja, hasta `max_cells`.
-fn read_sheet(src: &str, ctx: &Ctx, max_cells: usize) -> Sheet {
-    let mut sheet = Sheet { cells: Vec::new(), merges: Vec::new(), truncated: false };
+/// Lee las celdas con valor de una hoja, hasta `max_cells` y hasta agotar `text_left` (bytes
+/// de texto que quedan en el libro: se descuenta lo leido y queda en 0 si no alcanza).
+fn read_sheet<'a>(src: &str, ctx: &Ctx<'a>, max_cells: usize, text_left: &mut usize) -> Sheet<'a> {
+    let mut sheet = Sheet { cells: Vec::new(), merges: Vec::new(), truncated: false, text_full: false };
     let mut x = Xml::new(src);
     let mut row = 0usize;
     let mut col = 0usize;
@@ -420,7 +433,7 @@ fn read_sheet(src: &str, ctx: &Ctx, max_cells: usize) -> Sheet {
                         _ => {}
                     }
                 }
-                let value = display(ctx, &kind, style, &raw);
+                let value = display(ctx, &kind, style, raw);
                 if value.trim().is_empty() {
                     continue;
                 }
@@ -428,6 +441,12 @@ fn read_sheet(src: &str, ctx: &Ctx, max_cells: usize) -> Sheet {
                     sheet.truncated = true;
                     break;
                 }
+                if value.len() > *text_left {
+                    *text_left = 0;
+                    sheet.text_full = true;
+                    break;
+                }
+                *text_left -= value.len();
                 sheet.cells.push((r, c, value));
             }
             "mergeCell" => {
@@ -444,9 +463,9 @@ fn read_sheet(src: &str, ctx: &Ctx, max_cells: usize) -> Sheet {
 }
 
 /// Hoja muy dispersa: una tabla de dos columnas, referencia y valor, en el orden de la hoja.
-fn sparse_table(cells: Vec<(usize, usize, String)>, page: u32) -> Block {
+fn sparse_table(cells: Vec<(usize, usize, Cow<str>)>, page: u32) -> Block {
     let cell = |text: String| Cell { text, colspan: 1, rowspan: 1, merged: false };
-    let rows = cells.into_iter().map(|(r, c, v)| vec![cell(format!("{}{}", col_name(c), r)), cell(v)]).collect();
+    let rows = cells.into_iter().map(|(r, c, v)| vec![cell(format!("{}{}", col_name(c), r)), cell(v.into_owned())]).collect();
     Block { kind: Kind::Table, rows, page: Some(page), ..Block::default() }
 }
 
@@ -563,7 +582,7 @@ fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str, 
         let mut line = Vec::with_capacity(nc);
         // Valores de esta fila, ya ordenados por columna.
         let mut next = |j: usize| match values.peek() {
-            Some(v) if v.0 == r && cols.get(j) == Some(&v.1) => values.next().map(|v| v.2),
+            Some(v) if v.0 == r && cols.get(j) == Some(&v.1) => values.next().map(|v| v.2.into_owned()),
             _ => None,
         };
         for j in 0..nc {
@@ -579,7 +598,7 @@ fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str, 
             line.push(Cell { text, colspan, rowspan, merged: false });
         }
         // Las celdas vacias del final de la fila no aportan: en hojas anchas y ralas son la mayoria.
-        while line.last().is_some_and(|c| c.text.is_empty() && !c.merged && c.colspan == 1 && c.rowspan == 1) {
+        while matches!(line.last(), Some(c) if c.text.is_empty() && !c.merged && c.colspan == 1 && c.rowspan == 1) {
             line.pop();
         }
         out.push(line);
@@ -632,14 +651,16 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     properties(&zip, &mut doc);
     let mut hidden = 0usize;
     let mut number = 0u32;
-    // Una misma parte referida por varias hojas se lee una vez (vale la primera referencia).
-    let mut seen = std::collections::HashSet::new();
+    // Una misma parte referida por varias hojas se lee una vez (vale la primera referencia). La
+    // clave es la de `find`: "worksheets/Sheet1.xml" y "/xl/worksheets/sheet1.xml" son la misma.
+    let mut seen = HashSet::new();
     let mut repeated = 0usize;
     let mut cells_left = MAX_CELLS;
     let mut grid_left = MAX_GRID;
+    let mut text_left = MAX_TEXT;
     for (name, path, is_hidden) in &sheets {
         if let Some(p) = path {
-            if !seen.insert(p.as_str()) {
+            if !seen.insert(part_key(p)) {
                 repeated += 1;
                 continue;
             }
@@ -662,10 +683,17 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
             doc.warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} celdas con datos.", name, MAX_CELLS));
             continue;
         }
-        let sheet = read_sheet(&src, &ctx, cells_left);
+        if text_left == 0 {
+            doc.warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} MB de texto.", name, MAX_TEXT >> 20));
+            continue;
+        }
+        let sheet = read_sheet(&src, &ctx, cells_left, &mut text_left);
         cells_left -= sheet.cells.len();
         if sheet.truncated {
             doc.warnings.push(format!("Hoja «{}»: se leyo solo una parte, porque el libro alcanzo el tope de {} celdas con datos.", name, MAX_CELLS));
+        }
+        if sheet.text_full {
+            doc.warnings.push(format!("Hoja «{}»: se leyo solo una parte, porque el libro alcanzo el tope de {} MB de texto.", name, MAX_TEXT >> 20));
         }
         if let Some(table) = sheet_table(sheet, number, &mut doc.warnings, name, &mut grid_left) {
             doc.content.push(Block { kind: Kind::Heading, level: 1, text: name.clone(), page: Some(number), ..Block::default() });
@@ -716,8 +744,8 @@ mod tests {
         assert_eq!(excel_date(1.75, true), "1904-01-02T18:00:00");
     }
 
-    fn hoja(cells: &[(usize, usize)]) -> Sheet {
-        Sheet { cells: cells.iter().map(|&(r, c)| (r, c, format!("{}-{}", r, c))).collect(), merges: Vec::new(), truncated: false }
+    fn hoja(cells: &[(usize, usize)]) -> Sheet<'static> {
+        Sheet { cells: cells.iter().map(|&(r, c)| (r, c, Cow::Owned(format!("{}-{}", r, c)))).collect(), merges: Vec::new(), truncated: false, text_full: false }
     }
 
     #[test]

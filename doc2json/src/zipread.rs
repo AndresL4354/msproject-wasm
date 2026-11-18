@@ -2,6 +2,7 @@
 //! Suficiente para abrir un .docx (que es un ZIP con archivos XML dentro).
 
 use crate::inflate::inflate;
+use std::collections::HashMap;
 
 pub struct Entry {
     pub name: String,
@@ -14,6 +15,15 @@ pub struct Entry {
 pub struct ZipArchive<'a> {
     data: &'a [u8],
     pub entries: Vec<Entry>,
+    /// Indice de cada nombre en minusculas (ASCII) a su primera entrada: `find` no recorre la
+    /// lista, que en un archivo malicioso puede tener 65.535 entradas.
+    index: HashMap<String, usize>,
+}
+
+/// Clave con que `find` busca una parte: sin barras iniciales y en minusculas (ASCII). Dos
+/// rutas con la misma clave son la misma parte; sirve para no leer dos veces la misma.
+pub fn part_key(name: &str) -> String {
+    name.trim_start_matches('/').to_ascii_lowercase()
 }
 
 fn u16_at(d: &[u8], o: usize) -> usize {
@@ -65,12 +75,18 @@ impl<'a> ZipArchive<'a> {
             });
             pos += 46 + name_len + u16_at(data, pos + 30) + u16_at(data, pos + 32);
         }
-        Ok(ZipArchive { data, entries })
+        let mut index = HashMap::with_capacity(entries.len());
+        for (i, e) in entries.iter().enumerate() {
+            // Vale la primera entrada con ese nombre. Al nombre de la entrada no se le quitan las
+            // barras iniciales: una entrada "/a.xml" no la encuentra ninguna busqueda.
+            index.entry(e.name.to_ascii_lowercase()).or_insert(i);
+        }
+        Ok(ZipArchive { data, entries, index })
     }
 
+    /// Entrada de una parte, sin distinguir mayusculas (ASCII) y sin las barras iniciales.
     pub fn find(&self, name: &str) -> Option<&Entry> {
-        let name = name.trim_start_matches('/');
-        self.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name))
+        self.index.get(&part_key(name)).map(|&i| &self.entries[i])
     }
 
     pub fn read(&self, name: &str) -> Option<Vec<u8>> {

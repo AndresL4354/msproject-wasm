@@ -120,6 +120,20 @@ impl Document {
     }
 }
 
+/// Tope del texto que juntan los lectores de PowerPoint y Excel en todo el documento, en bytes.
+/// Sin el, una parte que figura con muchos nombres en el ZIP o un texto compartido citado por
+/// millones de celdas multiplican el texto sin limite. 64 MB dan 32 bytes por celda con el tope
+/// de 2 millones de celdas de un libro; el JSON lleva el texto al menos dos veces (bloques y
+/// texto plano) y en JavaScript una cadena no pasa de unos 512 MB.
+pub(crate) const MAX_TEXT: usize = 64 << 20;
+
+/// Bytes de texto de un bloque: su texto, el de sus tramos y celdas y su marcador.
+pub(crate) fn text_size(b: &Block) -> usize {
+    let runs: usize = b.runs.iter().map(|r| r.text.len()).sum();
+    let cells: usize = b.rows.iter().flatten().map(|c| c.text.len()).sum();
+    b.text.len() + runs + cells + b.marker.as_ref().map_or(0, String::len)
+}
+
 /// Texto plano de un bloque, con su numeracion o vineta delante.
 pub fn block_text(b: &Block) -> String {
     match b.kind {

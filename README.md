@@ -124,7 +124,7 @@ Un PDF no guarda párrafos ni tablas: guarda letras sueltas con coordenadas. La 
 - El título sale como `heading`; el texto de los marcadores de contenido, como `list_item` con su nivel y su viñeta o numeración automática (`1.`, `a)`, `IV.`); los cuadros de texto, como párrafos.
 - Tablas con celdas combinadas, imágenes con su texto alternativo y notas del orador aparte, en `notes`.
 - Se omite lo que no es contenido (número de diapositiva, fecha y pie) y las diapositivas ocultas, con un aviso en `warnings`.
-- Una diapositiva referida varias veces en la presentación se lee una vez; se leen hasta 10.000 diapositivas distintas.
+- Una diapositiva referida varias veces en la presentación (aunque cambien las mayúsculas o las barras de la ruta) se lee una vez; se leen hasta 10.000 diapositivas distintas y hasta 64 MB de texto en toda la presentación, con un aviso si se pasa.
 
 ### Excel (.xlsx)
 
@@ -133,7 +133,7 @@ Un PDF no guarda párrafos ni tablas: guarda letras sueltas con coordenadas. La 
 - De las fórmulas se toma el último valor que calculó Excel; no se recalculan.
 - Se quitan las filas y columnas vacías, también las intermedias; las celdas combinadas pasan a `colspan`/`rowspan`. Si dos combinaciones se solapan (Excel no lo permite), vale la primera.
 - Una hoja muy dispersa (más de 16 celdas de tabla por cada valor, como datos en diagonal) sale como una `table` de dos columnas, referencia y valor (`B2`, `123`), con un aviso: como tabla tendría filas × columnas celdas casi todas vacías.
-- Topes para todo el libro, no por hoja: 2 millones de celdas con valor y 4 millones de celdas de tabla. Lo que pasa del tope se corta con un aviso. Una hoja referida varias veces se lee una vez.
+- Topes para todo el libro, no por hoja: 2 millones de celdas con valor, 4 millones de celdas de tabla, 64 MB de texto y 4.096 hojas. Lo que pasa del tope se corta con un aviso. Una hoja referida varias veces (aunque cambien las mayúsculas o las barras de la ruta) se lee una vez.
 - Se omiten las hojas ocultas, con un aviso en `warnings`.
 
 ---
