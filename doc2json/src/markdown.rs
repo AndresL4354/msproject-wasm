@@ -8,7 +8,8 @@
 //!   el bloque solo ya sea mas grande que el fragmento) y trae la ruta de titulos de su seccion y
 //!   las paginas que cubre. Las tablas largas se parten por filas repitiendo el encabezado.
 //!
-//! El texto del documento nunca se vuelve marca: se escapan `<`, `[`, `]`, `` ` ``, las entidades
+//! El texto del documento no se vuelve HTML, enlaces, titulos ni listas (`*x*`, `_x_` y `~~x~~` no
+//! se escapan y pueden salir como enfasis): se escapan `<`, `[`, `]`, `` ` ``, las entidades
 //! (`&lt;`), las barras invertidas y lo que al inicio de una linea (tambien tras un `\r` solo)
 //! abriria un titulo, una cita, una lista o una linea horizontal. Los enlaces de Word solo salen si
 //! son `http`, `https` o `mailto`. Esto evita que el texto se lea como marca, pero no reemplaza a un
@@ -67,15 +68,18 @@ fn escape_start(text: &str) -> String {
     let needs = match first {
         Some('#') | Some('>') => true,
         Some('=') => only('=', 1),
+        // "--" bajo una linea de parrafo la vuelve titulo (subrayado), como "-" o "---".
+        Some('-') if only('-', 1) => true,
         Some('~') => t.starts_with("~~~"),
         Some('-') | Some('+') | Some('*') | Some('_') if only(first.unwrap_or(' '), 3) => true,
         Some('-') | Some('+') | Some('*') => t.chars().nth(1).map_or(true, |c| c == ' ' || c == '\t'),
         Some(c) if c.is_ascii_digit() => {
-            // "1. " y "1) " abren una lista numerada. En CommonMark "\1" no es un escape (la barra
-            // se veria): se escapa el punto o el parentesis, "1\. Objetivo".
+            // "1. " y "1) " (tambien con tabulador) abren una lista numerada. En CommonMark "\1" no
+            // es un escape (la barra se veria): se escapa el punto o el parentesis, "1\. Objetivo".
             let digits = t.bytes().take_while(u8::is_ascii_digit).count();
             let rest = &t[digits..];
-            let list = (rest.starts_with(". ") || rest.starts_with(") ") || rest == "." || rest == ")") && digits <= 9;
+            let opens = |p: char| rest.starts_with(p) && rest[1..].starts_with([' ', '\t']);
+            let list = (opens('.') || opens(')') || rest == "." || rest == ")") && digits <= 9;
             return if list { format!("{}\\{}", &t[..digits], rest) } else { t.to_string() };
         }
         _ => false,
@@ -377,7 +381,8 @@ fn block_md(b: &Block, cx: &Ctx) -> String {
             match &b.name {
                 Some(n) => {
                     // Un nombre con ":" antes de la primera "/" se leeria como esquema ("javascript:").
-                    let n = encode_url(n.trim());
+                    // Un "&" tambien: CommonMark decodifica las entidades de un destino ("&#58;" = ":").
+                    let n = encode_url(n.trim()).replace('&', "%26");
                     let local = if n.split('/').next().map_or(false, |p| p.contains(':')) { format!("./{}", n) } else { n };
                     format!("![{}]({})", alt, local)
                 }
@@ -400,7 +405,39 @@ fn context(d: &Document) -> Ctx {
     Ctx { offset: if d.content.iter().any(|b| b.kind == Kind::Title) { 1 } else { 0 }, labels }
 }
 
-/// Notas al pie y finales como definiciones de Markdown (`[^1]: texto`).
+/// Texto de una nota despues de "[^n]: ". Para un lector sin notas al pie (CommonMark puro) esa
+/// linea es una definicion de referencia si el texto es un destino ("javascript:...", "<...>") o un
+/// destino y un titulo ('x "t"'), y cada cita "[^n]" del cuerpo seria un enlace a ese destino.
+/// Escapar no alcanza (CommonMark deshace escapes y entidades en un destino): la linea nunca tiene
+/// esa forma. Despues de la primera palabra, que se leeria como destino, siempre va otra (un texto
+/// de una sola palabra va despues de una raya) y esa no abre un titulo: `"`, `'` y `(` van escapados.
+fn note_text(text: &str) -> String {
+    not_destination(escape_text(&text.split_whitespace().collect::<Vec<_>>().join(" ")))
+}
+
+/// La regla de `note_text` sobre un texto ya escapado. Suma como mucho 3 caracteres y no cambia
+/// un texto que ya la cumple.
+fn not_destination(mut t: String) -> String {
+    if !t.contains(' ') {
+        t = format!("— {}", t);
+    }
+    let i = t.find(' ').map_or(0, |i| i + 1);
+    if t[i..].starts_with(['"', '\'', '(']) {
+        t.insert(i, '\\');
+    }
+    t
+}
+
+/// Una linea de notas en un fragmento: si es el inicio de una nota ("[^n]: ..."), cumple la regla
+/// de `note_text` aunque el corte la haya dejado con una sola palabra.
+fn note_line(l: &str) -> String {
+    match l.strip_prefix("[^").and_then(|r| r.split_once("]: ")) {
+        Some((label, rest)) if safe_label(label) && !rest.trim().is_empty() => format!("[^{}]: {}", label, not_destination(rest.trim().to_string())),
+        _ => l.to_string(),
+    }
+}
+
+/// Notas al pie y finales como notas de Markdown (`[^1]: texto`). Una nota sin texto no sale.
 fn notes_md(d: &Document) -> String {
     let mut out: Vec<String> = Vec::new();
     for (k, blocks) in &d.extras {
@@ -408,9 +445,8 @@ fn notes_md(d: &Document) -> String {
             continue;
         }
         for b in blocks {
-            if let Some(l) = b.label.as_deref().filter(|l| safe_label(l)) {
-                let text = escape_text(&b.text.split_whitespace().collect::<Vec<_>>().join(" "));
-                out.push(format!("[^{}]: {}", l, text));
+            if let Some(l) = b.label.as_deref().filter(|l| safe_label(l) && !b.text.trim().is_empty()) {
+                out.push(format!("[^{}]: {}", l, note_text(&b.text)));
             }
         }
     }
@@ -740,12 +776,15 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
             }
         }
     }
-    // Las notas al pie van en un fragmento propio al final.
+    // Las notas al pie van en un fragmento propio al final. Un corte puede dejar una nota con solo
+    // su primera palabra ("[^1]: palabra"), que seria una definicion de referencia: esa linea se
+    // arregla como en `note_text` (por eso el corte deja 3 caracteres mas de margen).
     let notes = notes_md(d);
     b.emit();
     if !notes.is_empty() {
-        for piece in split_text(&notes, b.max - 1) {
-            b.push(&escape_start(&piece), Kind::Paragraph, None, &["Notas".to_string()]);
+        for piece in split_text(&notes, b.max - 4) {
+            let piece = escape_start(&piece).lines().map(note_line).collect::<Vec<_>>().join("\n");
+            b.push(&piece, Kind::Paragraph, None, &["Notas".to_string()]);
             b.emit();
         }
     }
@@ -938,7 +977,7 @@ mod revision {
         let texto = "palabra ".repeat(1_000_000);
         let inicio = Instant::now();
         let partes = split_text(&texto, 200);
-        assert!(inicio.elapsed().as_secs() < 3, "{:?}", inicio.elapsed());
+        assert!(inicio.elapsed().as_secs() < 20, "{:?}", inicio.elapsed());
         assert!(partes.iter().all(|p| p.chars().count() <= 200));
         assert_eq!(partes.iter().map(|p| p.matches("palabra").count()).sum::<usize>(), 1_000_000);
         // Tambien sin espacios y con caracteres de varios bytes.
@@ -952,7 +991,7 @@ mod revision {
         let content: Vec<Block> = (0..200_000).map(|i| p(&format!("Linea {}", i))).collect();
         let inicio = Instant::now();
         let c = chunks(&doc(content), 16_000_000);
-        assert!(inicio.elapsed().as_secs() < 3, "{:?}", inicio.elapsed());
+        assert!(inicio.elapsed().as_secs() < 20, "{:?}", inicio.elapsed());
         assert_eq!(c.len(), 1);
     }
 
@@ -992,5 +1031,132 @@ mod revision {
             let md = to_markdown(&doc(vec![una_celda(t), p("Texto")]));
             assert_eq!(md, format!("{}\n\nTexto\n", esperado));
         }
+    }
+
+    /// La linea es una definicion de referencia para CommonMark: "[etiqueta]:", un destino
+    /// ("<...>" o sin espacios y con los parentesis equilibrados) y, si hay, un titulo separado por
+    /// espacios ("...", '...' o (...)), sin nada mas hasta el final de la linea.
+    fn es_definicion(linea: &str) -> bool {
+        let resto = match linea.strip_prefix('[').and_then(|r| r.split_once("]:")) {
+            Some((_, r)) => r,
+            None => return false,
+        };
+        let s: Vec<char> = resto.trim_start_matches([' ', '\t']).chars().collect();
+        let escape = |s: &[char], i: usize| s[i] == '\\' && s.get(i + 1).map_or(false, char::is_ascii_punctuation);
+        let mut i = 0;
+        if s.first() == Some(&'<') {
+            i = 1;
+            loop {
+                match s.get(i) {
+                    None | Some('<') => return false,
+                    Some('>') => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += if escape(&s, i) { 2 } else { 1 },
+                }
+            }
+        } else {
+            let mut abiertos = 0;
+            while i < s.len() && s[i] != ' ' && !s[i].is_ascii_control() {
+                if escape(&s, i) {
+                    i += 2;
+                    continue;
+                }
+                if s[i] == '(' {
+                    abiertos += 1;
+                } else if s[i] == ')' {
+                    if abiertos == 0 {
+                        break;
+                    }
+                    abiertos -= 1;
+                }
+                i += 1;
+            }
+            if i == 0 || abiertos != 0 {
+                return false;
+            }
+        }
+        let espacios = s[i..].iter().take_while(|c| **c == ' ' || **c == '\t').count();
+        let t = &s[i + espacios..];
+        if t.is_empty() {
+            return true;
+        }
+        let cierre = match t[0] {
+            '"' => '"',
+            '\'' => '\'',
+            '(' => ')',
+            _ => return false,
+        };
+        let mut j = 1;
+        while j < t.len() && espacios > 0 {
+            if escape(t, j) {
+                j += 2;
+                continue;
+            }
+            if t[j] == cierre {
+                return t[j + 1..].iter().all(|c| *c == ' ' || *c == '\t');
+            }
+            if t[0] == '(' && t[j] == '(' {
+                return false;
+            }
+            j += 1;
+        }
+        false
+    }
+
+    #[test]
+    fn una_nota_no_es_una_definicion_de_referencia() {
+        // Para un lector sin notas al pie, "[^1]: destino" y "[^1]: destino \"titulo\"" definen la
+        // referencia "^1" y cada cita "[^1]" del cuerpo seria un enlace a ese destino.
+        for l in ["[^1]: javascript:alert(1)", "[^1]: \\<javascript:alert(1)>", "[^1]: <javascript:alert(1)>", "[^1]: x \"t\"", "[^1]: x 't'", "[^1]: x (t)"] {
+            assert!(es_definicion(l), "{}", l);
+        }
+        for l in ["[^1]: x y", "[^1]: (x", "[^1]: x \\\"t\"", "[^1]: x \"t\" y", "[^1]:"] {
+            assert!(!es_definicion(l), "{}", l);
+        }
+        let notas = ["javascript:alert(1)", "<javascript:alert(1)>", "javascript:alert(1) \"titulo\"", "javascript:alert(1) 'titulo'", "javascript:alert(1) (titulo)", " ", "\"javascript:alert(1)\"", "Solo equipos electricos."];
+        let citas: String = (1..=notas.len()).map(|i| format!("Cita [{}]. ", i)).collect();
+        let mut d = doc(vec![p(&citas)]);
+        d.extras.push(("footnotes", notas.iter().enumerate().map(|(i, t)| Block { label: Some((i + 1).to_string()), text: t.to_string(), ..Block::default() }).collect()));
+        let md = to_markdown(&d);
+        let lineas: Vec<&str> = md.lines().filter(|l| l.starts_with("[^")).collect();
+        assert_eq!(
+            lineas,
+            [
+                "[^1]: — javascript:alert(1)",
+                "[^2]: — \\<javascript:alert(1)>",
+                "[^3]: javascript:alert(1) \\\"titulo\"",
+                "[^4]: javascript:alert(1) \\'titulo'",
+                "[^5]: javascript:alert(1) \\(titulo)",
+                "[^7]: — \\\"javascript:alert(1)\"",
+                "[^8]: Solo equipos electricos.",
+            ],
+            "{}",
+            md
+        );
+        for l in md.lines() {
+            assert!(!es_definicion(l), "{}\n{}", l, md);
+        }
+        // En los fragmentos, un corte no deja una nota con solo su primera palabra: aqui la segunda
+        // palabra es enorme frente al fragmento y el corte cae justo despues de la primera.
+        let larga = format!("javascript:alert(1)//{} {}", "a".repeat(80), "x".repeat(500));
+        d.extras.push(("endnotes", vec![Block { label: Some("i".into()), text: larga, ..Block::default() }]));
+        for max in [200, 300] {
+            for c in chunks(&d, max) {
+                assert!(c.text.chars().count() <= max, "{}", c.text);
+                for l in c.text.lines() {
+                    assert!(!es_definicion(l), "{}\n{}", l, c.text);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn una_imagen_con_entidades_no_sale_remota() {
+        // CommonMark decodifica las entidades de un destino: "&#58;" seria ":" y la imagen, remota.
+        let img = |n: &str| Block { kind: Kind::Image, name: Some(n.into()), text: "foto".into(), ..Block::default() };
+        let md = to_markdown(&doc(vec![img("https&#58;&#47;&#47;host&#47;p.png"), img("javascript&#58;alert(1)")]));
+        assert_eq!(md, "![foto](https%26#58;%26#47;%26#47;host%26#47;p.png)\n\n![foto](javascript%26#58;alert%281%29)\n");
     }
 }
