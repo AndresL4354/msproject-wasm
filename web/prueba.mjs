@@ -43,6 +43,28 @@ for (const nombre of ['procedimiento.docx', 'procedimiento.pdf']) {
   comprobar(`${nombre}: la salida completa trae mas datos`, (await doc.docToJsonText(bytes, { full: true })).length > texto.length);
 }
 
+{
+  // Limites de recursos: con pocos caracteres se entrega la primera parte con un aviso, y los
+  // limites de una llamada no quedan para la siguiente.
+  const bytes = await readFile(path.join(ejemplo, 'procedimiento.docx'));
+  const corto = await doc.docToJson(bytes, { limits: { maxChars: 100 } });
+  comprobar('limits.maxChars corta el texto y avisa', (corto.warnings || []).some((w) => /limite de 100 caracteres/.test(w)));
+  const completo = await doc.docToJson(bytes);
+  comprobar('los limites no quedan para la conversion siguiente', !completo.warnings && completo.content.length > corto.content.length);
+  comprobar('limits rechaza valores invalidos', /maxPages/.test(await mensajeDeError(doc.docToJson(bytes, { limits: { maxPages: 0 } }))));
+  // Un .wasm anterior (doc_convert con tres parametros) no puede ignorar los limites en silencio.
+  // Modulo minimo armado a mano: solo exporta doc_convert(i32, i32, i32) -> i32.
+  const anterior = await import('./doc2json.js?wasm-anterior');
+  await anterior.init(new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x08, 0x01, 0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+    0x03, 0x02, 0x01, 0x00,
+    0x07, 0x0f, 0x01, 0x0b, ...new TextEncoder().encode('doc_convert'), 0x00, 0x00,
+    0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x00, 0x0b,
+  ]));
+  comprobar('limits con un .wasm anterior da error', /no admite limites/.test(await mensajeDeError(anterior.docToJson(bytes, { limits: { maxChars: 100 } }))));
+}
+
 comprobar('doc2json rechaza un archivo que no es documento', /no reconocido/.test(await mensajeDeError(doc.docToJson(new TextEncoder().encode('hola mundo')))));
 comprobar('doc2json rechaza un archivo vacio', /vac/.test(await mensajeDeError(doc.docToJson(new Uint8Array(0)))));
 comprobar('mpp2xlsx rechaza un archivo que no es .mpp', /no es un \.mpp/.test(await mensajeDeError(mpp.mppToXlsx(await readFile(path.join(ejemplo, 'procedimiento.pdf'))))));

@@ -34,19 +34,37 @@ export function init(origen) {
   return modulo.then(() => undefined);
 }
 
-async function convertir(archivo, modo) {
+/** Limites de una conversion: [MB descomprimidos, paginas, caracteres]; 0 = valor por defecto. */
+function limites(opciones) {
+  const l = (opciones && opciones.limits) || {};
+  const entero = (v, nombre) => {
+    if (v == null) return 0;
+    const n = Math.floor(v);
+    if (!(n >= 1 && n <= 0xffffffff)) throw new RangeError(`limits.${nombre} debe ser un entero positivo.`);
+    return n;
+  };
+  return [entero(l.maxDecompressedMB, 'maxDecompressedMB'), entero(l.maxPages, 'maxPages'), entero(l.maxChars, 'maxChars')];
+}
+
+async function convertir(archivo, modo, opciones) {
   if (!modulo) throw new Error('Llame primero a init() con la ubicacion de doc2json.wasm.');
+  const lim = limites(opciones);
   if (typeof Blob !== 'undefined' && archivo instanceof Blob) archivo = await archivo.arrayBuffer();
   const entrada = archivo instanceof Uint8Array ? archivo : new Uint8Array(archivo);
   if (!instancia) instancia = modulo.then((m) => WebAssembly.instantiate(m, {})).then((i) => i.exports);
   const usada = instancia;
   const x = await usada;
+  // Un doc2json.wasm anterior a los limites recibe solo tres argumentos y los ignoraria en silencio.
+  if (lim.some((v) => v !== 0) && x.doc_convert.length < 6) {
+    throw new Error('Este doc2json.wasm no admite limites de recursos (limits): actualicelo a la version de este cargador.');
+  }
   // Desde aqui no hay ningun await: dos conversiones simultaneas no se mezclan dentro del modulo.
   try {
     const ptr = x.doc_alloc(entrada.length);
     if (entrada.length && !ptr) throw new Error('No hay memoria suficiente para un archivo de este tamano.');
     new Uint8Array(x.memory.buffer, ptr, entrada.length).set(entrada);
-    const estado = x.doc_convert(ptr, entrada.length, modo);
+    // Los limites van como argumentos de cada conversion: no quedan para la siguiente.
+    const estado = x.doc_convert(ptr, entrada.length, modo, lim[0], lim[1], lim[2]);
     const salida = new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.doc_result_ptr(), x.doc_result_len()));
     x.doc_free(ptr, entrada.length);
     if (estado !== 0) throw new Error(salida);
@@ -64,7 +82,7 @@ async function convertir(archivo, modo) {
 
 /** Convierte un .docx o un .pdf en JSON, como texto. Con `full` agrega estilos, tramos con formato y lineas de PDF. */
 export function docToJsonText(archivo, opciones) {
-  return convertir(archivo, opciones && opciones.full ? 1 : 0);
+  return convertir(archivo, opciones && opciones.full ? 1 : 0, opciones);
 }
 
 /** Convierte un .docx o un .pdf en un objeto con metadatos, bloques de contenido y texto plano. */
