@@ -579,11 +579,13 @@ fn excel_alias_por_mayusculas_y_barras_se_leen_una_vez() {
 
 #[test]
 fn powerpoint_tope_de_10000_diapositivas() {
-    // 10.001 diapositivas distintas (nombres distintos en el ZIP, con los mismos datos).
+    // 10.001 diapositivas distintas (el mismo contenido, copiado en cada parte: los alias de
+    // los mismos datos cuentan como una sola).
     let destinos: Vec<String> = (1..=10_001).map(|i| format!("slides/slide{}.xml", i)).collect();
-    let alias: Vec<(String, &str)> = (2..=10_001).map(|i| (format!("ppt/slides/slide{}.xml", i), "ppt/slides/slide1.xml")).collect();
+    let nombres: Vec<String> = destinos.iter().map(|d| format!("ppt/{}", d)).collect();
     let s1 = diapositiva(&forma("", 0, 0, "<a:p><a:r><a:t>Texto</a:t></a:r></a:p>"), false);
-    let d = read(&presentacion_que_cita(&destinos, &[("ppt/slides/slide1.xml", s1.as_bytes())], &alias)).unwrap();
+    let partes: Vec<(&str, &[u8])> = nombres.iter().map(|n| (n.as_str(), s1.as_bytes())).collect();
+    let d = read(&presentacion_que_cita(&destinos, &partes, &[])).unwrap();
     assert_eq!(d.page_count, Some(10_000));
     assert_eq!(d.content.len(), 10_000);
     assert_eq!(d.content.last().and_then(|b| b.page), Some(10_000));
@@ -593,9 +595,10 @@ fn powerpoint_tope_de_10000_diapositivas() {
 #[test]
 fn excel_tope_de_4096_hojas() {
     let destinos: Vec<String> = (1..=4097).map(|i| format!("worksheets/sheet{}.xml", i)).collect();
-    let alias: Vec<(String, &str)> = (2..=4097).map(|i| (format!("xl/worksheets/sheet{}.xml", i), "xl/worksheets/sheet1.xml")).collect();
+    let nombres: Vec<String> = destinos.iter().map(|d| format!("xl/{}", d)).collect();
     let hoja = r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>dato</t></is></c></row></sheetData></worksheet>"#;
-    let d = read(&libro_que_cita(&destinos, "", "", &[("xl/worksheets/sheet1.xml", hoja.as_bytes())], &alias)).unwrap();
+    let partes: Vec<(&str, &[u8])> = nombres.iter().map(|n| (n.as_str(), hoja.as_bytes())).collect();
+    let d = read(&libro_que_cita(&destinos, "", "", &partes, &[])).unwrap();
     assert_eq!(tablas(&d).len(), 4096);
     assert_eq!(tablas(&d).last().and_then(|b| b.page), Some(4096));
     assert!(d.warnings.iter().any(|w| w.contains("mas de 4096 hojas")), "{:?}", d.warnings);
@@ -603,17 +606,21 @@ fn excel_tope_de_4096_hojas() {
 
 #[test]
 fn excel_tope_de_celdas_es_del_libro() {
-    // Tres hojas con los mismos datos, de 1.000.001 celdas con valor cada una. Sin referencia,
+    // Tres hojas con el mismo contenido, de 1.000.001 celdas con valor cada una. Sin referencia,
     // las celdas pasada la ultima columna caen en la misma: la tabla queda chica, pero las
     // celdas leidas cuentan para el tope de 2 millones, que es del libro y no de cada hoja.
     let hoja = format!("<worksheet><sheetData>{}</sheetData></worksheet>", "<c><v>1</v></c>".repeat(1_000_001));
-    let destinos: Vec<String> = (1..=3).map(|i| format!("worksheets/sheet{}.xml", i)).collect();
-    let alias: Vec<(String, &str)> = (2..=3).map(|i| (format!("xl/worksheets/sheet{}.xml", i), "xl/worksheets/sheet1.xml")).collect();
-    let d = read(&libro_que_cita(&destinos, "", "", &[("xl/worksheets/sheet1.xml", hoja.as_bytes())], &alias)).unwrap();
+    // La hoja H4 cita una parte que no esta en el ZIP: con el tope agotado se omite sin intentar
+    // leerla, asi que tiene su aviso (leida primero, se habria saltado sin aviso).
+    let destinos: Vec<String> = (1..=4).map(|i| format!("worksheets/sheet{}.xml", i)).collect();
+    let nombres: Vec<String> = destinos[..3].iter().map(|d| format!("xl/{}", d)).collect();
+    let partes: Vec<(&str, &[u8])> = nombres.iter().map(|n| (n.as_str(), hoja.as_bytes())).collect();
+    let d = read(&libro_que_cita(&destinos, "", "", &partes, &[])).unwrap();
     let avisos = |hoja: &str| d.warnings.iter().filter(|w| w.starts_with(&format!("Hoja «{}»", hoja))).cloned().collect::<Vec<_>>();
     assert!(avisos("H1").is_empty(), "{:?}", d.warnings);
     assert!(avisos("H2").iter().any(|w| w.contains("solo una parte") && w.contains("2000000 celdas")), "{:?}", d.warnings);
     assert!(avisos("H3").iter().any(|w| w.contains("se omitio") && w.contains("2000000 celdas")), "{:?}", d.warnings);
+    assert!(avisos("H4").iter().any(|w| w.contains("se omitio") && w.contains("2000000 celdas")), "{:?}", d.warnings);
     assert_eq!(tablas(&d).len(), 2);
 }
 
@@ -652,13 +659,13 @@ fn excel_texto_compartido_en_blanco_no_se_recorre_en_cada_celda() {
 
 #[test]
 fn powerpoint_tope_de_texto_total() {
-    // Una diapositiva de 1 MB de texto con 70 nombres distintos en el ZIP: sin el tope de 64 MB,
-    // 70 MB.
+    // 70 diapositivas de 1 MB de texto cada una: sin el tope de 64 MB, 70 MB.
     let n = 70;
     let s1 = diapositiva(&forma("", 0, 0, &format!("<a:p><a:r><a:t>{}</a:t></a:r></a:p>", "x".repeat(1 << 20))), false);
     let destinos: Vec<String> = (1..=n).map(|i| format!("slides/slide{}.xml", i)).collect();
-    let alias: Vec<(String, &str)> = (2..=n).map(|i| (format!("ppt/slides/slide{}.xml", i), "ppt/slides/slide1.xml")).collect();
-    let d = read(&presentacion_que_cita(&destinos, &[("ppt/slides/slide1.xml", s1.as_bytes())], &alias)).unwrap();
+    let nombres: Vec<String> = destinos.iter().map(|d| format!("ppt/{}", d)).collect();
+    let partes: Vec<(&str, &[u8])> = nombres.iter().map(|n| (n.as_str(), s1.as_bytes())).collect();
+    let d = read(&presentacion_que_cita(&destinos, &partes, &[])).unwrap();
     let total: usize = d.content.iter().map(|b| b.text.len()).sum();
     assert!(total <= 64 << 20, "texto: {} bytes", total);
     assert_eq!(d.content.len(), 64);
@@ -733,4 +740,53 @@ fn partes_xml_truncadas_no_hacen_caer_la_lectura() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Copias antes de los topes y alias de los mismos datos.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn relacion_con_destino_enorme_se_descarta() {
+    // Un destino de 3 MB citado por 150 hojas: copiarlo en cada referencia serian 450 MB antes de
+    // deduplicar. Se descarta al leer las relaciones, y esas hojas quedan sin parte; la hoja con
+    // un destino normal se lee igual.
+    let enorme = "x".repeat(3 << 20);
+    let mut hojas: String = (1..=150).map(|i| format!(r#"<sheet name="H{0}" sheetId="{0}" r:id="rId1"/>"#, i)).collect();
+    hojas.push_str(r#"<sheet name="Datos" sheetId="151" r:id="rId2"/>"#);
+    let libro = format!(r#"<?xml version="1.0"?><workbook xmlns:r="{}"><sheets>{}</sheets></workbook>"#, REL, hojas);
+    let hoja = r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>dato</t></is></c></row></sheetData></worksheet>"#;
+    let bytes = zip(&[
+        ("_rels/.rels", &rels(&[("rId1", "officeDocument", "xl/workbook.xml")])),
+        ("xl/workbook.xml", &libro),
+        ("xl/_rels/workbook.xml.rels", &rels(&[("rId1", "worksheet", &enorme), ("rId2", "worksheet", "worksheets/sheet1.xml")])),
+        ("xl/worksheets/sheet1.xml", hoja),
+    ]);
+    let d = read(&bytes).unwrap();
+    // Con el destino conservado, las 150 hojas citarian la misma ruta de 3 MB: 149 repetidas.
+    assert!(!d.warnings.iter().any(|w| w.contains("repetid")), "{:?}", d.warnings);
+    assert_eq!(tablas(&d).len(), 1);
+    assert_eq!(tablas(&d)[0].rows[0][0].text, "dato");
+}
+
+#[test]
+fn alias_de_los_mismos_datos_se_leen_una_vez() {
+    // 2.000 nombres distintos en el ZIP que apuntan a los datos de una misma parte: una hoja
+    // grande de celdas vacias (que no gastan ningun tope) y una diapositiva. Cada una se lee una
+    // vez; las demas son referencias repetidas.
+    let n = 2000;
+    let hoja = format!("<worksheet><sheetData><row r=\"1\">{}</row></sheetData></worksheet>", "<c/>".repeat(25_000));
+    let destinos: Vec<String> = (1..=n).map(|i| format!("worksheets/sheet{}.xml", i)).collect();
+    let alias: Vec<(String, &str)> = (2..=n).map(|i| (format!("xl/worksheets/sheet{}.xml", i), "xl/worksheets/sheet1.xml")).collect();
+    let d = read(&libro_que_cita(&destinos, "", "", &[("xl/worksheets/sheet1.xml", hoja.as_bytes())], &alias)).unwrap();
+    assert_eq!(d.page_count, Some(1));
+    assert!(d.warnings.iter().any(|w| w.contains(&format!("{} referencias repetidas a hojas", n - 1))), "{:?}", d.warnings);
+
+    let s1 = diapositiva(&forma("", 0, 0, "<a:p><a:r><a:t>Unica</a:t></a:r></a:p>"), false);
+    let destinos: Vec<String> = (1..=n).map(|i| format!("slides/slide{}.xml", i)).collect();
+    let alias: Vec<(String, &str)> = (2..=n).map(|i| (format!("ppt/slides/slide{}.xml", i), "ppt/slides/slide1.xml")).collect();
+    let d = read(&presentacion_que_cita(&destinos, &[("ppt/slides/slide1.xml", s1.as_bytes())], &alias)).unwrap();
+    assert_eq!(textos(&d), vec!["Unica"]);
+    assert_eq!(d.page_count, Some(1));
+    assert!(d.warnings.iter().any(|w| w.contains(&format!("{} referencias repetidas a diapositivas", n - 1))), "{:?}", d.warnings);
 }

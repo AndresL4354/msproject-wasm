@@ -310,7 +310,10 @@ fn rich_text(x: &mut Xml, end: &str) -> String {
 
 fn shared_strings(zip: &ZipArchive, path: Option<&String>) -> Vec<String> {
     let mut out = Vec::new();
-    let Some(src) = path.and_then(|p| zip.read_text(p)) else { return out };
+    let src = match path.and_then(|p| zip.read_text(p)) {
+        Some(src) => src,
+        None => return out,
+    };
     let mut x = Xml::new(&src);
     while let Some(ev) = x.next() {
         if let Ev::Start(t) = ev {
@@ -331,7 +334,10 @@ fn shared_strings(zip: &ZipArchive, path: Option<&String>) -> Vec<String> {
 /// Tipo de numero de cada estilo de celda (`cellXfs`).
 fn styles(zip: &ZipArchive, path: Option<&String>) -> Vec<NumKind> {
     let mut out = Vec::new();
-    let Some(src) = path.and_then(|p| zip.read_text(p)) else { return out };
+    let src = match path.and_then(|p| zip.read_text(p)) {
+        Some(src) => src,
+        None => return out,
+    };
     // Formatos propios por numero; si uno se repite, vale el ultimo.
     let mut custom: HashMap<u32, NumKind> = HashMap::new();
     let mut x = Xml::new(&src);
@@ -405,7 +411,10 @@ fn read_sheet<'a>(src: &str, ctx: &Ctx<'a>, max_cells: usize, text_left: &mut us
     let mut row = 0usize;
     let mut col = 0usize;
     while let Some(ev) = x.next() {
-        let Ev::Start(t) = ev else { continue };
+        let t = match ev {
+            Ev::Start(t) => t,
+            _ => continue,
+        };
         match local(t.name) {
             "row" => {
                 row = t.attr("r").and_then(|v| v.trim().parse().ok()).filter(|r| (1..=MAX_ROW).contains(r)).unwrap_or_else(|| (row + 1).min(MAX_ROW));
@@ -653,17 +662,22 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     let mut number = 0u32;
     // Una misma parte referida por varias hojas se lee una vez (vale la primera referencia). La
     // clave es la de `find`: "worksheets/Sheet1.xml" y "/xl/worksheets/sheet1.xml" son la misma.
+    // Tambien lo son dos nombres distintos cuyas entradas del ZIP apuntan a los mismos datos.
     let mut seen = HashSet::new();
+    let mut seen_at = HashSet::new();
     let mut repeated = 0usize;
     let mut cells_left = MAX_CELLS;
     let mut grid_left = MAX_GRID;
     let mut text_left = MAX_TEXT;
     for (name, path, is_hidden) in &sheets {
         if let Some(p) = path {
-            if !seen.insert(part_key(p)) {
+            let (key, at) = (part_key(p), zip.data_at(p));
+            if seen.contains(&key) || at.map_or(false, |a| seen_at.contains(&a)) {
                 repeated += 1;
                 continue;
             }
+            seen.insert(key);
+            seen_at.extend(at);
             if seen.len() > MAX_SHEETS {
                 doc.warnings.push(format!("El libro tiene mas de {} hojas; se leyeron solo las primeras.", MAX_SHEETS));
                 break;
@@ -674,17 +688,21 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
             continue;
         }
         number += 1;
-        // Las hojas de graficos o de macros no tienen celdas.
-        let Some(src) = path.as_ref().and_then(|p| zip.read_text(p)) else { continue };
-        if !src.contains("sheetData") {
-            continue;
-        }
+        // Los topes se miran antes de descomprimir la hoja, para no leerla si ya no queda cupo.
         if cells_left == 0 {
             doc.warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} celdas con datos.", name, MAX_CELLS));
             continue;
         }
         if text_left == 0 {
             doc.warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} MB de texto.", name, MAX_TEXT >> 20));
+            continue;
+        }
+        // Las hojas de graficos o de macros no tienen celdas.
+        let src = match path.as_ref().and_then(|p| zip.read_text(p)) {
+            Some(src) => src,
+            None => continue,
+        };
+        if !src.contains("sheetData") {
             continue;
         }
         let sheet = read_sheet(&src, &ctx, cells_left, &mut text_left);

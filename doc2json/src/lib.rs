@@ -54,17 +54,20 @@ pub fn detect(bytes: &[u8]) -> Result<Format, String> {
 /// Tipo de paquete Office segun la parte principal que declara (o, si no la declara, segun sus
 /// carpetas). Un ZIP que no es de Office se trata como Word, que dara el error adecuado.
 fn office_kind(bytes: &[u8]) -> Format {
-    let Ok(zip) = zipread::ZipArchive::open(bytes) else {
-        // ZIP danado o incompleto: los nombres de las partes estan en claro en cada entrada, asi
-        // el error puede hablar del formato correcto.
-        let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
-        return if has(b"ppt/presentation.xml") {
-            Format::Pptx
-        } else if has(b"xl/workbook.xml") {
-            Format::Xlsx
-        } else {
-            Format::Docx
-        };
+    let zip = match zipread::ZipArchive::open(bytes) {
+        Ok(zip) => zip,
+        Err(_) => {
+            // ZIP danado o incompleto: los nombres de las partes estan en claro en cada entrada,
+            // asi el error puede hablar del formato correcto.
+            let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+            return if has(b"ppt/presentation.xml") {
+                Format::Pptx
+            } else if has(b"xl/workbook.xml") {
+                Format::Xlsx
+            } else {
+                Format::Docx
+            };
+        }
     };
     // La parte principal declarada cuenta solo si existe: un paquete con una relacion rota sigue
     // reconociendose por sus carpetas, como lo hace cada lector.

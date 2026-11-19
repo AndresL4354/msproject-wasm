@@ -93,7 +93,13 @@ pub(crate) fn resolve(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-/// Relaciones de una parte: lista de (id, tipo, destino, es_externo).
+/// Largo maximo, en bytes, del destino de una relacion (una ruta o una URL). Cada referencia a
+/// una relacion copia su destino: uno de varios MB citado por muchas hojas o diapositivas
+/// multiplicaria la memoria antes de que actuen los topes. Un destino mas largo se descarta.
+const MAX_TARGET: usize = 4096;
+
+/// Relaciones de una parte: lista de (id, tipo, destino, es_externo). Se descartan las de destino
+/// mas largo que `MAX_TARGET`.
 pub(crate) fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, String, bool)> {
     let mut out = Vec::new();
     if let Some(src) = zip.read_text(rels_path) {
@@ -101,11 +107,15 @@ pub(crate) fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, S
         while let Some(ev) = x.next() {
             if let Ev::Start(t) = ev {
                 if t.name.ends_with("Relationship") {
+                    let target = t.attr("Target").unwrap_or_default();
+                    if target.len() > MAX_TARGET {
+                        continue;
+                    }
                     let kind = t.attr("Type").unwrap_or_default();
                     out.push((
                         t.attr("Id").unwrap_or_default(),
                         kind.rsplit('/').next().unwrap_or("").to_string(),
-                        t.attr("Target").unwrap_or_default(),
+                        target,
                         t.attr("TargetMode").as_deref() == Some("External"),
                     ));
                 }

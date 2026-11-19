@@ -428,10 +428,20 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     let mut doc = Document { kind: "pptx", ..Document::default() };
     properties(&zip, &mut doc);
     // Una diapositiva referida varias veces se lee una vez, en su primera posicion. La clave es
-    // la de `find`: "slides/Slide1.xml" y "//ppt/slides/slide1.xml" son la misma parte.
+    // la de `find`: "slides/Slide1.xml" y "//ppt/slides/slide1.xml" son la misma parte. Tambien
+    // lo son dos nombres distintos cuyas entradas del ZIP apuntan a los mismos datos.
     let total = order.len();
     let mut seen = HashSet::new();
-    order.retain(|p| seen.insert(part_key(p)));
+    let mut seen_at = HashSet::new();
+    order.retain(|p| {
+        let (key, at) = (part_key(p), zip.data_at(p));
+        if seen.contains(&key) || at.map_or(false, |a| seen_at.contains(&a)) {
+            return false;
+        }
+        seen.insert(key);
+        seen_at.extend(at);
+        true
+    });
     if order.len() < total {
         doc.warnings.push(format!("Se omitieron {} referencias repetidas a diapositivas ya leidas.", total - order.len()));
     }

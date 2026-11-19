@@ -89,13 +89,24 @@ impl<'a> ZipArchive<'a> {
         self.index.get(&part_key(name)).map(|&i| &self.entries[i])
     }
 
-    pub fn read(&self, name: &str) -> Option<Vec<u8>> {
-        let e = self.find(name)?;
+    /// Posicion en el archivo de los datos de una entrada (tras su encabezado local).
+    fn data_start(&self, e: &Entry) -> Option<usize> {
         let o = e.offset;
         if self.data.get(o..o + 4) != Some(&[0x50, 0x4B, 0x03, 0x04]) {
             return None;
         }
-        let start = o + 30 + u16_at(self.data, o + 26) + u16_at(self.data, o + 28);
+        Some(o + 30 + u16_at(self.data, o + 26) + u16_at(self.data, o + 28))
+    }
+
+    /// Posicion de los datos de una parte. Varias entradas del directorio central, con nombres
+    /// distintos, pueden apuntar a los mismos datos: si la posicion coincide, son la misma parte.
+    pub fn data_at(&self, name: &str) -> Option<usize> {
+        self.data_start(self.find(name)?)
+    }
+
+    pub fn read(&self, name: &str) -> Option<Vec<u8>> {
+        let e = self.find(name)?;
+        let start = self.data_start(e)?;
         let raw = self.data.get(start..start.checked_add(e.packed)?)?;
         match e.method {
             0 => Some(raw.to_vec()),
