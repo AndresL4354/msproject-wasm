@@ -20,6 +20,9 @@ struct Bits<'a> {
     /// Rechaza lo que zlib rechaza aunque se pueda leer: largo de bloque sin su complemento y
     /// codigos Huffman incompletos o sobrepasados.
     strict: bool,
+    /// Distancia maxima de una referencia: la ventana que declara la cabecera zlib en la lectura
+    /// estricta; sin limite en la tolerante.
+    window: usize,
 }
 
 impl Bits<'_> {
@@ -142,7 +145,7 @@ fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Opti
                 return None;
             }
             let distance = DIST_BASE[d] as usize + b.bits(DIST_EXTRA[d] as u32)? as usize;
-            if distance > out.len() || out.len() + len > MAX_OUTPUT {
+            if distance > out.len() || distance > b.window || out.len() + len > MAX_OUTPUT {
                 return None;
             }
             let start = out.len() - distance;
@@ -237,15 +240,16 @@ fn run(b: &mut Bits, out: &mut Vec<u8>) -> Option<()> {
 /// Descomprime un flujo DEFLATE "crudo" (el de las entradas de un ZIP).
 pub fn inflate(d: &[u8]) -> Inflated {
     let mut out = Vec::with_capacity(d.len().saturating_mul(3).min(MAX_OUTPUT));
-    let mut b = Bits { d, pos: 0, acc: 0, n: 0, strict: false };
+    let mut b = Bits { d, pos: 0, acc: 0, n: 0, strict: false, window: usize::MAX };
     let ok = run(&mut b, &mut out).is_some();
     Inflated { data: out, ok }
 }
 
 /// Descomprime un flujo zlib solo si un lector estricto (el de un PNG) lo aceptaria entero:
-/// cabecera valida, ventana de hasta 32 KB y sin diccionario previo; bloques sin compresion con su
-/// largo complementario (NLEN) y codigos Huffman completos; el flujo DEFLATE terminando justo
-/// antes de la suma Adler-32, y esa suma correcta. `None` si no.
+/// cabecera valida, ventana de hasta 32 KB, sin diccionario previo y ninguna referencia mas lejana
+/// que la ventana declarada; bloques sin compresion con su largo complementario (NLEN) y codigos
+/// Huffman completos; el flujo DEFLATE terminando justo antes de la suma Adler-32, y esa suma
+/// correcta. `None` si no.
 pub fn zlib_strict(d: &[u8]) -> Option<Vec<u8>> {
     if d.len() < 6 || d[0] & 0x0F != 8 || d[0] >> 4 > 7 || ((d[0] as u32) << 8 | d[1] as u32) % 31 != 0 || d[1] & 0x20 != 0 {
         return None;
@@ -253,7 +257,7 @@ pub fn zlib_strict(d: &[u8]) -> Option<Vec<u8>> {
     // Sin los 4 bytes de la suma: si el flujo DEFLATE los necesitara, no termina donde debe.
     let body = &d[2..d.len() - 4];
     let mut out = Vec::with_capacity(body.len().saturating_mul(3).min(MAX_OUTPUT));
-    let mut b = Bits { d: body, pos: 0, acc: 0, n: 0, strict: true };
+    let mut b = Bits { d: body, pos: 0, acc: 0, n: 0, strict: true, window: 1 << ((d[0] >> 4) + 8) };
     run(&mut b, &mut out)?;
     let adler = u32::from_be_bytes([d[d.len() - 4], d[d.len() - 3], d[d.len() - 2], d[d.len() - 1]]);
     (b.pos == body.len() && crate::png::adler32(&out) == adler).then_some(out)
@@ -445,5 +449,37 @@ mod tests {
             assert!(r.ok && !r.data.is_empty(), "{}: el lector tolerante deberia leerlo", nombre);
             assert_eq!(zlib_strict(&z), None, "{}", nombre);
         }
+    }
+
+    #[test]
+    fn zlib_estricto_rechaza_distancias_mayores_que_la_ventana() {
+        // Bloque sin compresion con 300 bytes y luego uno de Huffman fijo que copia 3 bytes desde
+        // 300 atras.
+        let datos: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut cuerpo = vec![0x00, 0x2C, 0x01, 0xD3, 0xFE];
+        cuerpo.extend_from_slice(&datos);
+        let mut w = Escritor::default();
+        w.bits(1, 1); // ultimo bloque
+        w.bits(1, 2); // Huffman fijo
+        w.code("0000001"); // largo 3
+        w.code("10000"); // distancias de 257 a 384
+        w.bits(300 - 257, 7);
+        w.code("0000000"); // fin de bloque
+        cuerpo.extend_from_slice(&w.fin());
+        let mut esperado = datos.clone();
+        esperado.extend_from_slice(&datos[..3]);
+        let adler = crate::png::adler32(&esperado).to_be_bytes();
+        let con_cabecera = |cabecera: [u8; 2]| {
+            let mut z = cabecera.to_vec();
+            z.extend_from_slice(&cuerpo);
+            z.extend_from_slice(&adler);
+            z
+        };
+        // Ventana de 32 KB: la referencia cabe.
+        assert_eq!(zlib_strict(&con_cabecera([0x78, 0x01])).as_deref(), Some(&esperado[..]));
+        // Ventana de 256 bytes (CINFO 0): la referencia queda fuera, aunque el tolerante la lee.
+        let corta = con_cabecera([0x08, 0x1D]);
+        assert_eq!(zlib(&corta).data, esperado);
+        assert_eq!(zlib_strict(&corta), None);
     }
 }
