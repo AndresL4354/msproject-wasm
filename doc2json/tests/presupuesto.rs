@@ -636,10 +636,63 @@ fn un_formulario_repetido_en_muchas_paginas_se_cuenta_una_vez() {
     assert!(!avisa(&d, 3), "{:?}", d.warnings);
     assert_eq!(textos(&d), vec!["Hola mundo"; paginas]);
     // Un formulario que por si solo pasa el presupuesto se sigue cortando, con su aviso, y cada
-    // repeticion entrega lo mismo que la primera vez (lo que cupo) sin descontar de nuevo.
+    // repeticion entrega lo mismo que la primera vez (lo que cupo) sin volver a descomprimirlo.
     let d = doc2json::read_with_limits(&archivo, Limits { max_decompressed: 500_000, ..Limits::default() }).unwrap();
     assert!(d.warnings.iter().any(|w| w.contains("limite de datos descomprimidos")), "{:?}", d.warnings);
     assert_eq!(textos(&d), vec!["Hola mundo"; paginas]);
+}
+
+#[test]
+fn un_flujo_repetido_en_el_contenido_de_una_pagina_descuenta_cada_copia() {
+    // `/Contents [5 0 R 5 0 R ...]`: el mismo flujo de ~1 MB descomprimido, 20 veces en la pagina.
+    // Se descomprime una vez, pero cada copia que se junta en el contenido ocupa memoria y se
+    // descuenta: con 3 MB entran a lo mas cuatro copias (la ultima en parte), con su aviso. Cada
+    // copia baja el texto una linea (`cm` se acumula), para contarlas en el texto de la pagina.
+    let veces = 20;
+    let mut z = vec![0x78, 0x9C];
+    z.extend(deflate(b"1 0 0 1 0 -14 cm BT /F1 12 Tf 72 720 Td (Hola mundo) Tj ET ", b' ', 1_000_000, b""));
+    let refs = vec!["5 0 R"; veces].join(" ");
+    let pagina = format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents [{}] >>", refs);
+    let objs = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec()),
+        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (4, pagina.into_bytes()),
+        (5, flujo("/Filter /FlateDecode", &z)),
+    ];
+    let archivo = ensamblar(&objs, true);
+    let copias = |d: &doc2json::Document| d.pages[0].text.matches("Hola mundo").count();
+    // Sin limite chico la pagina trae las 20 copias: el archivo de la prueba es valido.
+    let d = doc2json::read(&archivo).unwrap();
+    assert_eq!(copias(&d), veces);
+    let d = doc2json::read_with_limits(&archivo, limites(3)).unwrap();
+    assert!(avisa(&d, 3), "{:?}", d.warnings);
+    assert!((1..=4).contains(&copias(&d)), "{}", copias(&d));
+}
+
+#[test]
+fn flujos_con_la_misma_posicion_y_distinta_clave_no_comparten_cupo() {
+    use doc2json::pdf::document::Pdf;
+    use doc2json::pdf::object::{Dict, Obj};
+    // Un flujo de ~1 MB descomprimido y, en la misma posicion de datos, otro con distinto largo
+    // u otros filtros que descomprime casi nada. Cada uno se descomprime y descuenta por su cuenta.
+    let archivo = pdf_flujos(&[("/Filter /FlateDecode", zlib_bomba(1_000_000))]);
+    let hex = Dict(vec![("Filter".to_string(), Obj::Name("ASCIIHexDecode".to_string()))]);
+    for caso in ["otro largo", "otros filtros"] {
+        let pdf = Pdf::open(&archivo).unwrap();
+        let flujo = pdf.object(5);
+        let otro = match &*flujo {
+            Obj::Stream { dict, start, len } if caso == "otro largo" => Obj::Stream { dict: dict.clone(), start: *start, len: 20 },
+            Obj::Stream { start, len, .. } => Obj::Stream { dict: hex.clone(), start: *start, len: *len },
+            _ => panic!("el objeto 5 es un flujo"),
+        };
+        doc2json::budget::begin(limites(3));
+        pdf.stream_data(&otro);
+        let datos = pdf.stream_data(&flujo).unwrap();
+        let gastado = doc2json::budget::end();
+        assert_eq!(datos.len(), TEXTO.len() + 1_000_000, "{}", caso);
+        assert!(gastado.decompressed >= 1_000_000, "{}: {:?}", caso, gastado);
+    }
 }
 
 /// Estilos (T1 = "heading 1") y numeracion (lista 1, "1.") de un .docx, comprimidos.

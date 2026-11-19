@@ -17,7 +17,7 @@ enum XRef {
 }
 
 struct ObjStm {
-    data: Vec<u8>,
+    data: Rc<Vec<u8>>,
     index: Vec<(u32, usize)>,
 }
 
@@ -45,7 +45,13 @@ pub struct Pdf<'a> {
     encrypt_obj: Option<u32>,
     /// Numero de objeto de cada flujo, por posicion de sus datos (la clave depende de el).
     stream_ids: RefCell<HashMap<usize, (u32, u16)>>,
+    /// Flujos ya descomprimidos en esta lectura (`stream_data`), para no repetir el trabajo.
+    decoded: RefCell<HashMap<StreamKey, Option<Rc<Vec<u8>>>>>,
 }
+
+/// Lo que determina el resultado de descomprimir un flujo: objeto con que se descifra (si se
+/// descifra), posicion y largo de sus datos, y cada filtro con sus parametros.
+type StreamKey = (Option<(u32, u16)>, usize, usize, Vec<(String, Parms)>);
 
 /// Descifra todas las cadenas de un objeto.
 fn decrypt_strings(o: &mut Obj, c: &Crypt, num: u32, gen: u16) {
@@ -90,6 +96,7 @@ impl<'a> Pdf<'a> {
             crypt: None,
             encrypt_obj: None,
             stream_ids: RefCell::new(HashMap::new()),
+            decoded: RefCell::new(HashMap::new()),
         };
 
         let tail_start = data.len().saturating_sub(2048);
@@ -160,6 +167,7 @@ impl<'a> Pdf<'a> {
         // Lo cargado antes de tener la clave puede traer cadenas sin descifrar.
         self.cache.borrow_mut().clear();
         self.objstms.borrow_mut().clear();
+        self.decoded.borrow_mut().clear();
         Ok(())
     }
 
@@ -522,20 +530,33 @@ impl<'a> Pdf<'a> {
     }
 
     /// Datos de un flujo con sus filtros aplicados. `None` si usa un filtro no soportado.
-    pub fn stream_data(&self, obj: &Obj) -> Option<Vec<u8>> {
+    pub fn stream_data(&self, obj: &Obj) -> Option<Rc<Vec<u8>>> {
+        self.decode_stream(obj).map(|(data, _)| data)
+    }
+
+    /// Como `stream_data`, e indica si el flujo ya se habia descomprimido antes en esta lectura.
+    /// Cada flujo se descomprime (y se descuenta del presupuesto) una sola vez: lo descomprimido
+    /// queda guardado y las siguientes veces se entrega eso mismo, sin copiarlo. Un formulario
+    /// dibujado en cientos de paginas cuesta lo mismo que dibujado una vez.
+    fn decode_stream(&self, obj: &Obj) -> Option<(Rc<Vec<u8>>, bool)> {
         let (dict, start, len) = match obj {
             Obj::Stream { dict, start, len } => (dict, *start, *len),
             _ => return None,
         };
         let raw = self.data.get(start..start.checked_add(len)?.min(self.data.len()))?;
         // Descifrado previo a los filtros. Los flujos de referencias cruzadas nunca van cifrados.
-        let decrypted: Option<Vec<u8>> = match &self.crypt {
+        let crypt_id: Option<(u32, u16)> = match &self.crypt {
             Some(c) if c.streams != Method::None && dict.get("Type").and_then(|t| t.as_name()) != Some("XRef") => {
-                self.stream_ids.borrow().get(&start).map(|(num, gen)| c.decrypt(c.streams, *num, *gen, raw))
+                self.stream_ids.borrow().get(&start).copied()
             }
             _ => None,
         };
-        let raw: &[u8] = decrypted.as_deref().unwrap_or(raw);
+        let decrypt = |raw: &[u8]| -> Vec<u8> {
+            match (&self.crypt, crypt_id) {
+                (Some(c), Some((num, gen))) => c.decrypt(c.streams, num, gen, raw),
+                _ => raw.to_vec(),
+            }
+        };
         let filter = self.get(dict, "Filter");
         let names: Vec<String> = match &*filter {
             Obj::Name(n) => vec![n.clone()],
@@ -543,7 +564,7 @@ impl<'a> Pdf<'a> {
             _ => Vec::new(),
         };
         if names.is_empty() {
-            return Some(raw.to_vec());
+            return Some((Rc::new(decrypt(raw)), false));
         }
         let parms_obj = match dict.get("DecodeParms").or_else(|| dict.get("DP")) {
             Some(o) => self.resolve(o),
@@ -564,16 +585,17 @@ impl<'a> Pdf<'a> {
         };
         // Los parametros se resuelven antes: resolverlos puede abrir otros flujos (de objetos).
         let parms: Vec<Parms> = (0..names.len()).map(parms_at).collect();
-        // Un flujo se cuenta una sola vez en el presupuesto de la lectura aunque se descomprima
-        // varias (un formulario dibujado en cada pagina, un contenido compartido): se identifica
-        // por la posicion de sus datos en el archivo.
-        crate::budget::once(start, || {
-            let mut data = raw.to_vec();
-            for (name, p) in names.iter().zip(&parms) {
-                data = filters::apply(name, &data, p)?;
-            }
-            Some(data)
-        })
+        let key: StreamKey = (crypt_id, start, len, names.into_iter().zip(parms).collect());
+        if let Some(done) = self.decoded.borrow().get(&key) {
+            return done.clone().map(|data| (data, true));
+        }
+        let mut data = Some(decrypt(raw));
+        for (name, p) in &key.3 {
+            data = data.and_then(|d| filters::apply(name, &d, p));
+        }
+        let data = data.map(Rc::new);
+        self.decoded.borrow_mut().insert(key, data.clone());
+        data.map(|data| (data, false))
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -679,8 +701,17 @@ impl<'a> Pdf<'a> {
             _ => Vec::new(),
         };
         for p in parts {
-            if let Some(d) = self.stream_data(&p) {
-                out.extend_from_slice(&d);
+            if let Some((d, repeated)) = self.decode_stream(&p) {
+                // Un flujo repetido (`/Contents [5 0 R 5 0 R ...]`) no se vuelve a descomprimir,
+                // pero cada copia que se junta aqui ocupa memoria: se descuenta del presupuesto.
+                let n = if repeated {
+                    let n = crate::budget::room(d.len());
+                    crate::budget::spend(n, n < d.len());
+                    n
+                } else {
+                    d.len()
+                };
+                out.extend_from_slice(&d[..n]);
                 out.push(b'\n');
             }
         }

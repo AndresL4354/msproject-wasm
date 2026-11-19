@@ -4,7 +4,7 @@
 use crate::inflate::{zlib, MAX_OUTPUT};
 
 /// Parametros de un filtro (`/DecodeParms`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Parms {
     pub predictor: i64,
     pub colors: i64,
