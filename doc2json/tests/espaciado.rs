@@ -146,7 +146,7 @@ fn anchos_exagerados_y_palabras_separadas_solo_por_posicion() {
 #[test]
 fn anchos_exagerados_con_primera_palabra_corta() {
     // Como arriba (1500 milesimas, avance 6, hueco 9), pero el tramo empieza con una palabra
-    // corta, y los huecos que entran antes de tener la escala no deben impedir los siguientes.
+    // corta: el espacio se decide con todo el tramo a la vista, asi que el primero tambien se ve.
     let linea = |palabras: &[&str]| {
         let mut letras = Vec::new();
         let mut x = 72.0;
@@ -160,9 +160,37 @@ fn anchos_exagerados_con_primera_palabra_corta() {
         texto(&fuente_con_anchos(&[1500; 26]), &letras_ubicadas(&letras))
     };
     assert_eq!(linea(&["THIS", "SELLER", "SHALL"]), "THIS SELLER SHALL");
-    // Con dos letras medidas no se distingue un espacio de una letra ancha: el primer hueco tras
-    // una palabra de tres letras queda pegado, y desde ahi se separa.
-    assert_eq!(linea(&["THE", "SELLER", "SHALL"]), "THESELLER SHALL");
+    assert_eq!(linea(&["THE", "SELLER", "SHALL"]), "THE SELLER SHALL");
+    assert_eq!(linea(&["A", "SELLER", "SHALL"]), "A SELLER SHALL");
+    assert_eq!(linea(&["I", "AM", "THE", "SELLER"]), "I AM THE SELLER");
+}
+
+/// Palabras con cada letra ubicada aparte en su ancho real de Helvetica y un espacio entre
+/// palabras, con una fuente que declara 1500 milesimas para todas las letras.
+fn helvetica_con_anchos_iguales(palabras: &[&str]) -> String {
+    let mut letras = Vec::new();
+    let mut x = 72.0;
+    for palabra in palabras {
+        for l in palabra.chars() {
+            letras.push((l, x));
+            x += ANCHOS_HELVETICA[(l as u8 - b'A') as usize] as f64 / 100.0;
+        }
+        x += 2.78;
+    }
+    texto(&fuente_con_anchos(&[1500; 26]), &letras_ubicadas(&letras))
+}
+
+#[test]
+fn anchos_iguales_y_letras_reales_distintas_no_parten_palabras() {
+    // Las primeras letras miden lo mismo (S, A, V, E, P: 6,67 puntos), y despues viene una ancha
+    // (W, M): sin todo el tramo a la vista pareceria un espacio. No se parte ninguna palabra.
+    for palabras in [&["SAVE", "WAREHOUSE"][..], &["PASSAGE", "MADE"], &["SEA", "WAVES", "MAKE", "WAVES"]] {
+        let t = helvetica_con_anchos_iguales(palabras);
+        assert_eq!(t.replace(' ', ""), palabras.concat(), "{:?}", palabras);
+        for p in palabras {
+            assert!(t.contains(p), "{:?} partida en {:?}", p, t);
+        }
+    }
 }
 
 #[test]

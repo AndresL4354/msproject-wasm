@@ -83,15 +83,77 @@ pub struct Interp<'p, 'a> {
     inserted: Vec<f64>,
     /// Donde empieza el ultimo glifo del tramo actual.
     glyph: (f64, f64),
+    /// Fuente del ultimo glifo del tramo actual (direccion de su `Rc`).
+    glyph_font: usize,
     /// El ultimo glifo del tramo actual es una ligadura (fi, fl, ff...).
     ligature: bool,
-    /// Tramo con anchos de fuente exagerados: por cada letra ubicada aparte dentro de una palabra,
-    /// su avance real dividido por el ancho que declara la fuente (los ultimos `MAX_SCALES`).
-    scales: Vec<f64>,
+    /// Uniones del tramo actual entre letras ubicadas aparte con anchos de fuente exagerados.
+    wide: Vec<Wide>,
 }
 
-/// Escalas de anchos que se recuerdan por tramo.
-const MAX_SCALES: usize = 16;
+/// Una union entre dos letras ubicadas aparte, con anchos de fuente mayores que los glifos reales:
+/// donde iria un espacio en el texto del tramo, cuanto avanzo la letra anterior y cuanto declara la
+/// fuente para ella (en puntos), y la fuente de esa letra.
+struct Wide {
+    at: usize,
+    forward: f64,
+    declared: f64,
+    font: usize,
+}
+
+/// Uniones con anchos exagerados que se recuerdan por tramo; las siguientes van pegadas.
+const MAX_WIDE: usize = 1 << 16;
+
+/// Espacios entre palabras de un tramo con anchos de fuente exagerados: (posicion, hueco relativo
+/// al tamano de letra), con todas las uniones del tramo a la vista. Por cada fuente, las uniones
+/// dentro de una palabra avanzan una misma proporcion del ancho declarado: la que reune mas
+/// uniones dentro de un 5 % (la mayoria, al menos tres). Una union que avanza mas de `WORD_GAP`
+/// por sobre esa proporcion es un espacio. Si la fuente declara el mismo ancho para todas las
+/// letras, la proporcion solo dice algo si las letras reales tambien miden lo mismo: con una union
+/// que no este ni en la proporcion ni claramente por encima, o con huecos que no son casi iguales
+/// entre si (letras reales de distinto ancho), una letra ancha no se distingue de un espacio y no
+/// se separa nada. Queda un caso que no se puede distinguir sin las medidas reales de los glifos:
+/// un tramo cuyas unicas letras anchas miden justo una letra y un espacio (la W de Helvetica).
+fn wide_spaces(wide: &[Wide], size: f64) -> Vec<(usize, f64)> {
+    let mut out = Vec::new();
+    let mut fonts: Vec<usize> = wide.iter().map(|w| w.font).collect();
+    fonts.sort_unstable();
+    fonts.dedup();
+    for f in fonts {
+        let joins: Vec<&Wide> = wide.iter().filter(|w| w.font == f).collect();
+        let mut ratios: Vec<f64> = joins.iter().map(|w| w.forward / w.declared).collect();
+        ratios.sort_by(|a, b| a.total_cmp(b));
+        let (mut scale, mut count, mut j) = (0.0, 0usize, 0usize);
+        for i in 0..ratios.len() {
+            j = j.max(i);
+            while j < ratios.len() && ratios[j] <= ratios[i] * 1.05 {
+                j += 1;
+            }
+            if j - i > count {
+                count = j - i;
+                scale = ratios[i];
+            }
+        }
+        if count < 3 || 2 * count <= joins.len() {
+            continue;
+        }
+        let gap = |w: &Wide| w.forward - w.declared * scale;
+        let (lo, hi) = joins.iter().fold((f64::MAX, 0.0f64), |(lo, hi), w| (lo.min(w.declared), hi.max(w.declared)));
+        if hi <= lo * 1.01 {
+            let mixed = joins.iter().any(|w| {
+                let r = w.forward / w.declared;
+                !(r >= scale * 0.95 && r <= scale * 1.05) && gap(w) <= WORD_GAP * size
+            });
+            let (g0, g1) = joins.iter().map(|w| gap(w)).filter(|g| *g > WORD_GAP * size).fold((f64::MAX, 0.0f64), |(lo, hi), g| (lo.min(g), hi.max(g)));
+            if mixed || g1 > g0 * 1.15 {
+                continue;
+            }
+        }
+        out.extend(joins.iter().filter(|w| gap(w) > WORD_GAP * size).map(|w| (w.at, gap(w) / size)));
+    }
+    out.sort_by_key(|a| a.0);
+    out
+}
 
 /// Un glifo que da varias letras de una ligadura tipografica, o la ligadura misma.
 fn is_ligature(text: &str) -> bool {
@@ -241,7 +303,21 @@ fn number(raw: &[u8]) -> Obj {
 
 impl<'p, 'a> Interp<'p, 'a> {
     pub fn new(pdf: &'p Pdf<'a>, fonts: &'p FontCache) -> Interp<'p, 'a> {
-        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, doubt: Vec::new(), tight: 0, inserted: Vec::new(), glyph: (0.0, 0.0), ligature: false, scales: Vec::new() }
+        Interp {
+            pdf,
+            fonts,
+            out: PageText::default(),
+            cur: None,
+            depth: 0,
+            budget: 20_000_000,
+            doubt: Vec::new(),
+            tight: 0,
+            inserted: Vec::new(),
+            glyph: (0.0, 0.0),
+            glyph_font: 0,
+            ligature: false,
+            wide: Vec::new(),
+        }
     }
 
     fn font(&self, resources: &Dict, name: &str) -> Option<Rc<Font>> {
@@ -261,20 +337,29 @@ impl<'p, 'a> Interp<'p, 'a> {
     fn flush(&mut self) {
         let doubt = std::mem::take(&mut self.doubt);
         let tight = std::mem::replace(&mut self.tight, 0);
-        let inserted = std::mem::take(&mut self.inserted);
-        self.scales.clear();
+        let mut inserted = std::mem::take(&mut self.inserted);
+        let wide = std::mem::take(&mut self.wide);
         if let Some(mut item) = self.cur.take() {
+            // Los espacios de las letras con anchos exagerados cuentan como los que puso un hueco
+            // ancho (esas uniones se habian contado como apretadas).
+            let mut at = wide_spaces(&wide, item.size);
+            let tight = tight.saturating_sub(at.len());
+            inserted.extend(at.iter().map(|a| a.1));
             // Una linea justificada que separa las palabras solo por su posicion (sin caracteres
             // de espacio; los que hay los puso un hueco ancho) puede apretarlas por debajo del
             // espacio comun. Sus huecos son casi iguales entre si y las letras de cada palabra van
             // juntas; un hueco dudoso suelto, o letras todas separadas (interletra amplia), no son
             // espacios.
-            if doubt.len() >= 3 && item.text.matches(' ').count() == inserted.len() && tight >= 2 * doubt.len() {
+            if doubt.len() >= 3 && item.text.matches(' ').count() + at.len() == inserted.len() && tight >= 2 * doubt.len() {
                 let (lo, hi) = doubt.iter().fold((f64::MAX, 0.0f64), |(lo, hi), d| (lo.min(d.1), hi.max(d.1)));
                 // Los espacios que ya hay, de la misma familia: la linea entera va justificada igual.
                 if hi <= lo * 1.15 && inserted.iter().all(|g| *g <= hi * 1.15) {
-                    item.text = with_spaces(&item.text, &doubt);
+                    at.extend(doubt);
+                    at.sort_by_key(|a| a.0);
                 }
+            }
+            if !at.is_empty() {
+                item.text = with_spaces(&item.text, &at);
             }
             if !item.text.trim().is_empty() {
                 self.out.items.push(item);
@@ -297,6 +382,7 @@ impl<'p, 'a> Interp<'p, 'a> {
         }
         let (dx, dy) = (m[0] / ux, m[1] / ux);
         let size = (st.size * uy).abs();
+        let font_id = Rc::as_ptr(&font) as usize;
         let (mut ox, mut oy) = (m[4] + st.ts * m[2], m[5] + st.ts * m[3]);
         let mut total = 0.0f64;
         let mut glyphs: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
@@ -337,6 +423,7 @@ impl<'p, 'a> Interp<'p, 'a> {
                 // Un glifo ubicado aparte (`Td`, `Tm`) dentro del espaciado del anterior: quien
                 // escribio el PDF declaro un `Tc` que no usa y ubica cada letra donde termina la
                 // anterior. Se mide desde el final visible del glifo, no desde su avance.
+                let mut wide = None;
                 if along < -0.3 * size {
                     // Avance desde el comienzo del glifo anterior.
                     let forward = (sx - self.glyph.0) * cur.dx + (sy - self.glyph.1) * cur.dy;
@@ -344,33 +431,13 @@ impl<'p, 'a> Interp<'p, 'a> {
                         along += cur.tail;
                     } else if forward > 0.2 * size && forward < 1.2 * size {
                         // Anchos de la fuente mayores que los glifos reales: cada letra, ubicada
-                        // aparte, parece montarse en la anterior aunque avanza. Va pegada a ella,
-                        // salvo que avance claramente mas que las demas. La menor proporcion entre
-                        // avance real y ancho declarado de las letras ya vistas del tramo da el
-                        // ancho real de la anterior, y lo que sobra es un espacio entre palabras.
-                        // Se usa si la mayoria de las letras vistas (al menos tres) avanza en esa
-                        // proporcion, dentro de un 5 %: los huecos entre palabras que entraron
-                        // antes, al comienzo del tramo, quedan por encima y no la mueven. Si la
-                        // proporcion varia (anchos declarados iguales y letras reales de distinto
-                        // ancho), una letra ancha no se distingue de un espacio y no se separa nada.
+                        // aparte, parece montarse en la anterior aunque avanza. Va pegada a ella;
+                        // si en realidad hay un espacio entre palabras se decide al cerrar el tramo
+                        // (`wide_spaces`), con todas sus uniones a la vista.
                         let declared = (cur.x1 - self.glyph.0) * cur.dx + (cur.y1 - self.glyph.1) * cur.dy - cur.tail;
                         along = 0.0;
                         if declared > 0.0 {
-                            let lo = self.scales.iter().fold(f64::MAX, |lo, s| lo.min(*s));
-                            let near = self.scales.iter().filter(|s| **s <= lo * 1.05).count();
-                            if near >= 3 && 2 * near > self.scales.len() {
-                                let gap = forward - declared * lo;
-                                if gap > WORD_GAP * size {
-                                    along = gap;
-                                }
-                            }
-                            // Solo las uniones dentro de una palabra miden la escala.
-                            if along == 0.0 {
-                                if self.scales.len() == MAX_SCALES {
-                                    self.scales.remove(0);
-                                }
-                                self.scales.push(forward / declared);
-                            }
+                            wide = Some((forward, declared));
                         }
                     }
                 }
@@ -396,11 +463,17 @@ impl<'p, 'a> Interp<'p, 'a> {
                     } else if along.abs() <= TIGHT_GAP * size {
                         self.tight += 1;
                     }
+                    if let Some((forward, declared)) = wide {
+                        if !cur.text.ends_with(' ') && !text.starts_with(' ') && self.wide.len() < MAX_WIDE {
+                            self.wide.push(Wide { at: cur.text.len(), forward, declared, font: self.glyph_font });
+                        }
+                    }
                     cur.text.push_str(&text);
                     cur.x1 = ex;
                     cur.y1 = ey;
                     cur.tail = tail;
                     self.glyph = (sx, sy);
+                    self.glyph_font = font_id;
                     self.ligature = is_ligature(&text);
                     continue;
                 }
@@ -410,6 +483,7 @@ impl<'p, 'a> Interp<'p, 'a> {
                 continue; // un tramo no empieza con espacios
             }
             self.glyph = (sx, sy);
+            self.glyph_font = font_id;
             self.ligature = is_ligature(&text);
             self.cur = Some(Item { text, x0: sx, y0: sy, x1: ex, y1: ey, size, tail, dx, dy, bold: font.bold });
         }
@@ -652,8 +726,8 @@ mod tests {
     #[test]
     fn ningun_operador_de_dibujo_tiene_rama_en_exec() {
         // Una rama de `exec` para un operador de `drawing_op` nunca se ejecutaria. Las ramas se
-        // buscan por sus cadenas: las que, solas o unidas por `|`, van seguidas de `=>`, sin
-        // importar los saltos de linea ni la sangria.
+        // buscan por sus cadenas: las que, solas o unidas por `|`, van seguidas de `=>` (con o sin
+        // guarda `if`), sin importar los saltos de linea ni la sangria.
         let src = include_str!("content.rs");
         let exec = src[src.find("fn exec(").unwrap()..src.find("fn xobject(").unwrap()].as_bytes();
         let (mut ramas, mut patron) = (Vec::new(), Vec::new());
@@ -682,6 +756,13 @@ mod tests {
                 b'=' if exec.get(i + 1) == Some(&b'>') => {
                     ramas.append(&mut patron);
                     i += 1;
+                }
+                b'i' if !patron.is_empty() && exec[i..].starts_with(b"if") && exec.get(i + 2).map_or(false, |c| is_ws(*c)) => {
+                    // Una guarda (`"re" if x =>`): la rama sigue siendo de esas cadenas.
+                    while i + 1 < exec.len() && &exec[i..i + 2] != b"=>" {
+                        i += 1;
+                    }
+                    continue;
                 }
                 b'|' => {}
                 c if is_ws(c) => {}
