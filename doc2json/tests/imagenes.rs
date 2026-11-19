@@ -582,8 +582,8 @@ fn pdf_mascara_suave_con_datos_cortos_se_ignora() {
     assert_eq!(color, 0, "sin canal alfa");
 }
 
-/// Comprueba que `p` sea un PNG que un lector estricto acepta: zlib valido, filas completas y
-/// tipos de filtro 0 a 4.
+/// Comprueba que `p` sea un PNG que un lector estricto acepta: zlib valido de punta a punta (con
+/// `zlib_strict`), filas completas y tipos de filtro 0 a 4.
 fn png_estricto(p: &[u8]) {
     let (w, h, depth, color, _, _) = decode_png(p);
     let channels = match color {
@@ -600,11 +600,10 @@ fn png_estricto(p: &[u8]) {
         }
         i += 12 + len;
     }
-    let z = doc2json::inflate::zlib(&idat);
-    assert!(z.ok, "IDAT no es zlib valido");
+    let z = doc2json::inflate::zlib_strict(&idat).expect("IDAT no es zlib valido");
     let row = (w as usize * channels * depth as usize + 7) / 8 + 1;
-    assert_eq!(z.data.len(), row * h as usize, "filas incompletas o sobrantes");
-    assert!(z.data.chunks(row).all(|r| r[0] <= 4), "tipo de filtro invalido");
+    assert_eq!(z.len(), row * h as usize, "filas incompletas o sobrantes");
+    assert!(z.chunks(row).all(|r| r[0] <= 4), "tipo de filtro invalido");
 }
 
 #[test]
@@ -641,6 +640,100 @@ fn pdf_predictor_png_que_no_es_un_png_valido_se_recodifica() {
     for img in &d.images[1..] {
         assert!(!img.data.as_deref().unwrap_or(&[]).windows(3).any(|w| w == [0x78, 0x01, 1]), "imagen {} copiada sin validar", img.id);
     }
+}
+
+#[test]
+fn pdf_predictor_png_con_zlib_que_un_lector_estricto_rechaza_se_recodifica() {
+    // El lector propio, tolerante, lee los dos flujos; un lector de PNG estricto no: el primero
+    // trae un bloque sin compresion con NLEN que no es el complemento de LEN, y el segundo un byte
+    // entre el fin del flujo DEFLATE y la suma Adler-32 (que sigue siendo correcta).
+    let rows = [0u8, 1, 2, 3, 4, 5, 6, 0, 7, 8, 9, 10, 11, 12];
+    let mut nlen = zlib_stored(&rows);
+    nlen[5] ^= 0xFF;
+    let mut sobra = zlib_stored(&rows);
+    sobra.insert(sobra.len() - 4, 0);
+    let dict = "/Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /Columns 2 >>";
+    let bytes = pdf_con(
+        "/Im1 5 0 R /Im2 6 0 R /Im3 7 0 R",
+        "q 1 0 0 1 0 0 cm /Im1 Do /Im2 Do /Im3 Do Q",
+        vec![stream(dict, &zlib_stored(&rows)), stream(dict, &nlen), stream(dict, &sobra)],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    let copiado = |img: &Image| img.data.as_deref().unwrap_or(&[]).windows(3).any(|w| w == [0x78, 0x01, 1]);
+    assert!(copiado(&d.images[0]), "el flujo valido se copia tal cual");
+    for img in &d.images[1..] {
+        assert!(!copiado(img), "imagen {} copiada sin validar", img.id);
+        let p = img.data.as_deref().unwrap_or_else(|| panic!("{:?}", img.note));
+        png_estricto(p);
+        assert_eq!(decode_png(p).5, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    }
+}
+
+#[test]
+fn pdf_imagen_como_diccionario_directo_no_figura() {
+    // Una imagen es un flujo y, por lo tanto, un objeto indirecto. Un diccionario directo con
+    // /Subtype /Image en los recursos se cuenta en la pagina pero no figura en la lista.
+    let bytes = pdf(&[
+        obj("<< /Type /Catalog /Pages 2 0 R >>"),
+        obj("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>"),
+        obj("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Im1 << /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 >> /Im2 5 0 R >> >> >>"),
+        stream("", b"/Im1 Do /Im1 Do /Im2 Do"),
+        stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[9]),
+    ]);
+    for d in [read(&bytes).unwrap(), read_with_images(&bytes).unwrap()] {
+        assert_eq!(d.pages[0].images, 3);
+        assert_eq!(d.images.len(), 1);
+        assert_eq!(d.images[0].places.len(), 1);
+    }
+}
+
+#[test]
+fn pdf_tope_descuenta_los_pixeles_declarados_antes_de_decodificar() {
+    // 5 imagenes de 200 x 200 en gris: 40.000 bytes de pixeles cada una, aunque su PNG ocupe
+    // pocos bytes. Con un tope de 100.000 se decodifican dos; las otras ni se leen.
+    let n = 5;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let imgs = (0..n)
+        .map(|i| stream("/Subtype /Image /Width 200 /Height 200 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode", &zlib_stored(&[i as u8; 40_000])))
+        .collect();
+    let d = doc2json::read_with_image_budget(&pdf_con(&names, &content, imgs), 100_000).unwrap();
+    let con_datos: Vec<bool> = d.images.iter().map(|i| i.data.is_some()).collect();
+    assert_eq!(con_datos, [true, true, false, false, false]);
+    assert!(d.images[0].data.as_ref().unwrap().len() < 1000, "el PNG es chico; lo que cuenta son los pixeles");
+    assert!(d.images[2].note.as_deref().unwrap_or("").contains("tope"), "{:?}", d.images[2].note);
+    assert!(d.warnings.iter().any(|w| w.contains("3 imagenes no se extrajeron")), "{:?}", d.warnings);
+    // Un JPEG cuenta por el largo de su flujo, no por sus pixeles: 23 bytes de un JPEG de 2 x 3.
+    let bytes = pdf_con("/Im1 5 0 R", "/Im1 Do", vec![stream("/Subtype /Image /Width 2 /Height 3 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode", &JPEG)]);
+    assert!(doc2json::read_with_image_budget(&bytes, JPEG.len()).unwrap().images[0].data.is_some());
+}
+
+#[test]
+fn pdf_paleta_y_mascara_compartidas_se_aplican_a_cada_imagen() {
+    // La misma tabla de colores en dos paletas de distinta base, y la misma mascara suave en dos
+    // imagenes de su tamano y en una de otro tamano (que sale sin transparencia).
+    let bytes = pdf_con(
+        "/I1 5 0 R /I2 6 0 R /I3 7 0 R /I4 8 0 R /I5 9 0 R",
+        "/I1 Do /I2 Do /I3 Do /I4 Do /I5 Do",
+        vec![
+            stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace [/Indexed /DeviceRGB 1 10 0 R] /BitsPerComponent 8", &[0, 1]),
+            stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace [/Indexed /DeviceGray 5 10 0 R] /BitsPerComponent 8", &[0, 5]),
+            stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 11 0 R", &[10, 20]),
+            stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 11 0 R", &[30]),
+            stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 11 0 R", &[40, 50]),
+            stream("", &[10, 20, 30, 40, 50, 60]),
+            stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[255, 7]),
+        ],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    let png = |i: usize| decode_png(d.images[i].data.as_deref().unwrap_or_else(|| panic!("{:?}", d.images[i].note)));
+    let (_, _, _, _, plte, _) = png(0);
+    assert_eq!(&plte[..6], &[10, 20, 30, 40, 50, 60]);
+    let (_, _, _, _, plte, _) = png(1);
+    assert_eq!((&plte[..3], &plte[15..18]), (&[10u8, 10, 10][..], &[60u8, 60, 60][..]));
+    assert_eq!((png(2).3, png(2).5), (4, vec![10, 255, 20, 7]));
+    assert_eq!((png(3).3, png(3).5), (0, vec![30]));
+    assert_eq!((png(4).3, png(4).5), (4, vec![40, 255, 50, 7]));
 }
 
 #[test]

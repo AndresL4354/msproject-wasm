@@ -922,15 +922,17 @@ pub fn read_opts(data: &[u8], images: Option<usize>) -> Result<Document, String>
                 img.note = Some("Imagen vinculada desde fuera del documento.".into());
                 continue;
             }
-            // El tamano que declara el ZIP permite saltarse una imagen que no cabe sin descomprimirla.
-            if budget.exhausted() || zip.find(key).map_or(false, |e| e.size > limit) {
+            // El tamano que declara el ZIP se descuenta antes de descomprimir: una imagen que ya no
+            // cabe no se descomprime.
+            let work = zip.find(key).map_or(0, |e| e.size);
+            if !budget.reserve(work) {
                 budget.skip(img);
                 continue;
             }
             match zip.read(key) {
                 Some(bytes) => {
                     describe(img, &bytes);
-                    budget.store(img, bytes);
+                    budget.store(img, bytes, work);
                 }
                 None => img.note = Some("No se pudo leer el archivo de la imagen.".into()),
             }

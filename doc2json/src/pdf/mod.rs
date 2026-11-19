@@ -184,14 +184,10 @@ pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, Strin
         let mut text = interp.out;
         unmapped += text.unmapped;
         inline_images += text.inline_images;
-        for (k, u) in std::mem::take(&mut text.uses).into_iter().enumerate() {
+        for u in std::mem::take(&mut text.uses) {
             let (x, y, w, h) = images::place(u.ctm, page.bbox, page.rotate);
             let place = Place { page: Some(i as u32 + 1), x: Some(x), y: Some(y), w, h };
-            // Un objeto sin numero (no deberia pasar con flujos) cuenta como imagen propia.
-            let key = match u.key {
-                Some(n) => n.to_string(),
-                None => format!("p{} {}", i + 1, k),
-            };
+            let key = u.key.to_string();
             let dict = match u.obj.as_dict() {
                 Some(d) => d,
                 None => continue,
@@ -243,26 +239,29 @@ pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, Strin
     doc.images = set.list;
     if let Some(limit) = extract {
         let mut budget = Budget::new(limit);
-        // Trabajo de decodificacion que le queda al documento: cada imagen se cobra antes.
-        let mut work = images::MAX_WORK;
+        // Paletas y mascaras compartidas, y el trabajo de decodificacion que le queda al documento.
+        let mut shared = images::Shared::new(&objs);
         let mut skipped_work = 0usize;
         for (img, obj) in doc.images.iter_mut().zip(&objs) {
-            if budget.exhausted() {
-                budget.skip(img);
-                continue;
-            }
-            let cost = images::cost(&pdf, obj);
-            if cost > work {
-                img.note = Some(images::work_note());
-                skipped_work += 1;
-                continue;
-            }
-            work -= cost;
-            match images::extract(&pdf, obj, &mut work) {
+            // Cada imagen se cobra antes de decodificarla, por lo que declara, a los dos topes del
+            // documento (bytes y trabajo): una que ya no cabe no se lee ni se decodifica.
+            let reserved = match shared.charge(&pdf, obj, &mut budget) {
+                Ok(bytes) => bytes,
+                Err(images::Over::Bytes) => {
+                    budget.skip(img);
+                    continue;
+                }
+                Err(images::Over::Work) => {
+                    img.note = Some(images::work_note());
+                    skipped_work += 1;
+                    continue;
+                }
+            };
+            match images::extract(&pdf, &mut shared, obj) {
                 Ok((format, data, note)) => {
                     img.format = format;
                     img.note = note;
-                    budget.store(img, data);
+                    budget.store(img, data, reserved);
                 }
                 Err(note) => img.note = Some(note),
             }
