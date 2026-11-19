@@ -9,7 +9,8 @@
 //!   las paginas que cubre. Las tablas largas se parten por filas repitiendo el encabezado.
 //!
 //! El texto del documento no se vuelve HTML, enlaces, titulos ni listas (`*x*`, `_x_` y `~~x~~` no
-//! se escapan y pueden salir como enfasis): se escapan `<`, `[`, `]`, `` ` ``, las entidades
+//! se escapan y pueden salir como enfasis; con GFM, una direccion `https://...` o `www....` escrita
+//! en el texto sale como enlace automatico): se escapan `<`, `[`, `]`, `` ` ``, las entidades
 //! (`&lt;`), las barras invertidas y lo que al inicio de una linea (tambien tras un `\r` solo)
 //! abriria un titulo, una cita, una lista o una linea horizontal. Los enlaces de Word solo salen si
 //! son `http`, `https` o `mailto`. Esto evita que el texto se lea como marca, pero no reemplaza a un
@@ -59,10 +60,20 @@ fn is_entity(rest: &str) -> bool {
     n > 0 && body.as_bytes().get(n) == Some(&b';')
 }
 
-/// Escapa lo que Markdown leeria como marca al inicio de una linea (titulo, cita, lista, linea
-/// horizontal, subrayado de titulo, bloque de codigo). Quita la sangria: cuatro espacios serian codigo.
+/// Escapa lo que Markdown leeria como marca al inicio de un texto (titulo, cita, lista, linea
+/// horizontal, subrayado de titulo, bloque de codigo). Quita la sangria: cuatro espacios serian
+/// codigo. Mira solo la primera linea: en un trozo de varias (un fragmento cortado) las demas ya
+/// vienen escapadas, y mirarlo entero dejaria pasar "1." o "---" solos en la primera.
 fn escape_start(text: &str) -> String {
     let t = text.trim_start();
+    let end = t.find(['\r', '\n']).unwrap_or(t.len());
+    let mut out = escape_line(&t[..end]);
+    out.push_str(&t[end..]);
+    out
+}
+
+/// `escape_start` de una sola linea.
+fn escape_line(t: &str) -> String {
     let first = t.chars().next();
     let only = |c: char, min: usize| t.chars().all(|x| x == c || x == ' ' || x == '\t') && t.chars().filter(|x| *x == c).count() >= min;
     let needs = match first {
@@ -366,8 +377,10 @@ fn block_md(b: &Block, cx: &Ctx) -> String {
             if numbered {
                 format!("{}{} {}", indent, marker, body)
             } else if b.ordered && !marker.is_empty() {
-                // "a)", "iv.", "3.2.1": Markdown no los numera; se dejan escritos.
-                format!("{}- {} {}", indent, escape_text(marker), body)
+                // "a)", "iv.", "3.2.1": Markdown no los numera; se dejan escritos. El texto del
+                // numero lo define el documento (`w:lvlText`): en una linea y escapado al inicio,
+                // como el texto ("#" o ">" lo volverian titulo o cita dentro del item).
+                format!("{}- {} {}", indent, escape_start(&one_line(escape_text(marker))), body)
             } else {
                 format!("{}- {}", indent, body)
             }
@@ -399,7 +412,8 @@ fn context(d: &Document) -> Ctx {
         .extras
         .iter()
         .filter(|(k, _)| *k == "footnotes" || *k == "endnotes")
-        .flat_map(|(_, v)| v.iter().filter_map(|b| b.label.clone()))
+        // Una nota sin texto no sale (`notes_md`): su cita queda como texto, no como `[^n]`.
+        .flat_map(|(_, v)| v.iter().filter(|b| !b.text.trim().is_empty()).filter_map(|b| b.label.clone()))
         .filter(|l| safe_label(l))
         .collect();
     Ctx { offset: if d.content.iter().any(|b| b.kind == Kind::Title) { 1 } else { 0 }, labels }
@@ -860,6 +874,41 @@ mod tests {
         assert_eq!(escape_start("- tampoco"), "\\- tampoco");
         assert_eq!(escape_start("2024 fue un buen anio"), "2024 fue un buen anio");
         assert_eq!(escape_start("-5 grados"), "-5 grados");
+        // En un trozo de varias lineas (un fragmento cortado) cuenta solo la primera: el resto no
+        // impide ver un "1." o un "---" solos en ella.
+        assert_eq!(escape_start("1.\nSiguiente linea"), "1\\.\nSiguiente linea");
+        assert_eq!(escape_start("---\notra"), "\\---\notra");
+        assert_eq!(escape_start("-\notra"), "\\-\notra");
+        assert_eq!(escape_start("\n  # titulo\n# otro"), "\\# titulo\n# otro");
+    }
+
+    #[test]
+    fn el_numero_de_lista_de_word_no_abre_marcas() {
+        // El texto del numero (`w:lvlText`) lo define el documento: no debe volver titulo, cita,
+        // lista ni bloque de codigo el contenido del item, ni cortar la lista con un salto.
+        let item = |marker: &str| Block { kind: Kind::ListItem, ordered: true, marker: Some(marker.into()), text: "Detener".into(), ..Block::default() };
+        for (marker, esperado) in [
+            ("#", "- \\# Detener"),
+            (">", "- \\> Detener"),
+            ("~~~", "- \\~~~ Detener"),
+            ("*", "- \\* Detener"),
+            ("-", "- \\- Detener"),
+            ("a)\n# Titulo", "- a) # Titulo Detener"),
+            ("iv.", "- iv. Detener"),
+        ] {
+            assert_eq!(to_markdown(&doc(vec![item(marker)])).trim_end(), esperado, "{:?}", marker);
+        }
+    }
+
+    #[test]
+    fn la_cita_de_una_nota_vacia_queda_como_texto() {
+        // La nota vacia no sale, asi que su cita no puede ser "[^6]" (se veria literal y sin nota).
+        let mut d = doc(vec![p("Cita [6] y [7].")]);
+        let nota = |l: &str, t: &str| Block { label: Some(l.into()), text: t.into(), ..Block::default() };
+        d.extras.push(("footnotes", vec![nota("6", " "), nota("7", "Nota siete.")]));
+        let md = to_markdown(&d);
+        assert!(md.contains("Cita \\[6\\] y [^7]."), "{}", md);
+        assert!(!md.contains("[^6]"), "{}", md);
     }
 
     #[test]
@@ -1105,6 +1154,17 @@ mod revision {
         false
     }
 
+    /// La primera definicion de referencia de un texto, tambien con el destino o el titulo en la
+    /// linea siguiente (CommonMark admite un salto de linea entre la etiqueta, el destino y el titulo).
+    fn hay_definicion(texto: &str) -> Option<String> {
+        let lineas: Vec<&str> = texto.lines().collect();
+        (0..lineas.len()).find_map(|i| {
+            let dos = lineas.get(i + 1).map(|s| format!("{} {}", lineas[i], s.trim_start()));
+            let es = es_definicion(lineas[i]) || dos.as_deref().map_or(false, es_definicion);
+            es.then(|| dos.unwrap_or_else(|| lineas[i].to_string()))
+        })
+    }
+
     #[test]
     fn una_nota_no_es_una_definicion_de_referencia() {
         // Para un lector sin notas al pie, "[^1]: destino" y "[^1]: destino \"titulo\"" definen la
@@ -1115,6 +1175,11 @@ mod revision {
         for l in ["[^1]: x y", "[^1]: (x", "[^1]: x \\\"t\"", "[^1]: x \"t\" y", "[^1]:"] {
             assert!(!es_definicion(l), "{}", l);
         }
+        // Con el destino o el titulo en la linea siguiente tambien es una definicion.
+        for t in ["[^1]:\njavascript:alert(1)", "[^1]:\n  x \"t\"", "Texto\n[^1]: x\n\"t\""] {
+            assert!(hay_definicion(t).is_some(), "{}", t);
+        }
+        assert_eq!(hay_definicion("[^1]: — x\n\"t\""), None);
         let notas = ["javascript:alert(1)", "<javascript:alert(1)>", "javascript:alert(1) \"titulo\"", "javascript:alert(1) 'titulo'", "javascript:alert(1) (titulo)", " ", "\"javascript:alert(1)\"", "Solo equipos electricos."];
         let citas: String = (1..=notas.len()).map(|i| format!("Cita [{}]. ", i)).collect();
         let mut d = doc(vec![p(&citas)]);
@@ -1135,9 +1200,7 @@ mod revision {
             "{}",
             md
         );
-        for l in md.lines() {
-            assert!(!es_definicion(l), "{}\n{}", l, md);
-        }
+        assert_eq!(hay_definicion(&md), None, "{}", md);
         // En los fragmentos, un corte no deja una nota con solo su primera palabra: aqui la segunda
         // palabra es enorme frente al fragmento y el corte cae justo despues de la primera.
         let larga = format!("javascript:alert(1)//{} {}", "a".repeat(80), "x".repeat(500));
@@ -1145,9 +1208,7 @@ mod revision {
         for max in [200, 300] {
             for c in chunks(&d, max) {
                 assert!(c.text.chars().count() <= max, "{}", c.text);
-                for l in c.text.lines() {
-                    assert!(!es_definicion(l), "{}\n{}", l, c.text);
-                }
+                assert_eq!(hay_definicion(&c.text), None, "{}", c.text);
             }
         }
     }

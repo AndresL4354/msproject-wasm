@@ -40,8 +40,9 @@ export declare function docToJson(file: FileInput, options?: JsonOptions): Promi
 /**
  * Convierte un .docx o un .pdf en Markdown: titulos con `#`, listas con su numeracion, tablas GFM,
  * notas al pie como `[^1]` y, en Word, negrita, cursiva y enlaces. En PDF cada pagina empieza con
- * `<!-- pagina N -->`. El texto del documento va escapado: no trae etiquetas HTML ni enlaces, y los
- * enlaces de Word solo salen si son `http`, `https` o `mailto`.
+ * `<!-- pagina N -->`. El texto del documento va escapado: no trae etiquetas HTML ni enlaces (salvo
+ * las direcciones `https://...` escritas en el texto, que GFM muestra como enlace), y los enlaces de
+ * Word solo salen si son `http`, `https` o `mailto`.
  */
 export declare function docToMarkdown(file: FileInput, options?: MarkdownOptions): Promise<string>;
 
