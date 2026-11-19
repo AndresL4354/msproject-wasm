@@ -12,6 +12,7 @@ pub mod filters;
 pub mod font;
 pub mod layout;
 pub mod object;
+pub mod structure;
 
 use crate::doc::{Document, Line, Meta, OutlineItem, Page};
 use content::{FontCache, Interp};
@@ -134,7 +135,132 @@ fn annotations(pdf: &Pdf, page: &document::PageInfo, interp: &mut Interp) {
     }
 }
 
+fn visible_chars(items: &[content::Item]) -> usize {
+    items.iter().map(|it| it.text.chars().filter(|c| !c.is_whitespace()).count()).sum()
+}
+
+/// Bloques desde el arbol de estructura, con el texto que no quedo en ningun elemento agregado
+/// (por posicion) despues de los bloques de su pagina, las notas al pie y los avisos. `None` si
+/// la estructura no sirve.
+type Tagged = (Vec<crate::doc::Block>, Vec<crate::doc::Block>, Vec<String>);
+fn tagged_blocks(tree: &structure::Node, stores: &[structure::PageStore], unmarked: &[Vec<content::Item>], body: f64, sizes: &[f64]) -> Option<Tagged> {
+    let mut b = structure::Builder::new(stores);
+    let mut blocks = Vec::new();
+    b.walk(tree, &mut blocks);
+    let total: usize = stores.iter().flat_map(|s| s.by_mcid.values()).map(|v| visible_chars(v)).sum::<usize>() + unmarked.iter().map(|v| visible_chars(v)).sum::<usize>();
+    let covered: usize = b.used.iter().filter_map(|(p, m)| stores.get(*p).and_then(|s| s.by_mcid.get(m))).map(|v| visible_chars(v)).sum();
+    if blocks.is_empty() || covered * 2 < total {
+        return None;
+    }
+    // Bloques del texto suelto de cada pagina, en orden de pagina.
+    let mut extras: Vec<(u32, Vec<crate::doc::Block>)> = Vec::new();
+    for (i, store) in stores.iter().enumerate() {
+        let mut items: Vec<content::Item> = unmarked[i].clone();
+        let mut left: Vec<&i64> = store.by_mcid.keys().filter(|m| !b.used.contains(&(i, **m))).collect();
+        left.sort_unstable();
+        for m in left {
+            items.extend(store.by_mcid[m].iter().cloned());
+        }
+        if visible_chars(&items) == 0 {
+            continue;
+        }
+        let (lines, width, _) = layout::lines(items, store.bbox, store.rotate);
+        let lines = layout::reorder_columns(lines, width);
+        let mut extra = Vec::new();
+        let page = i as u32 + 1;
+        layout::blocks(&lines, page, body, sizes, &mut extra);
+        if !extra.is_empty() {
+            extras.push((page, extra));
+        }
+    }
+    // Cada pagina va despues del ultimo bloque de esa pagina o de una anterior. `last[p]` es ese
+    // bloque, calculado en una pasada: buscarlo y abrir lugar en cada pagina costaba paginas x bloques.
+    let mut last: Vec<Option<usize>> = vec![None; stores.len() + 1];
+    for (k, x) in blocks.iter().enumerate() {
+        if let Some(slot) = x.page.and_then(|p| last.get_mut(p as usize)) {
+            *slot = Some(k);
+        }
+    }
+    let mut upto = None;
+    for slot in last.iter_mut() {
+        upto = upto.max(*slot);
+        *slot = upto;
+    }
+    // `last` no baja de una pagina a la siguiente, asi que todo se arma en orden en una pasada; las
+    // paginas sin ningun bloque propio ni anterior van al comienzo.
+    let at = |p: u32| last.get(p as usize).copied().flatten();
+    let mut out = Vec::with_capacity(blocks.len() + extras.iter().map(|(_, e)| e.len()).sum::<usize>());
+    let mut extras = extras.into_iter().peekable();
+    let mut take = |out: &mut Vec<crate::doc::Block>, after: Option<usize>| {
+        while extras.peek().map_or(false, |(p, _)| at(*p) == after) {
+            if let Some((_, extra)) = extras.next() {
+                out.extend(extra);
+            }
+        }
+    };
+    take(&mut out, None);
+    for (k, x) in blocks.into_iter().enumerate() {
+        out.push(x);
+        take(&mut out, Some(k));
+    }
+    Some((out, b.notes, b.warnings))
+}
+
+/// Encabezados y pies de un PDF etiquetado (artefactos de paginacion), como `headers` y `footers`
+/// del lector de Word. Cada texto se informa una vez: el que se repite en varias paginas (aunque
+/// cambie el numero de pagina) se toma de la primera. Sin subtipo declarado, decide la posicion.
+fn running_texts(arts: &[Vec<content::Item>], stores: &[structure::PageStore]) -> (Vec<crate::doc::Block>, Vec<crate::doc::Block>) {
+    use crate::doc::{Block, Kind};
+    let (mut headers, mut footers): (Vec<Block>, Vec<Block>) = (Vec::new(), Vec::new());
+    let mut seen: HashSet<(bool, String)> = HashSet::new();
+    for (i, items) in arts.iter().enumerate() {
+        let store = &stores[i];
+        // (es encabezado, lineas) de cada tipo de artefacto de la pagina.
+        let mut lines_of: Vec<(bool, String)> = Vec::new();
+        for kind in [content::ART_ENCABEZADO, content::ART_PIE, content::ART_PAGINACION] {
+            let group: Vec<content::Item> = items.iter().filter(|it| it.art == kind).cloned().collect();
+            if group.is_empty() {
+                continue;
+            }
+            let (lines, _, height) = layout::lines(group, store.bbox, store.rotate);
+            for l in lines {
+                let header = match kind {
+                    content::ART_ENCABEZADO => true,
+                    content::ART_PIE => false,
+                    _ => l.y < height / 2.0,
+                };
+                // Espacios de relleno entre partes de un membrete: se compactan (los tabuladores quedan).
+                let t = l.text.split('\t').map(|c| c.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\t");
+                lines_of.push((header, t));
+            }
+        }
+        for header in [true, false] {
+            let text = lines_of.iter().filter(|(h, _)| *h == header).map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n");
+            if text.trim().is_empty() {
+                continue;
+            }
+            let key: String = text.chars().filter(|c| !c.is_ascii_digit() && !c.is_whitespace()).collect();
+            if !seen.insert((header, key)) {
+                continue;
+            }
+            let b = Block { kind: Kind::Paragraph, text, page: Some(i as u32 + 1), ..Block::default() };
+            if header {
+                headers.push(b);
+            } else {
+                footers.push(b);
+            }
+        }
+    }
+    (headers, footers)
+}
+
 pub fn read(bytes: &[u8]) -> Result<Document, String> {
+    read_with(bytes, true)
+}
+
+/// Como `read`, pero con `tags = false` ignora el etiquetado y deduce la estructura por la
+/// posicion del texto (lo que se hace siempre con los PDF sin etiquetas).
+pub fn read_with(bytes: &[u8], tags: bool) -> Result<Document, String> {
     let pdf = Pdf::open(bytes)?;
     let pages = pdf.pages();
     if pages.is_empty() {
@@ -166,6 +292,12 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
     // Presupuesto de la lectura: paginas y texto. Las paginas que no se leen se informan.
     let limits = crate::budget::limits();
     let mut stopped: Option<String> = None;
+    // Para el PDF etiquetado: el texto de cada pagina agrupado por contenido marcado, el que no
+    // esta marcado (anotaciones, contenido sin etiquetar) y los encabezados y pies (artefactos de
+    // paginacion). Los demas artefactos (lineas, fondos, marcas de agua) no se guardan.
+    let mut stores: Vec<structure::PageStore> = Vec::with_capacity(pages.len());
+    let mut unmarked: Vec<Vec<content::Item>> = Vec::with_capacity(pages.len());
+    let mut arts: Vec<Vec<content::Item>> = Vec::with_capacity(pages.len());
     for (i, page) in pages.iter().enumerate() {
         if i >= limits.max_pages {
             stopped = Some(format!("Se leyeron las primeras {} de {} paginas (limite de paginas).", i, pages.len()));
@@ -178,9 +310,21 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
         let data = pdf.page_content(page);
         let mut interp = Interp::new(&pdf, &fonts);
         interp.run(&data, &page.resources, IDENTITY);
+        interp.end_marked();
         annotations(&pdf, page, &mut interp);
         let text = interp.out;
         unmapped += text.unmapped;
+        let mut by_mcid: HashMap<i64, Vec<content::Item>> = HashMap::new();
+        let mut loose: Vec<content::Item> = Vec::new();
+        for it in text.items.iter().filter(|it| !it.artifact) {
+            match it.mcid {
+                Some(m) => by_mcid.entry(m).or_default().push(it.clone()),
+                None => loose.push(it.clone()),
+            }
+        }
+        stores.push(structure::PageStore { bbox: page.bbox, rotate: page.rotate, by_mcid });
+        unmarked.push(loose);
+        arts.push(text.items.iter().filter(|it| it.artifact && it.art != content::ART_OTRO).cloned().collect());
         let (lines, width, height) = layout::lines(text.items, page.bbox, page.rotate);
         let lines = layout::reorder_columns(lines, width);
         let page_text = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
@@ -210,8 +354,36 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
     }
     sizes.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     sizes.truncate(6);
-    for (i, lines) in page_lines.iter().enumerate() {
-        layout::blocks(lines, i as u32 + 1, body, &sizes, &mut doc.content);
+
+    // PDF etiquetado: los bloques salen del arbol de estructura. Si no hay arbol, o cubre menos
+    // de la mitad del texto (etiquetado roto o parcial), se usa la deduccion por posicion.
+    let page_index0: HashMap<u32, usize> = pages.iter().enumerate().filter(|(_, p)| p.obj != 0).map(|(i, p)| (p.obj, i)).collect();
+    let tagged = if tags {
+        structure::tree(&pdf, &page_index0).and_then(|(tree, mut warnings)| {
+            let (blocks, notes, more) = tagged_blocks(&tree, &stores, &unmarked, body, &sizes)?;
+            warnings.extend(more);
+            Some((blocks, notes, warnings))
+        })
+    } else {
+        None
+    };
+    match tagged {
+        Some((blocks, notes, warnings)) => {
+            doc.content = blocks;
+            doc.warnings.extend(warnings);
+            let (headers, footers) = running_texts(&arts, &stores);
+            for (key, list) in [("headers", headers), ("footers", footers), ("footnotes", notes)] {
+                if !list.is_empty() {
+                    doc.extras.push((key, list));
+                }
+            }
+            doc.meta.push(("tagged", Meta::Bool(true)));
+        }
+        None => {
+            for (i, lines) in page_lines.iter().enumerate() {
+                layout::blocks(lines, i as u32 + 1, body, &sizes, &mut doc.content);
+            }
+        }
     }
 
     let page_index: HashMap<u32, u32> = pages.iter().enumerate().filter(|(_, p)| p.obj != 0).map(|(i, p)| (p.obj, i as u32 + 1)).collect();

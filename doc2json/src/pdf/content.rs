@@ -41,7 +41,37 @@ pub struct Item {
     pub dx: f64,
     pub dy: f64,
     pub bold: bool,
+    /// PDF etiquetado: identificador del contenido marcado (MCID) al que pertenece el tramo.
+    pub mcid: Option<i64>,
+    /// PDF etiquetado: el tramo es un artefacto (encabezado, pie, numero de pagina), no contenido.
+    pub artifact: bool,
+    /// Tipo de artefacto: `ART_PAGINACION` (sin subtipo), `ART_ENCABEZADO`, `ART_PIE` u `ART_OTRO`.
+    pub art: u8,
+    /// Artefacto que envuelve al tramo (numero de su `BMC`/`BDC`, 0 = ninguno). Si ese artefacto
+    /// nunca se cierra con `EMC`, el tramo vuelve a ser contenido.
+    pub scope: u32,
 }
+
+/// Artefacto de paginacion sin subtipo declarado: se clasifica por su posicion en la pagina.
+pub const ART_PAGINACION: u8 = 0;
+pub const ART_ENCABEZADO: u8 = 1;
+pub const ART_PIE: u8 = 2;
+/// Diseno, fondo o pagina (lineas, marcas de agua): no es texto del documento.
+pub const ART_OTRO: u8 = 3;
+
+/// Contenido marcado abierto (`BMC`/`BDC` ... `EMC`).
+#[derive(Clone, Copy, Default)]
+struct Marked {
+    mcid: Option<i64>,
+    artifact: bool,
+    art: u8,
+    /// Artefacto mas externo abierto (0 = ninguno) y si este contenido es el que lo abrio.
+    scope: u32,
+    opens: bool,
+}
+
+/// Profundidad maxima del contenido marcado; lo que se abre mas adentro solo se cuenta.
+const MAX_MARKED: usize = 256;
 
 #[derive(Default)]
 pub struct PageText {
@@ -89,6 +119,15 @@ pub struct Interp<'p, 'a> {
     ligature: bool,
     /// Uniones del tramo actual entre letras ubicadas aparte con anchos de fuente exagerados.
     wide: Vec<Wide>,
+    /// Pila de contenido marcado; cruza los formularios invocados con `Do`.
+    marked: Vec<Marked>,
+    /// Contenido marcado abierto por encima de `MAX_MARKED` (sus `EMC` no tocan la pila).
+    overflow: usize,
+    /// Numero del ultimo artefacto abierto.
+    scopes: u32,
+    /// Largo de `marked` y valor de `overflow` al empezar el flujo en curso (pagina, anotacion o
+    /// formulario): un `EMC` que sobra no cierra lo que abrio quien invoco el flujo.
+    flow: (usize, usize),
 }
 
 /// Una union entre dos letras ubicadas aparte, con anchos de fuente mayores que los glifos reales:
@@ -317,7 +356,84 @@ impl<'p, 'a> Interp<'p, 'a> {
             glyph_font: 0,
             ligature: false,
             wide: Vec::new(),
+            marked: Vec::new(),
+            overflow: 0,
+            scopes: 0,
+            flow: (0, 0),
         }
+    }
+
+    /// Cierra el contenido marcado que haya quedado abierto (antes de las anotaciones, que van aparte).
+    pub fn end_marked(&mut self) {
+        self.flush();
+        self.close_unbalanced(0, 0, 0);
+    }
+
+    /// Cierra el contenido marcado que quedo abierto por encima de `base` al terminar un flujo
+    /// (pagina, anotacion o formulario). Un artefacto sin su `EMC` convertiria en artefacto todo lo
+    /// que sigue, y ese texto desapareceria del contenido: lo escrito dentro de un artefacto que
+    /// nunca se cerro vuelve a ser contenido (desde el tramo `from`, el primero de ese flujo).
+    fn close_unbalanced(&mut self, base: usize, overflow: usize, from: usize) {
+        self.overflow = overflow;
+        if self.marked.len() <= base {
+            return;
+        }
+        let open: Vec<u32> = self.marked[base..].iter().filter(|m| m.opens).map(|m| m.scope).collect();
+        self.marked.truncate(base);
+        if open.is_empty() {
+            return;
+        }
+        self.flush();
+        for it in self.out.items.iter_mut().skip(from) {
+            if it.scope != 0 && open.contains(&it.scope) {
+                it.artifact = false;
+                it.art = ART_PAGINACION;
+                it.scope = 0;
+            }
+        }
+    }
+
+    /// Contenido marcado vigente: el MCID mas interno y si alguno de los abiertos es artefacto.
+    fn marked_now(&self) -> Marked {
+        self.marked.last().copied().unwrap_or_default()
+    }
+
+    /// Abre contenido marcado. `props` es el diccionario de propiedades de `BDC` (en linea o por
+    /// nombre en /Properties); `BMC` no lo trae. Un MCID ausente hereda el del contenido que lo envuelve.
+    fn begin_marked(&mut self, tag: Option<&str>, props: Option<&Obj>, resources: &Dict) {
+        let parent = self.marked_now();
+        let props: Option<Dict> = match props {
+            Some(Obj::Dict(d)) => Some(d.clone()),
+            Some(Obj::Name(n)) => self.pdf.dict(resources, "Properties").and_then(|p| p.get(n).map(|o| self.pdf.resolve(o))).and_then(|o| o.as_dict().cloned()),
+            _ => None,
+        };
+        let mcid = props.as_ref().and_then(|p| p.get("MCID")).and_then(|v| v.as_i64()).or(parent.mcid);
+        let own = tag == Some("Artifact");
+        let artifact = parent.artifact || own;
+        // Solo el artefacto mas externo abre un ambito: los de adentro se cierran con el.
+        let opens = own && !parent.artifact;
+        let art = if own {
+            let field = |k: &str| props.as_ref().and_then(|p| p.get(k)).and_then(|v| v.as_name()).map(String::from);
+            match (field("Type").as_deref(), field("Subtype").as_deref()) {
+                (_, Some("Header")) => ART_ENCABEZADO,
+                (_, Some("Footer")) => ART_PIE,
+                (Some("Layout") | Some("Page") | Some("Background"), _) | (_, Some("Watermark")) => ART_OTRO,
+                _ => ART_PAGINACION,
+            }
+        } else {
+            parent.art
+        };
+        if self.marked.len() >= MAX_MARKED {
+            self.overflow += 1;
+            return;
+        }
+        let scope = if opens {
+            self.scopes = self.scopes.wrapping_add(1).max(1);
+            self.scopes
+        } else {
+            parent.scope
+        };
+        self.marked.push(Marked { mcid, artifact, art, scope, opens });
     }
 
     fn font(&self, resources: &Dict, name: &str) -> Option<Rc<Font>> {
@@ -416,6 +532,7 @@ impl<'p, 'a> Interp<'p, 'a> {
         tm[4] += total * tm[0];
         tm[5] += total * tm[1];
 
+        let mk = self.marked_now();
         for (text, sx, sy, ex, ey, tail) in glyphs {
             if let Some(cur) = self.cur.as_mut() {
                 // Distancia del nuevo glifo al final del tramo, a lo largo y a traves de la linea.
@@ -442,7 +559,8 @@ impl<'p, 'a> Interp<'p, 'a> {
                     }
                 }
                 let across = (-(sx - cur.x1) * cur.dy + (sy - cur.y1) * cur.dx).abs();
-                let same = across < 0.2 * size && (size - cur.size).abs() < 0.08 * size.max(cur.size) && cur.dx * dx + cur.dy * dy > 0.98 && cur.bold == font.bold;
+                // Un tramo no mezcla contenido marcado distinto: cada uno pertenece a otro elemento.
+                let same = across < 0.2 * size && (size - cur.size).abs() < 0.08 * size.max(cur.size) && cur.dx * dx + cur.dy * dy > 0.98 && cur.bold == font.bold && cur.mcid == mk.mcid && cur.artifact == mk.artifact && cur.art == mk.art;
                 if same && along > -0.3 * size && along < 1.2 * size {
                     // Un espacio dibujado dentro del glifo anterior no separa nada (algunos
                     // programas lo agregan tras una ligadura); un espacio de verdad avanza.
@@ -472,6 +590,9 @@ impl<'p, 'a> Interp<'p, 'a> {
                     cur.x1 = ex;
                     cur.y1 = ey;
                     cur.tail = tail;
+                    // Dos artefactos seguidos en la misma linea forman un tramo; queda el ambito del
+                    // ultimo, asi un artefacto sin cerrar devuelve el tramo entero al contenido.
+                    cur.scope = mk.scope;
                     self.glyph = (sx, sy);
                     self.glyph_font = font_id;
                     self.ligature = is_ligature(&text);
@@ -485,15 +606,19 @@ impl<'p, 'a> Interp<'p, 'a> {
             self.glyph = (sx, sy);
             self.glyph_font = font_id;
             self.ligature = is_ligature(&text);
-            self.cur = Some(Item { text, x0: sx, y0: sy, x1: ex, y1: ey, size, tail, dx, dy, bold: font.bold });
+            self.cur = Some(Item { text, x0: sx, y0: sy, x1: ex, y1: ey, size, tail, dx, dy, bold: font.bold, mcid: mk.mcid, artifact: mk.artifact, art: mk.art, scope: mk.scope });
         }
     }
 
     /// Ejecuta un flujo de contenido con los recursos dados.
     pub fn run(&mut self, content: &[u8], resources: &Dict, ctm: Matrix) {
         let mut st = State { ctm, font: None, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, ts: 0.0 };
+        let (base, overflow, from) = (self.marked.len(), self.overflow, self.out.items.len());
+        let outer = std::mem::replace(&mut self.flow, (base, overflow));
         self.exec(content, resources, &mut st);
+        self.flow = outer;
         self.flush();
+        self.close_unbalanced(base, overflow, from);
     }
 
     fn exec(&mut self, content: &[u8], resources: &Dict, st: &mut State) {
@@ -613,6 +738,18 @@ impl<'p, 'a> Interp<'p, 'a> {
                         self.xobject(resources, name, st);
                     }
                 }
+                "BMC" => self.begin_marked(args.first().and_then(|a| a.as_name()), None, resources),
+                "BDC" => self.begin_marked(args.first().and_then(|a| a.as_name()), args.get(1), resources),
+                "EMC" => {
+                    // Un EMC que sobra en este flujo se ignora: no cierra el contenido marcado de
+                    // la pagina que invoca al formulario.
+                    let (base, overflow) = self.flow;
+                    if self.overflow > overflow {
+                        self.overflow -= 1;
+                    } else if self.marked.len() > base {
+                        self.marked.pop();
+                    }
+                }
                 "BI" => {
                     // Imagen incrustada: se salta el diccionario y los datos binarios.
                     while let Some(t) = lx.object() {
@@ -671,9 +808,14 @@ impl<'p, 'a> Interp<'p, 'a> {
                 let res = self.pdf.dict(dict, "Resources").unwrap_or_else(|| resources.clone());
                 let mut inner = st.clone();
                 inner.ctm = mul(matrix, st.ctm);
+                // El contenido marcado de un formulario tiene que cerrarse dentro de el.
+                let (base, overflow, from) = (self.marked.len(), self.overflow, self.out.items.len());
+                let outer = std::mem::replace(&mut self.flow, (base, overflow));
                 self.depth += 1;
                 self.exec(&data, &res, &mut inner);
                 self.depth -= 1;
+                self.flow = outer;
+                self.close_unbalanced(base, overflow, from);
             }
             _ => {}
         }
