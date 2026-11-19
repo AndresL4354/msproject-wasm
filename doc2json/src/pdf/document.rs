@@ -53,6 +53,9 @@ pub struct Pdf<'a> {
 /// descifra), posicion y largo de sus datos, y cada filtro con sus parametros.
 type StreamKey = (Option<(u32, u16)>, usize, usize, Vec<(String, Parms)>);
 
+/// Filtros que puede encadenar un flujo.
+pub const MAX_FILTERS: usize = 8;
+
 /// Descifra todas las cadenas de un objeto.
 fn decrypt_strings(o: &mut Obj, c: &Crypt, num: u32, gen: u16) {
     match o {
@@ -530,16 +533,11 @@ impl<'a> Pdf<'a> {
         self.get(d, key).as_array().map(|a| a.iter().map(|o| self.resolve(o)).collect())
     }
 
-    /// Datos de un flujo con sus filtros aplicados. `None` si usa un filtro no soportado.
+    /// Datos de un flujo con sus filtros aplicados. `None` si usa un filtro no soportado o encadena
+    /// mas de `MAX_FILTERS`. Cada flujo se descomprime (y se descuenta del presupuesto) una sola
+    /// vez: lo descomprimido queda guardado y las siguientes veces se entrega eso mismo, sin
+    /// copiarlo. Un formulario dibujado en cientos de paginas cuesta lo mismo que dibujado una vez.
     pub fn stream_data(&self, obj: &Obj) -> Option<Rc<Vec<u8>>> {
-        self.decode_stream(obj).map(|(data, _)| data)
-    }
-
-    /// Como `stream_data`, e indica si el flujo ya se habia descomprimido antes en esta lectura.
-    /// Cada flujo se descomprime (y se descuenta del presupuesto) una sola vez: lo descomprimido
-    /// queda guardado y las siguientes veces se entrega eso mismo, sin copiarlo. Un formulario
-    /// dibujado en cientos de paginas cuesta lo mismo que dibujado una vez.
-    fn decode_stream(&self, obj: &Obj) -> Option<(Rc<Vec<u8>>, bool)> {
         let (dict, start, len) = match obj {
             Obj::Stream { dict, start, len } => (dict, *start, *len),
             _ => return None,
@@ -561,11 +559,14 @@ impl<'a> Pdf<'a> {
         let filter = self.get(dict, "Filter");
         let names: Vec<String> = match &*filter {
             Obj::Name(n) => vec![n.clone()],
+            // La cadena va en la clave de lo guardado, que dura toda la lectura: una de millones de
+            // filtros retendria memoria sin descontarla. Un PDF real encadena dos o tres.
+            Obj::Array(a) if a.len() > MAX_FILTERS => return None,
             Obj::Array(a) => a.iter().filter_map(|o| self.resolve(o).as_name().map(String::from)).collect(),
             _ => Vec::new(),
         };
         if names.is_empty() {
-            return Some((Rc::new(decrypt(raw)), false));
+            return Some(Rc::new(decrypt(raw)));
         }
         let parms_obj = match dict.get("DecodeParms").or_else(|| dict.get("DP")) {
             Some(o) => self.resolve(o),
@@ -588,7 +589,7 @@ impl<'a> Pdf<'a> {
         let parms: Vec<Parms> = (0..names.len()).map(parms_at).collect();
         let key: StreamKey = (crypt_id, start, len, names.into_iter().zip(parms).collect());
         if let Some(done) = self.decoded.borrow().get(&key) {
-            return done.clone().map(|data| (data, true));
+            return done.clone();
         }
         let mut data = Some(decrypt(raw));
         for (name, p) in &key.3 {
@@ -596,7 +597,7 @@ impl<'a> Pdf<'a> {
         }
         let data = data.map(Rc::new);
         self.decoded.borrow_mut().insert(key, data.clone());
-        data.map(|data| (data, false))
+        data
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -701,11 +702,20 @@ impl<'a> Pdf<'a> {
             Obj::Stream { .. } => vec![contents.clone()],
             _ => Vec::new(),
         };
+        // Flujos ya juntados en esta pagina, por la posicion y el largo de sus datos.
+        let mut seen = HashSet::new();
         for p in parts {
-            if let Some((d, repeated)) = self.decode_stream(&p) {
-                // Un flujo repetido (`/Contents [5 0 R 5 0 R ...]`) no se vuelve a descomprimir,
-                // pero cada copia que se junta aqui ocupa memoria: se descuenta del presupuesto.
-                let n = if repeated {
+            let at = match &*p {
+                Obj::Stream { start, len, .. } => (*start, *len),
+                _ => continue,
+            };
+            if let Some(d) = self.stream_data(&p) {
+                // Un flujo repetido en la misma pagina (`/Contents [5 0 R 5 0 R ...]`) no se vuelve
+                // a descomprimir, pero cada copia que se junta aqui ocupa memoria, tenga filtro o
+                // no: se descuenta del presupuesto. La primera copia de cada flujo no se descuenta
+                // (ya se desconto al descomprimirlo, o es parte del archivo) y se suelta al pasar a
+                // la pagina siguiente: un membrete en cada pagina no gasta mas por cada una.
+                let n = if !seen.insert(at) {
                     let n = crate::budget::room(d.len());
                     crate::budget::spend(n, n < d.len());
                     n

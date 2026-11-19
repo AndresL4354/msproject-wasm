@@ -671,6 +671,77 @@ fn un_flujo_repetido_en_el_contenido_de_una_pagina_descuenta_cada_copia() {
 }
 
 #[test]
+fn un_flujo_sin_filtro_repetido_en_una_pagina_descuenta_cada_copia() {
+    // Como la prueba anterior, con un flujo sin filtro de ~1 MB: no se descomprime, pero cada copia
+    // que se junta en el contenido de la pagina ocupa memoria igual.
+    let veces = 20;
+    let mut datos = b"1 0 0 1 0 -14 cm BT /F1 12 Tf 72 720 Td (Hola mundo) Tj ET ".to_vec();
+    datos.resize(datos.len() + 1_000_000, b' ');
+    let refs = vec!["5 0 R"; veces].join(" ");
+    let pagina = format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents [{}] >>", refs);
+    let objs = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec()),
+        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (4, pagina.into_bytes()),
+        (5, flujo("", &datos)),
+    ];
+    let archivo = ensamblar(&objs, true);
+    let copias = |d: &doc2json::Document| d.pages[0].text.matches("Hola mundo").count();
+    let d = doc2json::read(&archivo).unwrap();
+    assert_eq!(copias(&d), veces);
+    // La primera copia es parte del archivo y no se descuenta; las demas si: con 3 MB entran a lo
+    // mas cinco (la ultima en parte), con su aviso.
+    let d = doc2json::read_with_limits(&archivo, limites(3)).unwrap();
+    assert!(avisa(&d, 3), "{:?}", d.warnings);
+    assert!((1..=5).contains(&copias(&d)), "{}", copias(&d));
+}
+
+#[test]
+fn un_flujo_de_contenido_compartido_por_todas_las_paginas_se_descuenta_una_vez() {
+    // Un membrete de ~1 MB descomprimido que va en el `/Contents` de cada una de las 12 paginas
+    // (no como formulario), junto al flujo propio de cada una. Cada pagina junta su copia y la
+    // suelta al terminar: 3 MB alcanzan, como con el formulario.
+    let paginas = 12;
+    let kids: Vec<String> = (0..paginas).map(|i| format!("{} 0 R", 6 + 2 * i)).collect();
+    let mut objs: Vec<(usize, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), paginas).into_bytes()),
+        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (4, flujo("/Filter /FlateDecode", &zlib_bomba(1_000_000))),
+        (5, b"null".to_vec()),
+    ];
+    for i in 0..paginas {
+        let pagina = format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents [4 0 R {} 0 R] >>", 7 + 2 * i);
+        objs.push((6 + 2 * i, pagina.into_bytes()));
+        objs.push((7 + 2 * i, flujo("", b" ")));
+    }
+    let archivo = ensamblar(&objs, true);
+    let d = doc2json::read_with_limits(&archivo, limites(3)).unwrap();
+    assert!(!avisa(&d, 3), "{:?}", d.warnings);
+    assert_eq!(textos(&d), vec!["Hola mundo"; paginas]);
+}
+
+#[test]
+fn una_cadena_de_mas_de_ocho_filtros_no_se_lee() {
+    // La cadena de filtros va en la clave de lo que el lector guarda: tiene tope. Con ocho filtros
+    // el flujo se lee; con nueve, no (y la lectura sigue).
+    let anidado = |veces: usize| {
+        let mut d = TEXTO.to_vec();
+        for _ in 0..veces {
+            d = hex(&d);
+        }
+        (vec!["/ASCIIHexDecode"; veces].join(" "), d)
+    };
+    let (filtros, datos) = anidado(8);
+    let d = doc2json::read(&pdf_flujos(&[(&format!("/Filter [{}]", filtros), datos)])).unwrap();
+    assert_eq!(textos(&d), ["Hola mundo"]);
+    let (filtros, datos) = anidado(9);
+    let d = doc2json::read(&pdf_flujos(&[(&format!("/Filter [{}]", filtros), datos)])).unwrap();
+    assert_eq!(textos(&d), [""]);
+}
+
+#[test]
 fn flujos_con_la_misma_posicion_y_distinta_clave_no_comparten_cupo() {
     use doc2json::pdf::document::Pdf;
     use doc2json::pdf::object::{Dict, Obj};
