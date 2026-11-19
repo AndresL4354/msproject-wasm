@@ -393,6 +393,52 @@ fn etiqueta_larga_de_una_cita_no_se_copia_en_cada_nota() {
     assert_eq!(notas.len(), 200);
     assert!(notas.iter().all(|b| b.label.as_deref().map_or(0, |l| l.chars().count()) <= 32), "{:?}", notas[0].label.as_deref().map(str::len));
     assert_eq!(notas[0].text, "Nota 1.");
+    // Un texto tan largo no es el numero de una nota: queda en el parrafo como texto, sin
+    // corchetes que lo hagan pasar por una cita.
+    let parrafo = &d.content[0].text;
+    assert!(parrafo.starts_with("Texto que cita xxxx") && !parrafo.contains('['), "{}", &parrafo[..40]);
+}
+
+/// Una cadena de `niveles` notas, cada una dentro del rotulo (`Lbl`) de la anterior, colgando de un
+/// parrafo; la ultima trae su texto en /ActualText.
+fn notas_en_rotulos(niveles: usize) -> Vec<u8> {
+    let mut mas = vec!["<< /S /P /Pg 3 0 R /K [0 8 0 R] >>".to_string()];
+    for k in 0..niveles {
+        let (nota, rotulo) = (8 + 2 * k, 9 + 2 * k);
+        if k + 1 == niveles {
+            mas.push("<< /S /Note /ActualText (Nota final.) >>".into());
+        } else {
+            mas.push(format!("<< /S /Note /K [{} 0 R] >>", rotulo));
+            mas.push(format!("<< /S /Lbl /K [{} 0 R] >>", nota + 2));
+        }
+    }
+    etiquetado(&marcado(0, 72, 700, "Texto con nota."), "7 0 R", &mas)
+}
+
+#[test]
+fn el_limite_de_paginas_deja_fuera_lo_que_el_arbol_cita_de_las_demas() {
+    // El arbol cita contenido de la pagina 2, que el limite de paginas deja sin leer: ese elemento
+    // queda sin texto y la lectura sigue.
+    let mas = ["<< /S /Document /K [9 0 R 10 0 R] >>".to_string(), "<< /S /P /Pg 3 0 R /K 0 >>".into(), "<< /S /P /Pg 11 0 R /K 0 >>".into()];
+    let archivo = paginas(3, &marcado(0, 72, 700, "Primera pagina."), "<< /Type /StructTreeRoot /K 8 0 R >>", &mas);
+    let limites = doc2json::budget::Limits { max_pages: 1, ..Default::default() };
+    let d = doc2json::read_with_limits(&archivo, limites).unwrap();
+    assert!(etiquetado_si(&d));
+    assert_eq!(textos(&d), ["Primera pagina."]);
+    assert!(d.warnings.iter().any(|w| w.contains("limite de paginas")), "{:?}", d.warnings);
+}
+
+#[test]
+fn notas_anidadas_en_rotulos_se_guardan_una_vez() {
+    // Cada nota dentro del rotulo de otra se alcanzaba dos veces (al leer el rotulo y al leer la
+    // nota), y cada nivel duplicaba el trabajo: con 12 niveles la ultima nota salia 2.048 veces, y
+    // con 28 la lectura no terminaba.
+    let notas = |d: &doc2json::Document| extra(d, "footnotes").len();
+    let d = doc2json::read(&notas_en_rotulos(12)).unwrap();
+    assert_eq!(notas(&d), 1);
+    assert_eq!(extra(&d, "footnotes"), ["Nota final."]);
+    let d = a_tiempo(30, || doc2json::read(&notas_en_rotulos(28)).unwrap());
+    assert_eq!(notas(&d), 1);
 }
 
 #[test]

@@ -316,6 +316,10 @@ pub struct Builder<'s> {
     pub warnings: Vec<String>,
     /// Celdas de tabla que quedan en el presupuesto del documento.
     cells_left: usize,
+    /// Notas ya guardadas, por su direccion en el arbol. Una nota dentro del rotulo (`Lbl`) de otra
+    /// se alcanza dos veces, al leer el rotulo y al leer la nota entera: sin esto cada nivel de
+    /// anidamiento duplicaria el trabajo.
+    notes_done: HashSet<usize>,
 }
 
 /// Celda planificada de una tabla, antes de leer su texto.
@@ -345,7 +349,7 @@ fn clean(s: &str) -> String {
 
 impl<'s> Builder<'s> {
     pub fn new(pages: &'s [PageStore]) -> Builder<'s> {
-        Builder { pages, used: HashSet::new(), notes: Vec::new(), warnings: Vec::new(), cells_left: MAX_CELLS }
+        Builder { pages, used: HashSet::new(), notes: Vec::new(), warnings: Vec::new(), cells_left: MAX_CELLS, notes_done: HashSet::new() }
     }
 
     /// Texto de un grupo de contenido marcado. El orden es el de `/K` (el orden de lectura del
@@ -480,7 +484,9 @@ impl<'s> Builder<'s> {
     /// Guarda una nota al pie. Si trae su rotulo etiquetado (`Lbl`), se usa ese; si no, su texto
     /// suele empezar con el mismo numero que la cita, y se separa como rotulo.
     fn note(&mut self, node: &Node, label: Option<&str>) {
-        let label = label.filter(|l| l.chars().nth(MAX_LABEL).is_none());
+        if !self.notes_done.insert(node as *const Node as usize) {
+            return;
+        }
         let mut page = None;
         let lbl = Self::note_lbl(node).map(|l| self.text(l, &mut page).replace('\n', " ")).filter(|t| !t.is_empty());
         let text = self.text(node, &mut page).replace('\n', " ");
@@ -517,14 +523,23 @@ impl<'s> Builder<'s> {
         let t = self.flush(&mut lpend, page);
         lparts.push(t);
         let label = clean(&lparts.join(" "));
+        // Un texto de mas de `MAX_LABEL` caracteres no es el numero de una nota sino texto del
+        // enlace: queda en el parrafo como texto, sin corchetes, y las notas no lo toman de rotulo
+        // (cada una lo copiaria).
+        let long = label.chars().nth(MAX_LABEL).is_some();
         if !label.is_empty() {
             match parts.last_mut() {
+                Some(last) if long => {
+                    last.push(' ');
+                    last.push_str(&label);
+                }
                 Some(last) => last.push_str(&format!("[{}]", label)),
+                None if long => parts.push(label.clone()),
                 None => parts.push(format!("[{}]", label)),
             }
         }
         for n in notes {
-            self.note(n, if label.is_empty() { None } else { Some(&label) });
+            self.note(n, if label.is_empty() || long { None } else { Some(&label) });
         }
     }
 
