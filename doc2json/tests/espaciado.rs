@@ -144,6 +144,28 @@ fn anchos_exagerados_y_palabras_separadas_solo_por_posicion() {
 }
 
 #[test]
+fn anchos_exagerados_con_primera_palabra_corta() {
+    // Como arriba (1500 milesimas, avance 6, hueco 9), pero el tramo empieza con una palabra
+    // corta, y los huecos que entran antes de tener la escala no deben impedir los siguientes.
+    let linea = |palabras: &[&str]| {
+        let mut letras = Vec::new();
+        let mut x = 72.0;
+        for palabra in palabras {
+            for l in palabra.chars() {
+                letras.push((l, x));
+                x += 6.0;
+            }
+            x += 3.0;
+        }
+        texto(&fuente_con_anchos(&[1500; 26]), &letras_ubicadas(&letras))
+    };
+    assert_eq!(linea(&["THIS", "SELLER", "SHALL"]), "THIS SELLER SHALL");
+    // Con dos letras medidas no se distingue un espacio de una letra ancha: el primer hueco tras
+    // una palabra de tres letras queda pegado, y desde ahi se separa.
+    assert_eq!(linea(&["THE", "SELLER", "SHALL"]), "THESELLER SHALL");
+}
+
+#[test]
 fn miles_con_espacio_fino_no_son_espacios() {
     // Tres huecos iguales de 0,12 em entre cifras, con las demas uniones apretadas: agrupan miles.
     assert_eq!(texto(HELVETICA, "BT /F1 10 Tf 72 700 Td [(1)-120(234)-120(567)-120(890)]TJ ET"), "1234567890");

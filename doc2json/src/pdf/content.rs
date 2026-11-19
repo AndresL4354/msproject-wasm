@@ -129,15 +129,6 @@ fn with_spaces(text: &str, at: &[(usize, f64)]) -> String {
     out
 }
 
-/// Mediana de unos pocos valores.
-fn median(v: &[f64]) -> f64 {
-    let mut s = [0.0f64; MAX_SCALES];
-    let s = &mut s[..v.len()];
-    s.copy_from_slice(v);
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    s[s.len() / 2]
-}
-
 /// Desde este hueco (relativo al tamano de letra) hay un espacio entre palabras.
 const WORD_GAP: f64 = 0.15;
 /// Huecos entre este valor y `WORD_GAP` son dudosos: en una linea justificada apretada son
@@ -354,18 +345,21 @@ impl<'p, 'a> Interp<'p, 'a> {
                     } else if forward > 0.2 * size && forward < 1.2 * size {
                         // Anchos de la fuente mayores que los glifos reales: cada letra, ubicada
                         // aparte, parece montarse en la anterior aunque avanza. Va pegada a ella,
-                        // salvo que avance claramente mas que las demas. Si las letras ya vistas
-                        // del tramo avanzan todas en la misma proporcion de su ancho declarado
-                        // (al menos cuatro, dentro de un 5 %), esa escala da el ancho real de la
-                        // anterior, y lo que sobra es un espacio entre palabras. Si la proporcion
-                        // varia (anchos declarados iguales y letras reales de distinto ancho), una
-                        // letra ancha no se distingue de un espacio y no se separa nada.
+                        // salvo que avance claramente mas que las demas. La menor proporcion entre
+                        // avance real y ancho declarado de las letras ya vistas del tramo da el
+                        // ancho real de la anterior, y lo que sobra es un espacio entre palabras.
+                        // Se usa si la mayoria de las letras vistas (al menos tres) avanza en esa
+                        // proporcion, dentro de un 5 %: los huecos entre palabras que entraron
+                        // antes, al comienzo del tramo, quedan por encima y no la mueven. Si la
+                        // proporcion varia (anchos declarados iguales y letras reales de distinto
+                        // ancho), una letra ancha no se distingue de un espacio y no se separa nada.
                         let declared = (cur.x1 - self.glyph.0) * cur.dx + (cur.y1 - self.glyph.1) * cur.dy - cur.tail;
                         along = 0.0;
                         if declared > 0.0 {
-                            let (lo, hi) = self.scales.iter().fold((f64::MAX, 0.0f64), |(lo, hi), s| (lo.min(*s), hi.max(*s)));
-                            if self.scales.len() >= 4 && hi <= lo * 1.05 {
-                                let gap = forward - declared * median(&self.scales);
+                            let lo = self.scales.iter().fold(f64::MAX, |lo, s| lo.min(*s));
+                            let near = self.scales.iter().filter(|s| **s <= lo * 1.05).count();
+                            if near >= 3 && 2 * near > self.scales.len() {
+                                let gap = forward - declared * lo;
                                 if gap > WORD_GAP * size {
                                     along = gap;
                                 }
@@ -657,16 +651,47 @@ mod tests {
 
     #[test]
     fn ningun_operador_de_dibujo_tiene_rama_en_exec() {
-        // Una rama de `exec` para un operador de `drawing_op` nunca se ejecutaria.
+        // Una rama de `exec` para un operador de `drawing_op` nunca se ejecutaria. Las ramas se
+        // buscan por sus cadenas: las que, solas o unidas por `|`, van seguidas de `=>`, sin
+        // importar los saltos de linea ni la sangria.
         let src = include_str!("content.rs");
-        let exec = &src[src.find("fn exec(").unwrap()..src.find("fn xobject(").unwrap()];
-        let mut ramas = Vec::new();
-        for line in exec.lines().map(str::trim_start).filter(|l| l.starts_with('"') && l.contains("=>")) {
-            for op in line.split("=>").next().unwrap().split('|') {
-                ramas.push(op.trim().trim_matches('"').to_string());
+        let exec = src[src.find("fn exec(").unwrap()..src.find("fn xobject(").unwrap()].as_bytes();
+        let (mut ramas, mut patron) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < exec.len() {
+            match exec[i] {
+                b'/' if exec.get(i + 1) == Some(&b'/') => {
+                    // Un comentario, hasta el fin de la linea.
+                    while i < exec.len() && exec[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'"' => {
+                    let mut lit = Vec::new();
+                    i += 1;
+                    while exec[i] != b'"' {
+                        if exec[i] == b'\\' {
+                            i += 1;
+                        }
+                        lit.push(exec[i]);
+                        i += 1;
+                    }
+                    patron.push(String::from_utf8(lit).unwrap());
+                }
+                b'=' if exec.get(i + 1) == Some(&b'>') => {
+                    ramas.append(&mut patron);
+                    i += 1;
+                }
+                b'|' => {}
+                c if is_ws(c) => {}
+                _ => patron.clear(),
             }
+            i += 1;
         }
-        assert!(ramas.iter().any(|o| o == "Tj") && ramas.iter().any(|o| o == "Do"), "{:?}", ramas);
+        for op in ["BT", "Tj", "TD", "\"", "Do"] {
+            assert!(ramas.iter().any(|o| o == op), "{} no aparece en {:?}", op, ramas);
+        }
         for op in &ramas {
             assert!(!drawing_op(op.as_bytes()), "`{}` tiene una rama en exec pero drawing_op lo descarta", op);
         }
