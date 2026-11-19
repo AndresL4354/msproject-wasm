@@ -76,7 +76,7 @@ struct Reader<'a> {
 }
 
 /// Resuelve un destino de relacion respecto de la carpeta de la parte que lo referencia.
-fn resolve(dir: &str, target: &str) -> String {
+pub(crate) fn resolve(dir: &str, target: &str) -> String {
     if let Some(abs) = target.strip_prefix('/') {
         return abs.to_string();
     }
@@ -93,19 +93,29 @@ fn resolve(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-/// Relaciones de una parte: lista de (id, tipo, destino, es_externo).
-fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, String, bool)> {
+/// Largo maximo, en bytes, del destino de una relacion (una ruta o una URL). Cada referencia a
+/// una relacion copia su destino: uno de varios MB citado por muchas hojas o diapositivas
+/// multiplicaria la memoria antes de que actuen los topes. Un destino mas largo se descarta.
+const MAX_TARGET: usize = 4096;
+
+/// Relaciones de una parte: lista de (id, tipo, destino, es_externo). Se descartan las de destino
+/// mas largo que `MAX_TARGET`.
+pub(crate) fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, String, bool)> {
     let mut out = Vec::new();
     if let Some(src) = zip.read_text(rels_path) {
         let mut x = Xml::new(&src);
         while let Some(ev) = x.next() {
             if let Ev::Start(t) = ev {
                 if t.name.ends_with("Relationship") {
+                    let target = t.attr("Target").unwrap_or_default();
+                    if target.len() > MAX_TARGET {
+                        continue;
+                    }
                     let kind = t.attr("Type").unwrap_or_default();
                     out.push((
                         t.attr("Id").unwrap_or_default(),
                         kind.rsplit('/').next().unwrap_or("").to_string(),
-                        t.attr("Target").unwrap_or_default(),
+                        target,
                         t.attr("TargetMode").as_deref() == Some("External"),
                     ));
                 }
@@ -115,7 +125,7 @@ fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, Stri
     out
 }
 
-fn roman(mut n: i64, upper: bool) -> String {
+pub(crate) fn roman(mut n: i64, upper: bool) -> String {
     const T: [(i64, &str); 13] =
         [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")];
     if n <= 0 || n > 3999 {
@@ -135,13 +145,17 @@ fn roman(mut n: i64, upper: bool) -> String {
     }
 }
 
-/// a, b, ..., z, aa, bb, ... (asi numera Word).
-fn letters(n: i64, upper: bool) -> String {
-    if n <= 0 {
+/// Vueltas del abecedario que se escriben como letras; despues, cifras.
+const MAX_LETTER_ROUNDS: i64 = 30;
+
+/// a, b, ..., z, aa, bb, ... (asi numera Word). El numero viene del archivo (`w:start`,
+/// `startAt`): pasadas 30 vueltas (780) se escribe en cifras, para no armar cadenas enormes.
+pub(crate) fn letters(n: i64, upper: bool) -> String {
+    if n <= 0 || n > 26 * MAX_LETTER_ROUNDS {
         return n.to_string();
     }
     let c = (b'a' + ((n - 1) % 26) as u8) as char;
-    let s: String = std::iter::repeat(c).take(((n - 1) / 26 + 1) as usize).collect();
+    let s = c.to_string().repeat(((n - 1) / 26 + 1) as usize);
     if upper {
         s.to_uppercase()
     } else {
@@ -738,7 +752,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
+pub(crate) fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
     let (dir, file) = match part.rfind('/') {
         Some(i) => (&part[..i], &part[i + 1..]),
         None => ("", part),
@@ -748,7 +762,7 @@ fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
 }
 
 /// Propiedades del documento (docProps/core.xml y app.xml).
-fn properties(zip: &ZipArchive, doc: &mut Document) {
+pub(crate) fn properties(zip: &ZipArchive, doc: &mut Document) {
     let mut text = HashMap::new();
     for path in ["docProps/core.xml", "docProps/app.xml"] {
         if let Some(src) = zip.read_text(path) {
@@ -890,6 +904,10 @@ mod tests {
     fn numeros() {
         assert_eq!(roman(4, false), "iv");
         assert_eq!(roman(1994, true), "MCMXCIV");
+        assert_eq!(letters(27, false), "aa");
+        assert_eq!(letters(780, true), "Z".repeat(30));
+        assert_eq!(letters(781, false), "781");
+        assert_eq!(letters(i64::MAX, false), i64::MAX.to_string());
         assert_eq!(letters(1, false), "a");
         assert_eq!(letters(27, true), "AA");
         assert_eq!(format_number(3, "decimalZero"), "03");

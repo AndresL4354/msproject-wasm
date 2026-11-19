@@ -2,6 +2,7 @@
 //! Suficiente para abrir un .docx (que es un ZIP con archivos XML dentro).
 
 use crate::inflate::inflate;
+use std::collections::HashMap;
 
 pub struct Entry {
     pub name: String,
@@ -14,6 +15,15 @@ pub struct Entry {
 pub struct ZipArchive<'a> {
     data: &'a [u8],
     pub entries: Vec<Entry>,
+    /// Indice de cada nombre en minusculas (ASCII) a su primera entrada: `find` no recorre la
+    /// lista, que en un archivo malicioso puede tener 65.535 entradas.
+    index: HashMap<String, usize>,
+}
+
+/// Clave con que `find` busca una parte: sin barras iniciales y en minusculas (ASCII). Dos
+/// rutas con la misma clave son la misma parte; sirve para no leer dos veces la misma.
+pub fn part_key(name: &str) -> String {
+    name.trim_start_matches('/').to_ascii_lowercase()
 }
 
 fn u16_at(d: &[u8], o: usize) -> usize {
@@ -65,21 +75,38 @@ impl<'a> ZipArchive<'a> {
             });
             pos += 46 + name_len + u16_at(data, pos + 30) + u16_at(data, pos + 32);
         }
-        Ok(ZipArchive { data, entries })
+        let mut index = HashMap::with_capacity(entries.len());
+        for (i, e) in entries.iter().enumerate() {
+            // Vale la primera entrada con ese nombre. Al nombre de la entrada no se le quitan las
+            // barras iniciales: una entrada "/a.xml" no la encuentra ninguna busqueda.
+            index.entry(e.name.to_ascii_lowercase()).or_insert(i);
+        }
+        Ok(ZipArchive { data, entries, index })
     }
 
+    /// Entrada de una parte, sin distinguir mayusculas (ASCII) y sin las barras iniciales.
     pub fn find(&self, name: &str) -> Option<&Entry> {
-        let name = name.trim_start_matches('/');
-        self.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name))
+        self.index.get(&part_key(name)).map(|&i| &self.entries[i])
     }
 
-    pub fn read(&self, name: &str) -> Option<Vec<u8>> {
-        let e = self.find(name)?;
+    /// Posicion en el archivo de los datos de una entrada (tras su encabezado local).
+    fn data_start(&self, e: &Entry) -> Option<usize> {
         let o = e.offset;
         if self.data.get(o..o + 4) != Some(&[0x50, 0x4B, 0x03, 0x04]) {
             return None;
         }
-        let start = o + 30 + u16_at(self.data, o + 26) + u16_at(self.data, o + 28);
+        Some(o + 30 + u16_at(self.data, o + 26) + u16_at(self.data, o + 28))
+    }
+
+    /// Posicion de los datos de una parte. Varias entradas del directorio central, con nombres
+    /// distintos, pueden apuntar a los mismos datos: si la posicion coincide, son la misma parte.
+    pub fn data_at(&self, name: &str) -> Option<usize> {
+        self.data_start(self.find(name)?)
+    }
+
+    pub fn read(&self, name: &str) -> Option<Vec<u8>> {
+        let e = self.find(name)?;
+        let start = self.data_start(e)?;
         let raw = self.data.get(start..start.checked_add(e.packed)?)?;
         match e.method {
             0 => Some(raw.to_vec()),
