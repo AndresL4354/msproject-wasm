@@ -41,6 +41,19 @@ for (const nombre of ['procedimiento.docx', 'procedimiento.pdf']) {
   const objeto = await doc.docToJson(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
   comprobar(`${nombre}: objeto desde un ArrayBuffer`, objeto.type === nombre.split('.').pop() && objeto.content.length > 0);
   comprobar(`${nombre}: la salida completa trae mas datos`, (await doc.docToJsonText(bytes, { full: true })).length > texto.length);
+  const md = await doc.docToMarkdown(bytes);
+  comprobar(`${nombre}: Markdown identico al de ejemplo/`, md === (await readFile(path.join(ejemplo, `${nombre}.md`), 'utf8')));
+  const frag = await doc.docToChunks(bytes, { maxChars: 300 });
+  comprobar(`${nombre}: fragmentos con ruta de titulos y sin pasar el maximo`, frag.chunks.length >= 3 && frag.chunks.every((c) => c.chars <= 300 && Array.isArray(c.path)) && frag.chunks.some((c) => c.path.includes('Responsables')));
+}
+
+comprobar('docToChunks rechaza un tamano fuera de rango', /maxChars/.test(await mensajeDeError(doc.docToChunks(new Uint8Array(4), { maxChars: -1 }))));
+for (const malo of ['abc', NaN, 1.5, 0, '2000', 0x1000000]) {
+  comprobar(`docToChunks rechaza maxChars ${String(malo)}`, /maxChars/.test(await mensajeDeError(doc.docToChunks(new Uint8Array(4), { maxChars: malo }))));
+}
+{
+  const html = await doc.docToMarkdown(await readFile(path.join(ejemplo, 'procedimiento.docx')));
+  comprobar('docToMarkdown no deja etiquetas HTML del texto', !/<(?!br>|!-- pagina)/.test(html));
 }
 
 {

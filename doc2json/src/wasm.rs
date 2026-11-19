@@ -1,9 +1,21 @@
 //! Interfaz WebAssembly "a mano" (sin wasm-bindgen), con el mismo protocolo que mpp2xlsx:
 //!   1. `ptr = doc_alloc(n)` y copiar los bytes del documento en la memoria del modulo.
 //!   2. `estado = doc_convert(ptr, n, modo, mb, paginas, caracteres)`.
-//!      - `modo`: el byte bajo es la operacion y los bits 8 a 31 su parametro. Operaciones: 0 = JSON,
-//!        1 = JSON completo (reservadas: 2 = Markdown, 3 = fragmentos, 4 y 5 = JSON con imagenes);
-//!        otra da error.
+//!      - `modo`: el byte bajo es la operacion y los bits 8 a 31 su parametro
+//!        (`operacion | (parametro << 8)`):
+//!
+//!      | operacion | salida                     | parametro                               |
+//!      |-----------|----------------------------|-----------------------------------------|
+//!      | 0         | JSON                       | -                                       |
+//!      | 1         | JSON completo              | -                                       |
+//!      | 2         | Markdown                   | -                                       |
+//!      | 3         | fragmentos en JSON         | tamano maximo en caracteres (0 = 2000)  |
+//!      | 4         | JSON con imagenes          | lado minimo de las imagenes             |
+//!      | 5         | JSON completo con imagenes | lado minimo de las imagenes             |
+//!
+//!      Este modulo implementa 0 a 3; 4 y 5 quedan reservadas para la extraccion de imagenes.
+//!      Una operacion que el modulo no conoce da error ("Modo de conversion desconocido."), nunca
+//!      otra salida.
 //!      - `mb`, `paginas`, `caracteres`: limites de recursos de esta conversion (datos
 //!        descomprimidos en MB, paginas de PDF, caracteres de texto); 0 = valor por defecto. Van
 //!        en cada llamada y no quedan para la siguiente. Quien llama con solo tres argumentos (un
@@ -44,8 +56,18 @@ pub unsafe extern "C" fn doc_free(ptr: *mut u8, len: usize) {
 pub unsafe extern "C" fn doc_convert(ptr: *const u8, len: usize, mode: u32, mb: u32, pages: u32, chars: u32) -> u32 {
     let input: &[u8] = if ptr.is_null() || len == 0 { &[] } else { std::slice::from_raw_parts(ptr, len) };
     let limits = crate::budget::Limits::from_units(mb, pages, chars);
+    let read = || crate::read_with_limits(input, limits);
     let result = match mode & 0xff {
-        op @ (0 | 1) => crate::read_with_limits(input, limits).map(|d| crate::doc::to_json(&d, op == 1)),
+        op @ (0 | 1) => read().map(|d| crate::doc::to_json(&d, op == 1)),
+        2 => read().map(|d| crate::markdown::to_markdown(&d)),
+        3 => read().map(|d| {
+            let size = match (mode >> 8) as usize {
+                0 => crate::markdown::DEFAULT_CHUNK,
+                n => n,
+            };
+            crate::markdown::chunks_json(&d, &crate::markdown::chunks(&d, size))
+        }),
+        // 4 y 5 (imagenes) y cualquier otra: no se adivina otra salida.
         _ => Err("Modo de conversion desconocido.".to_string()),
     };
     let (status, bytes) = match result {

@@ -29,9 +29,17 @@ target\release\doc2json.exe informe.pdf
 target\release\doc2json.exe contrato.docx salida.json --full
 ```
 
+```bash
+target\release\doc2json.exe informe.pdf --markdown
+```
+
+```bash
+target\release\doc2json.exe manual.docx --fragmentos=1500
+```
+
 **En una página web:** copia a tu proyecto los archivos de `web/` y llama a los cargadores como se muestra en [Integración en una web](#integración-en-una-web-vercel--supabase). La conversión ocurre en el navegador; el archivo no se sube a ningún lado.
 
-En `ejemplo/` hay un procedimiento de muestra en `.docx` y `.pdf` con sus JSON.
+En `ejemplo/` hay un procedimiento de muestra en `.docx` y `.pdf` con sus JSON y su Markdown.
 
 ---
 
@@ -93,6 +101,27 @@ Los dos formatos salen con **la misma forma**, así una sola tabla en la base de
 | `warnings` | Avisos: páginas escaneadas sin texto, índice reconstruido, fuentes ilegibles. |
 
 Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de cada bloque, los tramos con formato (negrita, cursiva, enlaces) y, en PDF, cada línea con su posición y tamaño de letra.
+
+### Markdown y fragmentos (para modelos de lenguaje y búsqueda)
+
+Los mismos bloques salen también como **Markdown** (`--markdown`, `docToMarkdown`): títulos con `#` según su nivel, listas con su numeración o viñeta e indentación, tablas GFM (las celdas combinadas dejan su lugar vacío, sin filas ni columnas en blanco), notas al pie como `[^1]` y, en Word, **negrita**, *cursiva* y enlaces. En PDF cada página empieza con `<!-- pagina N -->`, para citar de dónde sale cada parte.
+
+El texto del documento **no se vuelve HTML, enlaces, títulos ni listas** (`*x*`, `_x_` y `~~x~~` no se escapan y pueden salir como énfasis): se escapan `<`, `[`, `]`, `` ` ``, las entidades (`&lt;`), las barras invertidas y lo que al inicio de una línea (también después de un `\r` suelto) abriría un título, una cita, una lista o una línea horizontal; una cita de nota (`[^1]`) no se vuelve enlace ni definición con lo que la sigue. Los enlaces de Word solo salen si son `http`, `https` o `mailto`; los demás (`javascript:`, `data:`, `file:`…) quedan como texto. Este escape evita que el texto del documento se lea como marca, pero **no reemplaza a un sanitizador**: si el Markdown se va a mostrar como HTML, conviértalo con un renderizador que no deje pasar HTML y limpie el resultado antes de insertarlo en la página. Una celda no ocupa más de 64 columnas y una tabla no pasa de 64: lo que sobra se junta en la última columna, sin perder texto.
+
+Y como **fragmentos** listos para indexar o enviar a un modelo (`--fragmentos[=N]`, `docToChunks`), de hasta N caracteres (2000 por defecto, unos 500 tokens en castellano):
+
+```json
+{ "type": "docx", "metadata": { … }, "page_count": 30,
+  "chunks": [ { "index": 4, "path": ["3. DEFINICIONES Y TÉRMINOS"], "chars": 1821, "text": "**AST**\n\n- Análisis de Seguridad en el Trabajo. …" } ] }
+```
+
+- Cada fragmento empieza en un título cuando se puede y trae en `path` los títulos de las secciones que lo contienen; en PDF, `pages` con la primera y la última página.
+- Nunca corta un bloque, salvo que el bloque solo sea más grande que el fragmento: un párrafo se corta al final de una oración, una tabla por filas repitiendo el encabezado, una fila con una celda enorme en filas de continuación con las mismas columnas, y un título muy largo como un párrafo.
+- Ningún fragmento pasa el tamaño pedido (200 caracteres como mínimo). Las pruebas lo comprueban con tablas muy anchas, filas y títulos más largos que el fragmento y documentos armados al azar.
+- Una sección más corta que 200 caracteres se junta con la siguiente; un título queda con el bloque que lo sigue: si ese bloque no cabe, el título pasa con él al fragmento siguiente.
+- En `path` cada título va en una línea y con 200 caracteres como máximo (el texto del fragmento lo trae completo).
+- Muchas plantillas escriben los títulos de sección como una tabla de una sola celda ("1. OBJETIVO"): se tratan como título, con el nivel que dé su numeración, si el texto está numerado ("3.2 Responsables") o en mayúsculas. Un recuadro con una advertencia ("Use casco en todo momento") sigue siendo tabla.
+- Las notas al pie van en un fragmento final con ruta `["Notas"]`.
 
 ### Word (.docx)
 
@@ -165,11 +194,15 @@ async function convertirPlan(file: File) {
 
 ```tsx
 'use client';
-import { init, docToJson } from '@/lib/doc2json';
+import { init, docToJson, docToMarkdown, docToChunks } from '@/lib/doc2json';
 
 async function convertirDocumento(file: File) {
   await init('/doc2json.wasm');
-  return docToJson(new Uint8Array(await file.arrayBuffer()));   // { type, metadata, content, text, ... }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const doc = await docToJson(bytes);                            // { type, metadata, content, text, ... }
+  const md = await docToMarkdown(bytes);                         // Markdown con tablas GFM
+  const { chunks } = await docToChunks(bytes, { maxChars: 1500 }); // [{ path, pages, text, ... }]
+  return { doc, md, chunks };
 }
 ```
 
@@ -215,6 +248,21 @@ const doc = await docToJson(bytes, { limits: { maxDecompressedMB: 32, maxPages: 
 Los límites se pasan en cada conversión y no quedan para la siguiente. El límite de texto se aplica mientras se lee un `.docx`, no solo al final: lo que no cabe ni siquiera se junta en memoria. Un `doc2json.wasm` anterior a esta versión no admite límites; con él, pedir `limits` da error en vez de ignorarlos.
 
 Los valores por defecto son holgados: en 900 documentos de oficina reales el máximo fue 40 MB descomprimidos (mediana 0,7 MB), 572 páginas y 2,5 millones de caracteres, y con ellos la salida es idéntica byte a byte a la de una lectura sin límites. Con un `.docx` de 1,5 MB que descomprime 250 MB, la memoria máxima del proceso pasa de 2,9 GB (sin presupuesto) a 875 MB por defecto y a 464 MB con `maxDecompressedMB: 32`. En Rust: `doc2json::read_with_limits(bytes, Limits { … })`.
+
+### El `.wasm` sin el cargador
+
+Quien llame al módulo directamente (sin `doc2json.js`) usa `doc_convert(ptr, largo, modo, mb, páginas, caracteres)`; los tres últimos son los límites de recursos de esa conversión (0 = valor por defecto). El byte bajo de `modo` es la operación y los bits 8 a 31 su parámetro (`operación | (parámetro << 8)`):
+
+| Operación | Salida | Parámetro |
+|---|---|---|
+| 0 | JSON | — |
+| 1 | JSON completo | — |
+| 2 | Markdown | — |
+| 3 | Fragmentos en JSON | tamaño máximo en caracteres (0 = 2000) |
+| 4 | JSON con imágenes | lado mínimo de las imágenes (reservada) |
+| 5 | JSON completo con imágenes | lado mínimo de las imágenes (reservada) |
+
+Una operación que el módulo no conoce da error («Modo de conversion desconocido.»), nunca otra salida. El protocolo completo está al inicio de `doc2json/src/wasm.rs`.
 
 ### Guardar documentos en Supabase
 
@@ -446,6 +494,7 @@ doc2json/src/           doc2json
     layout.rs           de letras con coordenadas a líneas, párrafos y tablas
     structure.rs        PDF etiquetado: árbol de estructura a títulos, listas, tablas y notas
   doc.rs                modelo común de documento y salida JSON
+  markdown.rs           Markdown (tablas GFM, notas) y fragmentos por sección
   symbols.rs            fuentes Symbol y Wingdings a Unicode
 doc2json/tests/
   ejemplo.rs            pruebas de punta a punta con los archivos de ejemplo/
