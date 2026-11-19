@@ -36,6 +36,10 @@ use std::rc::Rc;
 /// este tope los identificadores tienen a lo sumo 20 bits.
 const MAX_SYMBOLS: usize = 1 << 20;
 
+/// Tope de segmentos de un flujo (o de sus globales). Una pagina real tiene unos pocos (pagina,
+/// diccionarios, regiones, fin); sin tope, cada 11 bytes del archivo arman uno.
+const MAX_SEGMENTS: usize = 1 << 16;
+
 /// Lecturas permitidas despues del final de los datos (o de la marca de fin). Un flujo bien
 /// formado solo necesita unas pocas; pasado esto, los datos se terminaron antes de tiempo.
 const MQ_TAIL: u32 = 256;
@@ -893,6 +897,9 @@ fn segments(d: &[u8]) -> Result<Vec<Segment<'_>>, String> {
             (full.min(d.len() as u64) as usize, None)
         };
         let data_end = if rows.is_some() { end - 4 } else { end };
+        if out.len() == MAX_SEGMENTS {
+            return Err("JBIG2: demasiados segmentos.".into());
+        }
         out.push(Segment { number, kind, refs, data: &d[i..data_end], rows, cut });
         i = end;
         if kind == 51 {
@@ -1061,6 +1068,9 @@ fn decode_with(data: &[u8], globals: Option<&[u8]>, width: usize, height: usize,
                     let stride = ccitt::row_bytes(w.max(1));
                     budget.reserve((stride as u64).saturating_mul(h as u64))?;
                     let mut b = budget.bitmap(w, h, 0)?;
+                    // Cada llamada arma ademas las tablas del decodificador de fax, aunque la region
+                    // sea de 0 x 0: se cobran como trabajo.
+                    budget.spend(ccitt::TABLE_ENTRIES)?;
                     let p = ccitt::Params { k: -1, columns: w, rows: h, byte_align: false, end_of_block: true };
                     let (rows, decoded) = ccitt::decode(&s.data[18.min(s.data.len())..], &p, h)?;
                     // Las filas que faltan quedarian en blanco sin aviso: se informa.
@@ -2123,6 +2133,33 @@ mod tests {
         let mut s = segment(0, 48, &page_info(64, 64));
         s.extend(segment(1, 38, &d));
         assert!(decode(&s, None, 64, 64).unwrap_err().contains("memoria"));
+    }
+
+    #[test]
+    fn regiones_mmr_vacias_se_cobran() {
+        // 5.000 regiones MMR de 0 x 0: no decodifican nada, pero cada una arma las tablas del
+        // decodificador de fax. Antes no se cobraban y pasaban todas en una pagina de 1 x 1.
+        let mut d = Vec::new();
+        for v in [0u32, 0, 0, 0] {
+            d.extend_from_slice(&v.to_be_bytes());
+        }
+        d.extend_from_slice(&[0, 1]);
+        let mut s = segment(0, 48, &page_info(1, 1));
+        for n in 1..=5000 {
+            s.extend(segment(n, 38, &d));
+        }
+        assert!(decode(&s, None, 1, 1).unwrap_err().contains("calculo"));
+    }
+
+    #[test]
+    fn segmentos_con_tope() {
+        // 70.000 segmentos vacios (11 bytes cada uno, de un tipo que se ignora): antes se armaban
+        // todos.
+        let mut s = segment(0, 48, &page_info(1, 1));
+        for n in 1..=70_000 {
+            s.extend(segment(n, 52, &[]));
+        }
+        assert!(decode(&s, None, 1, 1).unwrap_err().contains("demasiados segmentos"));
     }
 
     /// Dibujo con ruido (xorshift): sus contextos no se vuelven predecibles, y un flujo cortado

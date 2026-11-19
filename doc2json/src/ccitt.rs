@@ -79,6 +79,10 @@ const EXTENDED_MAKEUP: [&str; 13] = [
 
 const PEEK: u32 = 13;
 
+/// Entradas de las dos tablas de busqueda (blanco y negro) que arma cada llamada a `decode`: un
+/// trabajo fijo, aunque no haya filas que decodificar.
+pub const TABLE_ENTRIES: u64 = 2 << PEEK;
+
 /// Tabla de busqueda por los proximos 13 bits: (largo de corrida, bits del codigo); 0 bits = invalido.
 type Table = Vec<(u16, u8)>;
 

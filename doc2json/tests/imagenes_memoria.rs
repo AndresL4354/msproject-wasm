@@ -250,4 +250,31 @@ fn imagenes_fabricadas_no_agotan_la_memoria() {
     assert_eq!(d.images[0].format, "tiff");
     assert!(d.images[0].note.as_deref().unwrap_or("").contains("16 de 10000000"), "{:?}", d.images[0].note);
     assert!(usado < 4 * MB, "fax de 8 x 10 millones con 2 bytes uso {} MB", usado / MB);
+
+    // 11. 200 imagenes JBIG2 con los mismos `JBIG2Globals`, de 1 MB: se leen una sola vez (antes,
+    //     una vez por imagen, 200 MB). Se compara con unos globales de 1 byte.
+    let segmento = |kind: u8, datos: &[u8]| {
+        let mut s = vec![0, 0, 0, 0, kind, 0, 1];
+        s.extend_from_slice(&(datos.len() as u32).to_be_bytes());
+        s.extend_from_slice(datos);
+        s
+    };
+    let mut pagina_1x1 = Vec::new();
+    for v in [1u32, 1, 300, 300] {
+        pagina_1x1.extend_from_slice(&v.to_be_bytes());
+    }
+    pagina_1x1.extend_from_slice(&[0, 0, 0]);
+    let jbig2 = segmento(48, &pagina_1x1);
+    let globales = |datos: &[u8]| {
+        muchas(
+            200,
+            |_| stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 205 0 R >>", &jbig2),
+            vec![stream("", &segmento(52, datos))],
+        )
+    };
+    let (_, base) = pedido(|| doc2json::read_with_images(&globales(&[0])).unwrap());
+    let bytes = globales(&vec![0; MB]);
+    let (d, total) = pedido(|| doc2json::read_with_images(&bytes).unwrap());
+    assert!(d.images.iter().all(|i| i.data.is_some()), "{:?}", d.images[0].note);
+    assert!(total < base + 10 * MB, "extraer 200 imagenes con unos JBIG2Globals compartidos pidio {} MB (con unos de 1 byte, {} MB)", total / MB, base / MB);
 }

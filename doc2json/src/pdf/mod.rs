@@ -240,7 +240,7 @@ pub fn read_opts(bytes: &[u8], extract: Option<usize>) -> Result<Document, Strin
     if let Some(limit) = extract {
         let mut budget = Budget::new(limit);
         // Paletas y mascaras compartidas, y el trabajo de decodificacion que le queda al documento.
-        let mut shared = images::Shared::new(&objs);
+        let mut shared = images::Shared::new(&pdf, &objs);
         let mut skipped_work = 0usize;
         for (img, obj) in doc.images.iter_mut().zip(&objs) {
             // Cada imagen se cobra antes de decodificarla, por lo que declara, a los dos topes del

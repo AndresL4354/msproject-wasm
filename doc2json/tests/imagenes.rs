@@ -828,6 +828,42 @@ fn tope_de_trabajo_de_decodificacion_por_documento() {
     assert!(d.images.iter().all(|i| i.data.is_some()), "{:?}", d.images.iter().find(|i| i.data.is_none()).map(|i| &i.note));
 }
 
+/// 25 faxes de 10.000 x 10.000 que no dan nada, con la cadena de filtros `filters`: cuales quedan
+/// con la nota del tope de trabajo.
+fn faxes_topados(filters: &str) -> Vec<usize> {
+    let n = 25;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let fax = format!("/Subtype /Image /Width 10000 /Height 10000 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter {} /DecodeParms << /K -1 /Columns 10000 >>", filters);
+    let imgs = (0..n).map(|_| stream(&fax, &[0, 0])).collect();
+    let d = read_with_images(&pdf_con(&names, &content, imgs)).unwrap();
+    (0..n).filter(|&i| d.images[i].note.as_deref().unwrap_or("").contains("tope de trabajo")).collect()
+}
+
+#[test]
+fn cada_pasada_de_fax_se_cobra() {
+    // Con dos faxes en la cadena, cada imagen decodificaria dos veces: se cobran 200 millones de
+    // pixeles por imagen y entran 10 (antes, 20, con un solo cobro por imagen).
+    assert_eq!(faxes_topados("[/CCITTFaxDecode /CCITTFaxDecode]"), (10..25).collect::<Vec<_>>());
+}
+
+#[test]
+fn fax_antes_de_un_jpeg_se_cobra() {
+    // El fax se decodifica antes de llegar al JPEG: se cobra igual. Antes el JPEG dejaba el costo
+    // en 0 y no se topaba ninguna.
+    assert_eq!(faxes_topados("[/CCITTFaxDecode /DCTDecode]"), (20..25).collect::<Vec<_>>());
+}
+
+#[test]
+fn cadena_de_filtros_con_tope() {
+    // 300 faxes encadenados: antes cada uno volvia a decodificar la imagen con un solo cobro.
+    let chain = format!("[{}]", "/CCF ".repeat(300));
+    let fax = format!("/Subtype /Image /Width 8 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter {} /DecodeParms << /K -1 /Columns 8 >>", chain);
+    let d = read_with_images(&pdf_con("/I0 5 0 R ", "/I0 Do ", vec![stream(&fax, &[0, 0])])).unwrap();
+    assert!(d.images[0].data.is_none());
+    assert!(d.images[0].note.as_deref().unwrap_or("").contains("300 filtros"), "{:?}", d.images[0].note);
+}
+
 #[test]
 fn topes_de_imagenes_distintas_y_de_lugares() {
     // 10.001 imagenes distintas: la ultima no figura, con aviso.
