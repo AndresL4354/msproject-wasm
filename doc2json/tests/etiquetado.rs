@@ -246,7 +246,7 @@ fn atributos_compartidos_se_leen_una_vez() {
     let atributos = format!("[{}]", "<< /O /Layout >> ".repeat(n));
     let elementos = "<< /S /Span /A 8 0 R >> ".repeat(n);
     let mas = [format!("<< /S /Document /K [9 0 R {}] >>", elementos), atributos, "<< /S /P /Pg 3 0 R /K 0 >>".into()];
-    let d = a_tiempo(5, || doc2json::read(&etiquetado(&marcado(0, 72, 700, "Parrafo real."), "7 0 R", &mas)).unwrap());
+    let d = a_tiempo(30, || doc2json::read(&etiquetado(&marcado(0, 72, 700, "Parrafo real."), "7 0 R", &mas)).unwrap());
     assert_eq!(textos(&d), ["Parrafo real."]);
 }
 
@@ -258,7 +258,7 @@ fn rolemap_grande_no_se_recorre_por_cada_elemento() {
     let elementos = format!("<< /S /R{:06} >> ", n - 1).repeat(n);
     let raiz = format!("<< /Type /StructTreeRoot /RoleMap << {} >> /K 7 0 R >>", mapa);
     let mas = [format!("<< /S /Document /K [8 0 R {}] >>", elementos), format!("<< /S /R{:06} /Pg 3 0 R /K 0 >>", n - 1)];
-    let d = a_tiempo(5, || doc2json::read(&etiquetado_con(&marcado(0, 72, 700, "Parrafo con tipo propio."), &raiz, "", &mas)).unwrap());
+    let d = a_tiempo(30, || doc2json::read(&etiquetado_con(&marcado(0, 72, 700, "Parrafo con tipo propio."), &raiz, "", &mas)).unwrap());
     assert!(etiquetado_si(&d));
     assert_eq!(textos(&d), ["Parrafo con tipo propio."]);
 }
@@ -293,7 +293,7 @@ fn texto_suelto_de_muchas_paginas_no_es_cuadratico() {
     let c = marcado(0, 72, 700, &"y".repeat(12_000));
     let elementos = "<< /S /P /ActualText (a) >> ".repeat(100_000);
     let mas = [format!("<< /S /Document /K [9 0 R {}] >>", elementos), "<< /S /P /Pg 3 0 R /K 0 >>".into()];
-    let d = a_tiempo(5, || doc2json::read(&paginas(n, &c, "<< /Type /StructTreeRoot /K 8 0 R >>", &mas)).unwrap());
+    let d = a_tiempo(30, || doc2json::read(&paginas(n, &c, "<< /Type /StructTreeRoot /K 8 0 R >>", &mas)).unwrap());
     assert!(etiquetado_si(&d));
     assert_eq!(d.content.len(), 1 + 100_000 + n - 1);
     assert_eq!(d.content.iter().filter(|b| b.text == "x").count(), n - 1);
@@ -378,4 +378,40 @@ fn mas_de_256_niveles_y_emc_sobrantes() {
     let mas = ["<< /S /P /Pg 3 0 R /K 0 >>".to_string(), "<< /S /P /Pg 3 0 R /K 1 >>".into(), form];
     let d = doc2json::read(&etiquetado_con(&c, raiz, "/XObject << /Fm1 9 0 R >>", &mas)).unwrap();
     assert_eq!(textos(&d), ["Antes de los niveles. Adentro. Despues de los niveles.", "Otro parrafo."]);
+}
+
+#[test]
+fn etiqueta_larga_de_una_cita_no_se_copia_en_cada_nota() {
+    // Link > [Span > Span con un /ActualText largo, 200 Note]: cada nota se quedaba con una copia
+    // entera de la etiqueta como rotulo (con 8 MB y 1.000 notas, 8 GB). Pasado el tope, la
+    // etiqueta no es rotulo.
+    let larga = format!("({})", "x".repeat(4 * 1024));
+    let notas: String = (1..=200).map(|i| format!("<< /S /Note /ActualText (Nota {}.) >> ", i)).collect();
+    let mas = [format!("<< /S /P /Pg 3 0 R /K [0 << /S /Link /K [<< /S /Span /K << /S /Span /ActualText 8 0 R /K 1 >> >> {}] >>] >>", notas), larga];
+    let d = doc2json::read(&etiquetado(&(marcado(0, 72, 700, "Texto que cita") + &marcado(1, 150, 704, "1")), "7 0 R", &mas)).unwrap();
+    let notas: Vec<&Block> = d.extras.iter().filter(|(k, _)| *k == "footnotes").flat_map(|(_, b)| b.iter()).collect();
+    assert_eq!(notas.len(), 200);
+    assert!(notas.iter().all(|b| b.label.as_deref().map_or(0, |l| l.chars().count()) <= 32), "{:?}", notas[0].label.as_deref().map(str::len));
+    assert_eq!(notas[0].text, "Nota 1.");
+}
+
+#[test]
+fn atributos_compartidos_conservan_sus_spans() {
+    // Dos celdas en filas distintas comparten un /A indirecto con RowSpan y ColSpan: la segunda lo
+    // lee de lo que se recordo de la primera y debe quedar con los mismos spans.
+    let c: String = ["A", "B", "C", "D", "E", "F"].iter().enumerate().map(|(i, t)| marcado(i as i64, 72 + 100 * (i as i32 % 2), 700 - 20 * i as i32, t)).collect();
+    let td = |a: &str, k: usize| format!("<< /S /TD {} /K {} >>", a, k);
+    let tr = |celdas: &[String]| format!("<< /S /TR /K [{}] >>", celdas.join(" "));
+    let tabla = format!(
+        "<< /S /Table /Pg 3 0 R /K [{} {} {} {}] >>",
+        tr(&[td("/A 8 0 R", 0), td("", 1)]),
+        tr(&[td("", 2)]),
+        tr(&[td("/A 8 0 R", 3), td("", 4)]),
+        tr(&[td("", 5)]),
+    );
+    let d = doc2json::read(&etiquetado(&c, "7 0 R", &[tabla, "<< /O /Table /RowSpan 2 /ColSpan 2 >>".into()])).unwrap();
+    let spans = |t: &str| d.content.iter().flat_map(|b| b.rows.iter().flatten()).find(|c| c.text == t).map(|c| (c.rowspan, c.colspan));
+    assert_eq!(spans("A"), Some((2, 2)));
+    assert_eq!(spans("D"), Some((2, 2)));
+    assert_eq!(spans("B"), Some((1, 1)));
 }

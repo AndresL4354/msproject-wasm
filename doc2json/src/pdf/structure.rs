@@ -33,6 +33,11 @@ const MAX_TEXT: usize = 16 << 20;
 /// ni se busca en `/RoleMap`.
 const MAX_NAME: usize = 127;
 
+/// Largo maximo, en caracteres, del rotulo que una nota toma de su cita: la cita de una nota mide
+/// unos pocos caracteres, y una etiqueta mas larga (un `/ActualText` o el texto de la pagina) se
+/// copiaria en cada nota que la comparte.
+const MAX_LABEL: usize = 32;
+
 /// Limites de las tablas: columnas de una fila y celdas de una tabla y de todo el documento. Las
 /// celdas combinadas se rellenan en las filas de abajo, asi que unos pocos atributos `RowSpan` y
 /// `ColSpan` pueden pedir millones de celdas; una tabla que se pasa va como parrafos.
@@ -475,6 +480,7 @@ impl<'s> Builder<'s> {
     /// Guarda una nota al pie. Si trae su rotulo etiquetado (`Lbl`), se usa ese; si no, su texto
     /// suele empezar con el mismo numero que la cita, y se separa como rotulo.
     fn note(&mut self, node: &Node, label: Option<&str>) {
+        let label = label.filter(|l| l.chars().nth(MAX_LABEL).is_none());
         let mut page = None;
         let lbl = Self::note_lbl(node).map(|l| self.text(l, &mut page).replace('\n', " ")).filter(|t| !t.is_empty());
         let text = self.text(node, &mut page).replace('\n', " ");
