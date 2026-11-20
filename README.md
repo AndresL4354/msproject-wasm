@@ -169,7 +169,7 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 - El título sale como `heading`; el texto de los marcadores de contenido, como `list_item` con su nivel y su viñeta o numeración automática (`1.`, `a)`, `IV.`); los cuadros de texto, como párrafos.
 - Tablas con celdas combinadas, imágenes con su texto alternativo y notas del orador aparte, en `notes`.
 - Se omite lo que no es contenido (número de diapositiva, fecha y pie) y las diapositivas ocultas, con un aviso en `warnings`.
-- Una diapositiva referida varias veces en la presentación (aunque cambien las mayúsculas o las barras de la ruta) se lee una vez; se leen hasta 10.000 diapositivas distintas y hasta 64 MB de texto en toda la presentación, con un aviso si se pasa.
+- Una diapositiva referida varias veces en la presentación (aunque cambien las mayúsculas o las barras de la ruta) se lee una vez; se leen hasta 10.000 diapositivas distintas y hasta 64 MB de texto en toda la presentación, con un aviso si se pasa. Unas notas del orador que citan varias diapositivas se leen una vez. El destino de cada enlace y el nombre de cada imagen cuentan en el límite de caracteres de la lectura (se copian en cada tramo o imagen que los cita); pasado el límite, los tramos siguen sin enlace.
 
 ### Excel (.xlsx)
 

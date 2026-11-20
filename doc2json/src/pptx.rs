@@ -14,7 +14,7 @@
 //! No se lee el texto de graficos ni de SmartArt.
 
 use crate::doc::*;
-use crate::docx::{letters, part_rels, properties, relationships, resolve, roman};
+use crate::docx::{letters, part_rels, properties, relationships, resolve, roman, MAX_TARGET};
 use crate::symbols::{classify, translate, translate_str, SymbolFont};
 use crate::xml::{Ev, Tag, Xml};
 use crate::zipread::{part_key, ZipArchive};
@@ -104,6 +104,15 @@ struct Para {
     auto: Option<(String, i64)>,
 }
 
+/// Una copia de `s` si cabe entera en el limite de texto de la lectura (`budget::take_text`), que
+/// la descuenta; si no, nada. El destino de un enlace o el nombre de una imagen se copia en cada
+/// tramo o imagen que lo cita: sin descontarlo, un destino citado por un millon de tramos de una
+/// letra ocuparia mil veces mas que el texto.
+fn charged(s: &str) -> Option<String> {
+    let kept = crate::budget::take_text(s);
+    (kept.len() == s.len()).then(|| s.to_string())
+}
+
 /// Lee un `a:p` (ya abierto) hasta su cierre.
 fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
     let mut p = Para { text: String::new(), runs: Vec::new(), level: 0, bullet: None, auto: None };
@@ -139,7 +148,7 @@ fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
                 }
                 "a:latin" => latin = classify(&t.attr("typeface").unwrap_or_default()),
                 "a:sym" => sym = classify(&t.attr("typeface").unwrap_or_default()),
-                "a:hlinkClick" => cur.link = t.attr("r:id").and_then(|id| rels.get(&id).cloned()),
+                "a:hlinkClick" => cur.link = t.attr("r:id").and_then(|id| rels.get(&id)).and_then(|l| charged(l)),
                 "a:t" if !t.empty => in_t = true,
                 "a:br" => {
                     p.text.push('\n');
@@ -322,7 +331,7 @@ fn shapes(x: &mut Xml, end: &str, rels: &HashMap<String, String>, slide: u32, de
                 }
                 "a:tbl" if !t.empty => pending.push(table(x, rels, slide)),
                 "a:blip" => {
-                    let name = t.attr("r:embed").and_then(|id| rels.get(&id).cloned()).map(|p| p.rsplit('/').next().unwrap_or(&p).to_string());
+                    let name = t.attr("r:embed").and_then(|id| rels.get(&id)).and_then(|p| charged(p.rsplit('/').next().unwrap_or(p)));
                     pending.push(Block { kind: Kind::Image, name, text: alt.trim().to_string(), page: Some(slide), ..Block::default() });
                 }
                 _ => {}
@@ -351,7 +360,7 @@ fn sort(items: &mut [Item]) {
 
 fn slide_blocks(zip: &ZipArchive, path: &str, number: u32) -> Option<(Vec<Block>, bool)> {
     let src = zip.read_text(path)?;
-    let rels = part_rels(zip, path);
+    let rels = part_rels(zip, path, MAX_TARGET);
     let mut x = Xml::new(&src);
     let mut hidden = false;
     let mut items = Vec::new();
@@ -368,14 +377,20 @@ fn slide_blocks(zip: &ZipArchive, path: &str, number: u32) -> Option<(Vec<Block>
     Some((items.into_iter().flat_map(|i| i.blocks).collect(), hidden))
 }
 
-/// Notas del orador de una diapositiva: el texto de su marcador de cuerpo.
-fn notes(zip: &ZipArchive, slide_path: &str, number: u32) -> Option<Block> {
+/// Notas del orador de una diapositiva: el texto de su marcador de cuerpo. Unas notas ya leidas
+/// (por su clave o por la posicion de sus datos en el ZIP, como las diapositivas) no se leen de
+/// nuevo: muchas diapositivas que citan unas mismas notas grandes no las descomprimen cada vez.
+fn notes(zip: &ZipArchive, slide_path: &str, number: u32, seen: &mut (HashSet<String>, HashSet<usize>)) -> Option<Block> {
     let dir = slide_path.rfind('/').map_or("", |i| &slide_path[..i]);
     let file = slide_path.rsplit('/').next().unwrap_or(slide_path);
     let rels_path = format!("{}/_rels/{}.rels", dir, file);
-    let target = relationships(zip, &rels_path).into_iter().find(|(_, kind, _, _)| kind == "notesSlide").map(|(_, _, t, _)| resolve(dir, &t))?;
+    let target = relationships(zip, &rels_path, MAX_TARGET).into_iter().find(|(_, kind, _, _)| kind == "notesSlide").map(|(_, _, t, _)| resolve(dir, &t))?;
+    let (key, at) = (part_key(&target), zip.data_at(&target));
+    if !seen.0.insert(key) || at.map_or(false, |a| !seen.1.insert(a)) {
+        return None;
+    }
     let src = zip.read_text(&target)?;
-    let rels = part_rels(zip, &target);
+    let rels = part_rels(zip, &target, MAX_TARGET);
     let mut x = Xml::new(&src);
     let items = loop {
         match x.next()? {
@@ -395,7 +410,7 @@ fn notes(zip: &ZipArchive, slide_path: &str, number: u32) -> Option<Block> {
 
 pub fn read(data: &[u8]) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo .pptx esta danado o incompleto: no se pudo abrir como ZIP.".to_string())?;
-    let main = relationships(&zip, "_rels/.rels")
+    let main = relationships(&zip, "_rels/.rels", MAX_TARGET)
         .into_iter()
         .find(|(_, kind, _, _)| kind == "officeDocument")
         .map(|(_, _, target, _)| resolve("", &target))
@@ -403,17 +418,23 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
         .or_else(|| zip.find("ppt/presentation.xml").map(|e| e.name.clone()))
         .ok_or("El archivo no es una presentacion de PowerPoint (.pptx): no contiene ppt/presentation.xml.")?;
     let dir = main.rfind('/').map_or(String::new(), |i| main[..i].to_string());
-    let rels = part_rels(&zip, &main);
+    let rels = part_rels(&zip, &main, MAX_TARGET);
     let src = zip.read_text(&main).ok_or("No se pudo leer la presentacion.")?;
 
-    // Diapositivas en el orden de la presentacion.
+    // Diapositivas en el orden de la presentacion. Cada relacion se toma una vez (la primera
+    // referencia): copiar su ruta por cada `sldId` que la cita multiplicaria la memoria.
     let mut order: Vec<String> = Vec::new();
+    let mut refs = 0usize;
+    let mut ids = HashSet::new();
     let mut x = Xml::new(&src);
     while let Some(ev) = x.next() {
         if let Ev::Start(t) = ev {
             if t.name == "p:sldId" {
-                if let Some(p) = t.attr("r:id").and_then(|id| rels.get(&id).cloned()) {
-                    order.push(p);
+                if let Some((id, p)) = t.attr("r:id").and_then(|id| rels.get(&id).map(|p| (id, p))) {
+                    refs += 1;
+                    if ids.insert(id) {
+                        order.push(p.clone());
+                    }
                 }
             }
         }
@@ -430,7 +451,7 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     // Una diapositiva referida varias veces se lee una vez, en su primera posicion. La clave es
     // la de `find`: "slides/Slide1.xml" y "//ppt/slides/slide1.xml" son la misma parte. Tambien
     // lo son dos nombres distintos cuyas entradas del ZIP apuntan a los mismos datos.
-    let total = order.len();
+    let total = refs.max(order.len());
     let mut seen = HashSet::new();
     let mut seen_at = HashSet::new();
     order.retain(|p| {
@@ -453,12 +474,13 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     let mut notes_list = Vec::new();
     let mut hidden = 0usize;
     let mut text_left = MAX_TEXT;
+    let mut seen_notes = (HashSet::new(), HashSet::new());
     for (i, path) in order.iter().enumerate() {
         let n = i as u32 + 1;
         match slide_blocks(&zip, path, n) {
             Some((_, true)) => hidden += 1,
             Some((blocks, false)) => {
-                let note = notes(&zip, path, n);
+                let note = notes(&zip, path, n, &mut seen_notes);
                 // Una misma parte puede figurar en el ZIP con muchos nombres, y muchas
                 // diapositivas pueden compartir las mismas notas: el texto total tiene tope.
                 let size: usize = blocks.iter().chain(note.as_ref()).map(text_size).sum();

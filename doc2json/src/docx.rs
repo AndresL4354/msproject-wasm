@@ -93,14 +93,15 @@ pub(crate) fn resolve(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-/// Largo maximo, en bytes, del destino de una relacion (una ruta o una URL). Cada referencia a
-/// una relacion copia su destino: uno de varios MB citado por muchas hojas o diapositivas
-/// multiplicaria la memoria antes de que actuen los topes. Un destino mas largo se descarta.
-const MAX_TARGET: usize = 4096;
+/// Largo maximo, en bytes, del destino de una relacion en PowerPoint y Excel (una ruta o una URL).
+/// Cada referencia a una relacion copia su destino: uno de varios MB citado por muchas hojas o
+/// diapositivas multiplicaria la memoria antes de que actuen los topes. Un destino mas largo se
+/// descarta. Word no lo usa (`usize::MAX`): un hipervinculo largo sale como siempre.
+pub(crate) const MAX_TARGET: usize = 4096;
 
 /// Relaciones de una parte: lista de (id, tipo, destino, es_externo). Se descartan las de destino
-/// mas largo que `MAX_TARGET`.
-pub(crate) fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, String, bool)> {
+/// mas largo que `max_target` bytes.
+pub(crate) fn relationships(zip: &ZipArchive, rels_path: &str, max_target: usize) -> Vec<(String, String, String, bool)> {
     let mut out = Vec::new();
     if let Some(src) = zip.read_text(rels_path) {
         let mut x = Xml::new(&src);
@@ -108,7 +109,7 @@ pub(crate) fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, S
             if let Ev::Start(t) = ev {
                 if t.name.ends_with("Relationship") {
                     let target = t.attr("Target").unwrap_or_default();
-                    if target.len() > MAX_TARGET {
+                    if target.len() > max_target {
                         continue;
                     }
                     let kind = t.attr("Type").unwrap_or_default();
@@ -703,7 +704,7 @@ impl<'a> Reader<'a> {
             None => return Vec::new(),
         };
         let saved = std::mem::take(&mut self.rels);
-        self.rels = part_rels(self.zip, path);
+        self.rels = part_rels(self.zip, path, usize::MAX);
         let mut x = Xml::new(&src);
         let mut out = Vec::new();
         while let Some(ev) = x.next() {
@@ -752,13 +753,13 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(crate) fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
+pub(crate) fn part_rels(zip: &ZipArchive, part: &str, max_target: usize) -> HashMap<String, String> {
     let (dir, file) = match part.rfind('/') {
         Some(i) => (&part[..i], &part[i + 1..]),
         None => ("", part),
     };
     let rels_path = if dir.is_empty() { format!("_rels/{}.rels", file) } else { format!("{}/_rels/{}.rels", dir, file) };
-    relationships(zip, &rels_path).into_iter().map(|(id, _, target, external)| (id, if external { target } else { resolve(dir, &target) })).collect()
+    relationships(zip, &rels_path, max_target).into_iter().map(|(id, _, target, external)| (id, if external { target } else { resolve(dir, &target) })).collect()
 }
 
 /// Propiedades del documento (docProps/core.xml y app.xml).
@@ -804,7 +805,7 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo no es un .docx valido (no es un ZIP).".to_string())?;
 
     // La parte principal se declara en las relaciones del paquete.
-    let main = relationships(&zip, "_rels/.rels")
+    let main = relationships(&zip, "_rels/.rels", usize::MAX)
         .into_iter()
         .find(|(_, kind, _, _)| kind == "officeDocument")
         .map(|(_, _, target, _)| resolve("", &target))
@@ -835,7 +836,7 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     let file = main.rsplit('/').next().unwrap_or(&main);
     let rels_path = if dir.is_empty() { format!("_rels/{}.rels", file) } else { format!("{}/_rels/{}.rels", dir, file) };
     let mut parts: HashMap<String, Vec<String>> = HashMap::new();
-    for (id, kind, target, external) in relationships(&zip, &rels_path) {
+    for (id, kind, target, external) in relationships(&zip, &rels_path, usize::MAX) {
         let path = if external { target } else { resolve(&r.dir, &target) };
         parts.entry(kind).or_default().push(path.clone());
         r.rels.insert(id, path);

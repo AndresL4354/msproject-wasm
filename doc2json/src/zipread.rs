@@ -104,10 +104,15 @@ impl<'a> ZipArchive<'a> {
         self.data_start(self.find(name)?)
     }
 
+    /// Datos de una entrada tal como estan en el archivo (comprimidos o no).
+    fn raw(&self, e: &Entry) -> Option<&'a [u8]> {
+        let start = self.data_start(e)?;
+        self.data.get(start..start.checked_add(e.packed)?)
+    }
+
     pub fn read(&self, name: &str) -> Option<Vec<u8>> {
         let e = self.find(name)?;
-        let start = self.data_start(e)?;
-        let raw = self.data.get(start..start.checked_add(e.packed)?)?;
+        let raw = self.raw(e)?;
         match e.method {
             0 => Some(raw.to_vec()),
             8 => Some(inflate(raw).data),
@@ -116,8 +121,21 @@ impl<'a> ZipArchive<'a> {
     }
 
     /// Lee una entrada como texto UTF-8 (los XML de un .docx lo son; se tolera UTF-16 con BOM).
+    /// Una parte almacenada sin comprimir tambien se descuenta del presupuesto de la lectura, como
+    /// una comprimida (que descuenta `inflate`): asi leer muchas veces los mismos datos, citados
+    /// desde muchas hojas o diapositivas, tampoco queda gratis.
     pub fn read_text(&self, name: &str) -> Option<String> {
-        let d = self.read(name)?;
+        let e = self.find(name)?;
+        let raw = self.raw(e)?;
+        let d = match e.method {
+            0 => {
+                let n = crate::budget::room(raw.len());
+                crate::budget::spend(n, n < raw.len());
+                raw[..n].to_vec()
+            }
+            8 => inflate(raw).data,
+            _ => return None,
+        };
         Some(if d.starts_with(&[0xFF, 0xFE]) || d.starts_with(&[0xFE, 0xFF]) {
             let be = d[0] == 0xFE;
             let units: Vec<u16> = d[2..].chunks_exact(2).map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect();

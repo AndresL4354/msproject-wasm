@@ -73,7 +73,7 @@ fn office_kind(bytes: &[u8]) -> Format {
     };
     // La parte principal declarada cuenta solo si existe: un paquete con una relacion rota sigue
     // reconociendose por sus carpetas, como lo hace cada lector.
-    let main = docx::relationships(&zip, "_rels/.rels")
+    let main = docx::relationships(&zip, "_rels/.rels", docx::MAX_TARGET)
         .into_iter()
         .find(|r| r.1 == "officeDocument")
         .map(|r| docx::resolve("", &r.2))

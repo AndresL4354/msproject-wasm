@@ -796,3 +796,86 @@ fn alias_de_los_mismos_datos_se_leen_una_vez() {
     assert_eq!(d.page_count, Some(1));
     assert!(d.warnings.iter().any(|w| w.contains(&format!("{} referencias repetidas a diapositivas", n - 1))), "{:?}", d.warnings);
 }
+
+#[test]
+fn excel_hojas_sin_parte_no_dan_avisos() {
+    // Con el tope de celdas agotado, 10.000 hojas sin `r:id` daban un aviso cada una (no entran en
+    // la cuenta de hojas, asi que no tenian tope). No tienen nada que leer: se saltan sin aviso.
+    let hoja = format!("<worksheet><sheetData>{}</sheetData></worksheet>", "<c><v>1</v></c>".repeat(1_000_001));
+    let mut hojas: String = (1..=2).map(|i| format!(r#"<sheet name="H{0}" sheetId="{0}" r:id="rId{0}"/>"#, i)).collect();
+    hojas.push_str(&(0..10_000).map(|i| format!(r#"<sheet name="S{}" sheetId="{}"/>"#, i, 10 + i)).collect::<String>());
+    let libro = format!(r#"<?xml version="1.0"?><workbook xmlns:r="{}"><sheets>{}</sheets></workbook>"#, REL, hojas);
+    let bytes = zip_de(&[
+        ("_rels/.rels", rels(&[("rId1", "officeDocument", "xl/workbook.xml")])),
+        ("xl/workbook.xml", libro),
+        ("xl/_rels/workbook.xml.rels", rels(&[("rId1", "worksheet", "worksheets/sheet1.xml"), ("rId2", "worksheet", "worksheets/sheet2.xml")])),
+        ("xl/worksheets/sheet1.xml", hoja.clone()),
+        ("xl/worksheets/sheet2.xml", hoja),
+    ]);
+    let d = read(&bytes).unwrap();
+    assert!(d.warnings.iter().any(|w| w.starts_with("Hoja «H2»") && w.contains("2000000 celdas")), "{:?}", d.warnings);
+    assert!(!d.warnings.iter().any(|w| w.starts_with("Hoja «S")), "{} avisos", d.warnings.len());
+}
+
+/// Presentacion de varias diapositivas, cada una con sus relaciones: (diapositiva, relaciones).
+fn presentacion_con_relaciones(diapositivas: &[(String, String)], mas: &[(&str, String)]) -> Vec<u8> {
+    let ids: String = (1..=diapositivas.len()).map(|i| format!(r#"<p:sldId id="{}" r:id="rId{}"/>"#, 255 + i, i)).collect();
+    let lista: Vec<(String, String)> = (1..=diapositivas.len()).map(|i| (format!("rId{}", i), format!("slides/slide{}.xml", i))).collect();
+    let lista: Vec<(&str, &str, &str)> = lista.iter().map(|(id, d)| (id.as_str(), "slide", d.as_str())).collect();
+    let nombres: Vec<(String, String)> = (1..=diapositivas.len()).map(|i| (format!("ppt/slides/slide{}.xml", i), format!("ppt/slides/_rels/slide{}.xml.rels", i))).collect();
+    let mut partes: Vec<(&str, String)> = vec![
+        ("_rels/.rels", rels(&[("rId1", "officeDocument", "ppt/presentation.xml")])),
+        ("ppt/presentation.xml", format!(r#"<?xml version="1.0"?><p:presentation {}><p:sldIdLst>{}</p:sldIdLst></p:presentation>"#, NS, ids)),
+        ("ppt/_rels/presentation.xml.rels", rels(&lista)),
+    ];
+    for ((s, r), (ns, nr)) in diapositivas.iter().zip(&nombres) {
+        partes.push((ns.as_str(), s.clone()));
+        partes.push((nr.as_str(), r.clone()));
+    }
+    partes.extend(mas.iter().cloned());
+    zip_de(&partes)
+}
+
+#[test]
+fn powerpoint_enlaces_cuentan_en_el_limite_de_texto() {
+    // 2.000 tramos de una letra con un enlace de 4 KB: el destino se copia en cada tramo, 8 MB
+    // para 2.000 letras. Cada copia se descuenta del limite de texto de la lectura; pasado el
+    // limite los tramos siguen, sin enlace, y queda el aviso.
+    let destino = format!("https://example.com/{}", "a".repeat(4000));
+    let tramos = r#"<a:r><a:rPr><a:hlinkClick r:id="rId9"/></a:rPr><a:t>x</a:t></a:r>"#.repeat(2000);
+    let s1 = diapositiva(&forma("", 0, 0, &format!("<a:p>{}</a:p>", tramos)), false);
+    let bytes = presentacion_con_relaciones(&[(s1, rels(&[("rId9", "hyperlink", &destino)]))], &[]);
+    let d = doc2json::read_with_limits(&bytes, doc2json::budget::Limits { max_chars: 100_000, ..Default::default() }).unwrap();
+    let enlaces: usize = d.content.iter().flat_map(|b| &b.runs).filter_map(|r| r.link.as_ref()).map(|l| l.len()).sum();
+    assert!(enlaces > 0 && enlaces <= 100_000, "{} bytes de enlaces", enlaces);
+    assert_eq!(d.content.iter().map(|b| b.text.matches('x').count()).sum::<usize>(), 2000);
+    assert!(d.warnings.iter().any(|w| w.contains("limite de 100000 caracteres")), "{:?}", d.warnings);
+}
+
+#[test]
+fn powerpoint_notas_compartidas_se_leen_una_vez() {
+    // Tres diapositivas que citan las mismas notas: se leen (y salen) una vez.
+    let notas = diapositiva(&forma(r#"<p:ph type="body" idx="1"/>"#, 0, 0, "<a:p><a:r><a:t>Nota comun</a:t></a:r></a:p>"), false).replace("p:sld ", "p:notes ").replace("</p:sld>", "</p:notes>");
+    let s = |t: &str| diapositiva(&forma("", 0, 0, &format!("<a:p><a:r><a:t>{}</a:t></a:r></a:p>", t)), false);
+    let r = rels(&[("rId1", "notesSlide", "../notesSlides/notesSlide1.xml")]);
+    let bytes = presentacion_con_relaciones(&[(s("Uno"), r.clone()), (s("Dos"), r.clone()), (s("Tres"), r)], &[("ppt/notesSlides/notesSlide1.xml", notas)]);
+    let d = read(&bytes).unwrap();
+    assert_eq!(textos(&d), vec!["Uno", "Dos", "Tres"]);
+    let notas: Vec<&str> = d.extras.iter().filter(|(k, _)| *k == "notes").flat_map(|(_, b)| b.iter().map(|b| b.text.as_str())).collect();
+    assert_eq!(notas, ["Nota comun"]);
+}
+
+#[test]
+fn word_conserva_los_hipervinculos_largos() {
+    // El tope de largo de los destinos es de PowerPoint y Excel: un hipervinculo de Word de 5 KB
+    // sale entero, como antes.
+    let destino = format!("https://example.com/?q={}", "b".repeat(5000));
+    let documento = r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:hyperlink r:id="rId5"><w:r><w:t>enlace</w:t></w:r></w:hyperlink></w:p></w:body></w:document>"#;
+    let bytes = zip(&[
+        ("_rels/.rels", &rels(&[("rId1", "officeDocument", "word/document.xml")])),
+        ("word/document.xml", documento),
+        ("word/_rels/document.xml.rels", &rels(&[("rId5", "hyperlink", &destino)])),
+    ]);
+    let d = read(&bytes).unwrap();
+    assert!(d.content.iter().flat_map(|b| &b.runs).any(|r| r.link.as_deref() == Some(destino.as_str())), "{:?}", d.content);
+}

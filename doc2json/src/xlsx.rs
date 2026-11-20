@@ -18,7 +18,7 @@
 //! Los nombres de las etiquetas se comparan sin prefijo: algunos programas escriben `<x:row>`.
 
 use crate::doc::*;
-use crate::docx::{part_rels, properties, relationships, resolve};
+use crate::docx::{part_rels, properties, relationships, resolve, MAX_TARGET};
 use crate::xml::{Ev, Xml};
 use crate::zipread::{part_key, ZipArchive};
 use std::borrow::Cow;
@@ -617,7 +617,7 @@ fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str, 
 
 pub fn read(data: &[u8]) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo .xlsx esta danado o incompleto: no se pudo abrir como ZIP.".to_string())?;
-    let main = relationships(&zip, "_rels/.rels")
+    let main = relationships(&zip, "_rels/.rels", MAX_TARGET)
         .into_iter()
         .find(|(_, kind, _, _)| kind == "officeDocument")
         .map(|(_, _, target, _)| resolve("", &target))
@@ -631,12 +631,13 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     let file = &main[main.rfind('/').map_or(0, |i| i + 1)..];
     let rels_path = if dir.is_empty() { format!("_rels/{}.rels", file) } else { format!("{}/_rels/{}.rels", dir, file) };
     let by_kind: HashMap<String, String> =
-        relationships(&zip, &rels_path).into_iter().filter(|r| !r.3).map(|(_, kind, target, _)| (kind, resolve(&dir, &target))).collect();
-    let rels = part_rels(&zip, &main);
+        relationships(&zip, &rels_path, MAX_TARGET).into_iter().filter(|r| !r.3).map(|(_, kind, target, _)| (kind, resolve(&dir, &target))).collect();
+    let rels = part_rels(&zip, &main, MAX_TARGET);
     let src = zip.read_text(&main).ok_or("No se pudo leer el libro.")?;
 
     let mut date1904 = false;
-    // (nombre, ruta de la hoja, oculta)
+    // (nombre, id de la relacion de la hoja, oculta). Se guarda el id y no la ruta: muchas hojas
+    // pueden citar la misma relacion, y copiar su ruta en cada una multiplicaria la memoria.
     let mut sheets: Vec<(String, Option<String>, bool)> = Vec::new();
     let mut x = Xml::new(&src);
     while let Some(ev) = x.next() {
@@ -645,8 +646,7 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
                 "workbookPr" => date1904 = matches!(t.attr("date1904").as_deref(), Some("1") | Some("true")),
                 "sheet" => {
                     let hidden = matches!(t.attr("state").as_deref(), Some("hidden") | Some("veryHidden"));
-                    let path = t.attr("r:id").and_then(|id| rels.get(&id).cloned());
-                    sheets.push((t.attr("name").unwrap_or_default(), path, hidden));
+                    sheets.push((t.attr("name").unwrap_or_default(), t.attr("r:id"), hidden));
                 }
                 _ => {}
             }
@@ -669,7 +669,8 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     let mut cells_left = MAX_CELLS;
     let mut grid_left = MAX_GRID;
     let mut text_left = MAX_TEXT;
-    for (name, path, is_hidden) in &sheets {
+    for (name, id, is_hidden) in &sheets {
+        let path = id.as_ref().and_then(|id| rels.get(id));
         if let Some(p) = path {
             let (key, at) = (part_key(p), zip.data_at(p));
             if seen.contains(&key) || at.map_or(false, |a| seen_at.contains(&a)) {
@@ -688,6 +689,12 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
             continue;
         }
         number += 1;
+        // Una hoja sin parte (sin `r:id`, o con uno que no existe) no tiene nada que leer. Se salta
+        // antes de mirar los topes: no entra en `seen`, asi que sus avisos no tendrian tope.
+        let path = match path {
+            Some(p) => p,
+            None => continue,
+        };
         // Los topes se miran antes de descomprimir la hoja, para no leerla si ya no queda cupo.
         if cells_left == 0 {
             doc.warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} celdas con datos.", name, MAX_CELLS));
@@ -698,7 +705,7 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
             continue;
         }
         // Las hojas de graficos o de macros no tienen celdas.
-        let src = match path.as_ref().and_then(|p| zip.read_text(p)) {
+        let src = match zip.read_text(path) {
             Some(src) => src,
             None => continue,
         };
