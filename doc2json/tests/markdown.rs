@@ -389,14 +389,14 @@ fn ningun_fragmento_pasa_el_maximo() {
                         let mut fila = Vec::new();
                         for _ in 0..columnas {
                             let palabras = azar.hasta(largo) + 1;
-                            fila.push(Cell { text: azar.texto(palabras), colspan: 1, rowspan: 1, merged: false });
+                            fila.push(Cell { text: azar.texto(palabras), colspan: 1, rowspan: 1, merged: false, images: Vec::new() });
                         }
                         rows.push(fila);
                     }
                     Block { kind: Kind::Table, rows, ..Block::default() }
                 }
                 4 => Block { kind: Kind::Image, name: Some("media/imagen 1.png".into()), text: texto, ..Block::default() },
-                5 => Block { kind: Kind::Table, rows: vec![vec![Cell { text: "3.2 RESPONSABLES".into(), colspan: 1, rowspan: 1, merged: false }]], ..Block::default() },
+                5 => Block { kind: Kind::Table, rows: vec![vec![Cell { text: "3.2 RESPONSABLES".into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }]], ..Block::default() },
                 _ => Block { kind: Kind::Paragraph, text: texto, ..Block::default() },
             });
         }

@@ -554,19 +554,57 @@ impl<'a> Pdf<'a> {
             _ => return None,
         };
         let raw = self.data.get(start..start.checked_add(len)?.min(self.data.len()))?;
-        // Descifrado previo a los filtros. Los flujos de referencias cruzadas nunca van cifrados.
-        let crypt_id: Option<(u32, u16)> = match &self.crypt {
-            Some(c) if c.streams != Method::None && dict.get("Type").and_then(|t| t.as_name()) != Some("XRef") => {
-                self.stream_ids.borrow().get(&start).copied()
-            }
+        let crypt_id = self.crypt_id(dict, start);
+        let chain = self.filter_chain(dict)?;
+        if chain.is_empty() {
+            return Some(Rc::new(self.decrypt(crypt_id, raw)));
+        }
+        let key: StreamKey = (crypt_id, start, len, chain.into_iter().map(|(name, p, _)| (name, p)).collect());
+        if let Some(done) = self.decoded.borrow().get(&key) {
+            return done.clone();
+        }
+        let mut data = Some(self.decrypt(crypt_id, raw));
+        for (name, p) in &key.3 {
+            data = data.and_then(|d| filters::apply(name, &d, p));
+        }
+        let data = data.map(Rc::new);
+        self.decoded.borrow_mut().insert(key, data.clone());
+        data
+    }
+
+    /// Datos de un flujo ya descifrados pero sin filtrar, y sus filtros en orden de aplicacion con
+    /// sus parametros (tambien el diccionario original, que piden filtros de imagen como CCITT).
+    /// No se guardan: los usan las imagenes, que se decodifican una vez y por su cuenta.
+    pub fn stream_parts(&self, obj: &Obj) -> Option<(Vec<u8>, Vec<(String, Parms, Option<Dict>)>)> {
+        let (dict, start, len) = match obj {
+            Obj::Stream { dict, start, len } => (dict, *start, *len),
+            _ => return None,
+        };
+        let raw = self.data.get(start..start.checked_add(len)?.min(self.data.len()))?;
+        let crypt_id = self.crypt_id(dict, start);
+        let chain = self.filter_chain(dict)?;
+        Some((self.decrypt(crypt_id, raw), chain))
+    }
+
+    /// Objeto con cuya clave se descifra un flujo, si el PDF va cifrado. Los flujos de referencias
+    /// cruzadas nunca van cifrados.
+    fn crypt_id(&self, dict: &Dict, start: usize) -> Option<(u32, u16)> {
+        match &self.crypt {
+            Some(c) if c.streams != Method::None && dict.get("Type").and_then(|t| t.as_name()) != Some("XRef") => self.stream_ids.borrow().get(&start).copied(),
             _ => None,
-        };
-        let decrypt = |raw: &[u8]| -> Vec<u8> {
-            match (&self.crypt, crypt_id) {
-                (Some(c), Some((num, gen))) => c.decrypt(c.streams, num, gen, raw),
-                _ => raw.to_vec(),
-            }
-        };
+        }
+    }
+
+    fn decrypt(&self, crypt_id: Option<(u32, u16)>, raw: &[u8]) -> Vec<u8> {
+        match (&self.crypt, crypt_id) {
+            (Some(c), Some((num, gen))) => c.decrypt(c.streams, num, gen, raw),
+            _ => raw.to_vec(),
+        }
+    }
+
+    /// Filtros de un flujo en orden de aplicacion, con sus parametros y su diccionario. `None` si
+    /// encadena mas de `MAX_FILTERS`.
+    fn filter_chain(&self, dict: &Dict) -> Option<Vec<(String, Parms, Option<Dict>)>> {
         let filter = self.get(dict, "Filter");
         let names: Vec<String> = match &*filter {
             Obj::Name(n) => vec![n.clone()],
@@ -577,38 +615,37 @@ impl<'a> Pdf<'a> {
             _ => Vec::new(),
         };
         if names.is_empty() {
-            return Some(Rc::new(decrypt(raw)));
+            return Some(Vec::new());
         }
         let parms_obj = match dict.get("DecodeParms").or_else(|| dict.get("DP")) {
             Some(o) => self.resolve(o),
             None => Rc::new(Obj::Null),
         };
-        let parms_at = |i: usize| -> Parms {
+        let single = names.len() == 1;
+        let parms_at = |i: usize| -> (Parms, Option<Dict>) {
             let d = match &*parms_obj {
-                Obj::Dict(d) if i == 0 || names.len() == 1 => Some(d.clone()),
+                Obj::Dict(d) if i == 0 || single => Some(d.clone()),
                 Obj::Array(a) => a.get(i).map(|o| self.resolve(o)).and_then(|o| o.as_dict().cloned()),
                 _ => None,
             };
             let mut p = Parms::default();
-            if let Some(d) = d {
-                let int = |k: &str, def: i64| self.get(&d, k).as_i64().unwrap_or(def);
+            if let Some(d) = &d {
+                let int = |k: &str, def: i64| self.get(d, k).as_i64().unwrap_or(def);
                 p = Parms { predictor: int("Predictor", 1), colors: int("Colors", 1), bits: int("BitsPerComponent", 8), columns: int("Columns", 1), early_change: int("EarlyChange", 1) };
             }
-            p
+            (p, d)
         };
-        // Los parametros se resuelven antes: resolverlos puede abrir otros flujos (de objetos).
-        let parms: Vec<Parms> = (0..names.len()).map(parms_at).collect();
-        let key: StreamKey = (crypt_id, start, len, names.into_iter().zip(parms).collect());
-        if let Some(done) = self.decoded.borrow().get(&key) {
-            return done.clone();
-        }
-        let mut data = Some(decrypt(raw));
-        for (name, p) in &key.3 {
-            data = data.and_then(|d| filters::apply(name, &d, p));
-        }
-        let data = data.map(Rc::new);
-        self.decoded.borrow_mut().insert(key, data.clone());
-        data
+        // Los parametros se resuelven antes de descomprimir: resolverlos puede abrir otros flujos
+        // (de objetos).
+        let chain = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let (p, d) = parms_at(i);
+                (name, p, d)
+            })
+            .collect();
+        Some(chain)
     }
 
     pub fn is_encrypted(&self) -> bool {

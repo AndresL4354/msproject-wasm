@@ -2,6 +2,7 @@
 //
 //   await init('/doc2json.wasm');          // una sola vez (en Node: init(bytes del .wasm))
 //   const doc = await docToJson(archivo);  // { type, metadata, content, text, ... }
+//   const conImagenes = await docToJson(archivo, { images: true });  // images[i].data: Uint8Array
 //
 // Acepta .docx, .pdf, .pptx y .xlsx; el formato se reconoce por el contenido. La conversion ocurre donde
 // corre este codigo: el archivo no se envia a ningun servidor.
@@ -65,9 +66,10 @@ async function convertir(archivo, modo, opciones) {
     new Uint8Array(x.memory.buffer, ptr, entrada.length).set(entrada);
     // Los limites van como argumentos de cada conversion: no quedan para la siguiente.
     const estado = x.doc_convert(ptr, entrada.length, modo, lim[0], lim[1], lim[2]);
-    const salida = new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.doc_result_ptr(), x.doc_result_len()));
+    // Copia: la memoria del modulo se reutiliza en la conversion siguiente.
+    const salida = new Uint8Array(x.memory.buffer, x.doc_result_ptr(), x.doc_result_len()).slice();
     x.doc_free(ptr, entrada.length);
-    if (estado !== 0) throw new Error(salida);
+    if (estado !== 0) throw new Error(new TextDecoder().decode(salida));
     return salida;
   } catch (e) {
     if (e instanceof WebAssembly.RuntimeError) {
@@ -81,13 +83,36 @@ async function convertir(archivo, modo, opciones) {
 }
 
 /** Convierte un .docx, .pdf, .pptx o .xlsx en JSON, como texto. Con `full` agrega estilos, tramos con formato y lineas de PDF. */
-export function docToJsonText(archivo, opciones) {
-  return convertir(archivo, opciones && opciones.full ? 1 : 0, opciones);
+export async function docToJsonText(archivo, opciones) {
+  return new TextDecoder().decode(await convertir(archivo, opciones && opciones.full ? 1 : 0, opciones));
 }
 
-/** Convierte un .docx, .pdf, .pptx o .xlsx en un objeto con metadatos, bloques de contenido y texto plano. */
+function modoImagenes(opciones) {
+  const lado = opciones.minSide == null ? 0 : opciones.minSide;
+  if (!Number.isInteger(lado) || lado < 0 || lado > 0xffffff) throw new RangeError('minSide debe ser un entero entre 0 y 16777215.');
+  return (opciones.full ? 1 : 0) | 4 | (lado << 8);
+}
+
+/**
+ * Convierte un .docx, .pdf, .pptx o .xlsx en un objeto con metadatos, bloques de contenido y texto
+ * plano. Con `images: true` cada imagen de `images` (de Word y PDF) trae sus bytes en `data` (PNG,
+ * JPEG, TIFF...; ver `format` y `mime`); con `minSide` se omiten los bytes de las imagenes con un
+ * lado menor a eso. Entre todas cuestan a lo sumo 128 MB por documento, contados por lo que cada
+ * una declara antes de leerla (en PDF, sus pixeles decodificados): las demas no se leen y quedan
+ * con `note`.
+ */
 export async function docToJson(archivo, opciones) {
-  return JSON.parse(await docToJsonText(archivo, opciones));
+  if (!opciones || !opciones.images) return JSON.parse(await docToJsonText(archivo, opciones));
+  const salida = await convertir(archivo, modoImagenes(opciones), opciones);
+  const largo = new DataView(salida.buffer, salida.byteOffset, 4).getUint32(0, true);
+  const doc = JSON.parse(new TextDecoder().decode(salida.subarray(4, 4 + largo)));
+  const bytes = salida.subarray(4 + largo);
+  for (const imagen of doc.images || []) {
+    if (imagen.offset != null) imagen.data = bytes.subarray(imagen.offset, imagen.offset + imagen.length);
+    delete imagen.offset;
+    delete imagen.length;
+  }
+  return doc;
 }
 
 // Operaciones de doc_convert (byte bajo del modo; el parametro va en los bits 8 a 31):
@@ -99,8 +124,8 @@ const FRAGMENTOS = 3;
  * Convierte un .docx o un .pdf en Markdown: titulos, listas, tablas GFM y notas al pie. El texto
  * del documento va escapado (no trae HTML ni enlaces que no sean http, https o mailto).
  */
-export function docToMarkdown(archivo, opciones) {
-  return convertir(archivo, MARKDOWN, opciones);
+export async function docToMarkdown(archivo, opciones) {
+  return new TextDecoder().decode(await convertir(archivo, MARKDOWN, opciones));
 }
 
 /**
@@ -113,5 +138,5 @@ export async function docToChunks(archivo, opciones) {
     throw new RangeError('maxChars debe ser un entero entre 1 y 16777215.');
   }
   // 0 = tamano por defecto. El modo cabe en 32 bits sin signo; WebAssembly lo recibe igual.
-  return JSON.parse(await convertir(archivo, FRAGMENTOS + (valor || 0) * 256, opciones));
+  return JSON.parse(new TextDecoder().decode(await convertir(archivo, FRAGMENTOS + (valor || 0) * 256, opciones)));
 }

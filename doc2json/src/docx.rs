@@ -4,6 +4,7 @@
 //! numeracion de listas, las notas, encabezados y pies, y las propiedades del documento.
 
 use crate::doc::*;
+use crate::image::{describe, format_from_name, part_key, Budget, ImageSet};
 use crate::symbols::{classify, translate_str, SymbolFont};
 use crate::xml::{Ev, Tag, Xml};
 use crate::zipread::ZipArchive;
@@ -57,6 +58,7 @@ struct CellTmp {
     colspan: u32,
     /// Some(true) = inicia una combinacion vertical; Some(false) = continua la de arriba.
     vmerge: Option<bool>,
+    images: Vec<u32>,
 }
 
 struct Reader<'a> {
@@ -65,7 +67,8 @@ struct Reader<'a> {
     styles: HashMap<String, Style>,
     abstracts: HashMap<String, Vec<Level>>,
     nums: HashMap<u32, Num>,
-    rels: HashMap<String, String>,
+    /// Relaciones de la parte en curso: destino y si es externo (`TargetMode="External"`).
+    rels: HashMap<String, (String, bool)>,
     /// Contadores de numeracion por lista; -1 = nivel aun sin usar.
     counters: HashMap<u32, [i64; 9]>,
     /// Numero visible de cada nota (segun el orden en que se citan): (es_final, id) -> n.
@@ -73,6 +76,10 @@ struct Reader<'a> {
     note_seq: [u32; 2],
     /// Profundidad de tablas y cuadros de texto anidados (tope contra archivos maliciosos).
     depth: u32,
+    /// Imagenes citadas, sin repetir (clave: ruta dentro del paquete).
+    images: ImageSet,
+    /// Tamano con que se muestra el dibujo en curso (`wp:extent`), en puntos.
+    extent: Option<(f64, f64)>,
 }
 
 /// Resuelve un destino de relacion respecto de la carpeta de la parte que lo referencia.
@@ -457,10 +464,12 @@ impl<'a> Reader<'a> {
         let mut fmt = RunFmt::default();
         let mut in_run = false;
         let mut link: Option<String> = None;
-        let mut images: Vec<(String, String)> = Vec::new();
+        let mut images: Vec<(String, String, Option<u32>)> = Vec::new();
         let mut alt = String::new();
         let mut nested: Vec<Block> = Vec::new();
         let mut page_break = false;
+        // Un tamano que quedo de un dibujo sin imagen (grafico, forma) no pasa a otro parrafo.
+        self.extent = None;
 
         fn push(text: &mut String, runs: &mut Vec<Run>, s: &str, fmt: &RunFmt, link: &Option<String>) {
             if fmt.hidden {
@@ -517,7 +526,7 @@ impl<'a> Reader<'a> {
                         }
                     }
                     "w:hyperlink" => {
-                        link = t.attr("r:id").and_then(|id| self.rels.get(&id).cloned()).or_else(|| t.attr("w:anchor").map(|a| format!("#{}", a)));
+                        link = t.attr("r:id").and_then(|id| self.rels.get(&id).map(|(target, _)| target.clone())).or_else(|| t.attr("w:anchor").map(|a| format!("#{}", a)));
                     }
                     "w:footnoteReference" => {
                         let n = self.note_number(false, t.attr("w:id"));
@@ -534,11 +543,21 @@ impl<'a> Reader<'a> {
                         let mut b = self.blocks(x, "w:txbxContent");
                         nested.append(&mut b);
                     }
+                    "wp:extent" => {
+                        let emu = |k: &str| t.attr(k).and_then(|v| v.parse::<f64>().ok()).map(|v| (v / 127.0).round() / 100.0);
+                        self.extent = emu("cx").zip(emu("cy"));
+                    }
                     "wp:docPr" => alt = t.attr("descr").or_else(|| t.attr("title")).unwrap_or_default(),
                     "a:blip" | "v:imagedata" => {
-                        if let Some(target) = t.attr("r:embed").or_else(|| t.attr("r:id")).and_then(|id| self.rels.get(&id).cloned()) {
+                        if let Some((target, external)) = t.attr("r:embed").or_else(|| t.attr("r:id")).and_then(|id| self.rels.get(&id).cloned()) {
                             let name = target.rsplit('/').next().unwrap_or(&target).to_string();
-                            images.push((name, std::mem::take(&mut alt)));
+                            let place = self.extent.take().map(|(w, h)| Place { w, h, ..Place::default() });
+                            let alt = std::mem::take(&mut alt);
+                            // La misma parte se reconoce aunque cambien las mayusculas (como la busca
+                            // el lector ZIP); una vinculada no es una parte del paquete.
+                            let key = if external { format!("{}{}", LINKED, target) } else { part_key(&target) };
+                            let id = self.images.add(&key, place, &alt, || Image { format: format_from_name(&target), name: Some(name.clone()), ..Image::default() });
+                            images.push((name, alt, id));
                         }
                     }
                     "m:t" if !t.empty => {
@@ -575,8 +594,8 @@ impl<'a> Reader<'a> {
             }
             out.push(b);
         }
-        for (name, alt) in images {
-            out.push(Block { kind: Kind::Image, name: Some(name), text: alt, ..Block::default() });
+        for (name, alt, id) in images {
+            out.push(Block { kind: Kind::Image, name: Some(name), text: alt, image: id, ..Block::default() });
         }
         out.append(&mut nested);
         if page_break {
@@ -628,7 +647,7 @@ impl<'a> Reader<'a> {
                         }
                     }
                 }
-                cells.push(Cell { text: c.text.clone(), colspan: c.colspan.max(1), rowspan, merged: c.vmerge == Some(false) });
+                cells.push(Cell { text: c.text.clone(), colspan: c.colspan.max(1), rowspan, merged: c.vmerge == Some(false), images: c.images.clone() });
             }
             out.push(cells);
         }
@@ -660,6 +679,18 @@ impl<'a> Reader<'a> {
             }
         }
         c.text = plain_text(&blocks);
+        // Las imagenes de la celda (tambien las de tablas anidadas) quedan referidas desde ella.
+        fn collect(blocks: &[Block], out: &mut Vec<u32>) {
+            for b in blocks {
+                if let Some(id) = b.image {
+                    out.push(id);
+                }
+                for cell in b.rows.iter().flatten() {
+                    out.extend_from_slice(&cell.images);
+                }
+            }
+        }
+        collect(&blocks, &mut c.images);
         c
     }
 
@@ -704,7 +735,7 @@ impl<'a> Reader<'a> {
             None => return Vec::new(),
         };
         let saved = std::mem::take(&mut self.rels);
-        self.rels = part_rels(self.zip, path, usize::MAX);
+        self.rels = part_rels_ext(self.zip, path, usize::MAX);
         let mut x = Xml::new(&src);
         let mut out = Vec::new();
         while let Some(ev) = x.next() {
@@ -753,14 +784,24 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Relaciones de una parte: de cada id, su destino (resuelto desde la carpeta de la parte si es
+/// interno). Descarta los destinos de mas de `max_target` bytes.
 pub(crate) fn part_rels(zip: &ZipArchive, part: &str, max_target: usize) -> HashMap<String, String> {
+    part_rels_ext(zip, part, max_target).into_iter().map(|(id, (target, _))| (id, target)).collect()
+}
+
+/// Como `part_rels`, e indica si cada destino es externo (`TargetMode="External"`).
+fn part_rels_ext(zip: &ZipArchive, part: &str, max_target: usize) -> HashMap<String, (String, bool)> {
     let (dir, file) = match part.rfind('/') {
         Some(i) => (&part[..i], &part[i + 1..]),
         None => ("", part),
     };
     let rels_path = if dir.is_empty() { format!("_rels/{}.rels", file) } else { format!("{}/_rels/{}.rels", dir, file) };
-    relationships(zip, &rels_path, max_target).into_iter().map(|(id, _, target, external)| (id, if external { target } else { resolve(dir, &target) })).collect()
+    relationships(zip, &rels_path, max_target).into_iter().map(|(id, _, target, external)| (id, (if external { target } else { resolve(dir, &target) }, external))).collect()
 }
+
+/// Prefijo de la clave de las imagenes vinculadas (fuera del paquete): no se leen del ZIP.
+const LINKED: &str = "vinculada:";
 
 /// Propiedades del documento (docProps/core.xml y app.xml).
 pub(crate) fn properties(zip: &ZipArchive, doc: &mut Document) {
@@ -802,6 +843,12 @@ pub(crate) fn properties(zip: &ZipArchive, doc: &mut Document) {
 }
 
 pub fn read(data: &[u8]) -> Result<Document, String> {
+    read_opts(data, None)
+}
+
+/// Lee el documento; con `images` (tope de bytes entre todas las imagenes) agrega los bytes de
+/// cada imagen y su tamano en pixeles.
+pub fn read_opts(data: &[u8], images: Option<usize>) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo no es un .docx valido (no es un ZIP).".to_string())?;
 
     // La parte principal se declara en las relaciones del paquete.
@@ -830,6 +877,8 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
         note_numbers: HashMap::new(),
         note_seq: [0, 0],
         depth: 0,
+        images: ImageSet::default(),
+        extent: None,
     };
 
     // Partes relacionadas con el documento principal.
@@ -839,7 +888,7 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     for (id, kind, target, external) in relationships(&zip, &rels_path, usize::MAX) {
         let path = if external { target } else { resolve(&r.dir, &target) };
         parts.entry(kind).or_default().push(path.clone());
-        r.rels.insert(id, path);
+        r.rels.insert(id, (path, external));
     }
     let first = |k: &str, default: &str| parts.get(k).and_then(|v| v.first().cloned()).unwrap_or_else(|| resolve(&dir, default));
     // El cuerpo se descomprime antes que estilos y numeracion: si un archivo agota el presupuesto
@@ -894,6 +943,35 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     doc.extras.push(("footnotes", footnotes));
     doc.extras.push(("endnotes", endnotes));
     doc.extras.push(("comments", comments));
+
+    // Las imagenes de encabezados y pies figuran en la lista aunque esos bloques salgan como texto.
+    let set = std::mem::take(&mut r.images);
+    doc.warnings.extend(set.warnings());
+    doc.images = set.list;
+    if let Some(limit) = images {
+        let mut budget = Budget::new(limit);
+        for (img, key) in doc.images.iter_mut().zip(&set.keys) {
+            if key.starts_with(LINKED) {
+                img.note = Some("Imagen vinculada desde fuera del documento.".into());
+                continue;
+            }
+            // El tamano que declara el ZIP se descuenta antes de descomprimir: una imagen que ya no
+            // cabe no se descomprime.
+            let work = zip.find(key).map_or(0, |e| e.size);
+            if !budget.reserve(work) {
+                budget.skip(img);
+                continue;
+            }
+            match zip.read(key) {
+                Some(bytes) => {
+                    describe(img, &bytes);
+                    budget.store(img, bytes, work);
+                }
+                None => img.note = Some("No se pudo leer el archivo de la imagen.".into()),
+            }
+        }
+        doc.warnings.extend(budget.warning());
+    }
     Ok(doc)
 }
 

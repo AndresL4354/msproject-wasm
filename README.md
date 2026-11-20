@@ -5,7 +5,7 @@ Dos herramientas independientes, escritas en **Rust sin ninguna dependencia**, q
 | Herramienta | Entrada | Salida | Ejecutable | WebAssembly |
 |---|---|---|---|---|
 | **mpp2xlsx** | Microsoft Project (`.mpp`) | Excel (`.xlsx`) con Gantt, y JSON | 569 KB | 339 KB (93 KB con brotli) |
-| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado | 554 KB | 481 KB (149 KB con brotli) |
+| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado, e imágenes | 554 KB | 481 KB (149 KB con brotli) |
 
 No necesitan Microsoft Project, Office, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
 
@@ -35,6 +35,10 @@ target\release\doc2json.exe informe.pdf --markdown
 
 ```bash
 target\release\doc2json.exe manual.docx --fragmentos=1500
+```
+
+```bash
+target\release\doc2json.exe informe.pdf --imagenes
 ```
 
 **En una página web:** copia a tu proyecto los archivos de `web/` y llama a los cargadores como se muestra en [Integración en una web](#integración-en-una-web-vercel--supabase). La conversión ocurre en el navegador; el archivo no se sube a ningún lado.
@@ -100,6 +104,7 @@ Los cuatro formatos salen con **la misma forma**, así una sola tabla en la base
 | `headers`, `footers`, `footnotes` | Encabezados, pies y notas al pie: de Word y de PDF etiquetados, cuando existen. |
 | `endnotes`, `comments` | Solo Word, cuando existen. |
 | `notes` | Solo PowerPoint: notas del orador, con el número de la diapositiva en `label`. |
+| `images` | Imágenes sin repetir: formato, tamaño en píxeles, texto alternativo y dónde se muestran (ver [Imágenes](#imágenes)). |
 | `warnings` | Avisos: páginas escaneadas sin texto, índice reconstruido, fuentes ilegibles. |
 
 Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de cada bloque, los tramos con formato (negrita, cursiva, enlaces) y, en PDF, cada línea con su posición y tamaño de letra.
@@ -180,6 +185,38 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 - Una hoja muy dispersa (más de 16 celdas de tabla por cada valor, como datos en diagonal) sale como una `table` de dos columnas, referencia y valor (`B2`, `123`), con un aviso: como tabla tendría filas × columnas celdas casi todas vacías.
 - Topes para todo el libro, no por hoja: 2 millones de celdas con valor, 4 millones de celdas de tabla, 64 MB de texto y 4.096 hojas. Lo que pasa del tope se corta con un aviso. Una hoja referida varias veces (aunque cambien las mayúsculas o las barras de la ruta) se lee una vez.
 - Se omiten las hojas ocultas, con un aviso en `warnings`.
+
+### Imágenes
+
+`images` lista cada imagen **una vez**, aunque se muestre varias (un logo en cada página), con un `id` desde 1:
+
+```json
+{ "id": 3, "format": "png", "width": 1240, "height": 620, "alt": "Diagrama del circuito",
+  "places": [{ "page": 2, "x": 72, "y": 142, "w": 300, "h": 150 }] }
+```
+
+- **Word:** cada imagen sigue en `content` como bloque `image` en su lugar de lectura, ahora con `"image": <id>`; las que están dentro de una tabla (pictogramas, firmas) quedan citadas desde su celda, en `images`. `places` trae el tamaño con que se muestra (`w`, `h`, en puntos). Las de encabezados y pies figuran en la lista aunque esos bloques salgan como texto.
+- **PDF:** `places` dice en qué página y dónde se dibuja cada vez: `x`, `y` (esquina superior izquierda, medida desde la esquina superior izquierda de la página en su orientación de lectura, igual que `y` de las líneas), `w` y `h`, en puntos. `width` y `height` son los píxeles de la imagen.
+
+**Extraer los archivos:** `--imagenes[=carpeta]` en la consola (quedan como `imagen-<id>.<formato>`), `docToJson(archivo, { images: true })` en la web (cada imagen trae sus bytes en `data`, un `Uint8Array`, con `mime` y `size`; `minSide: 32` omite los bytes de iconos y líneas) y `doc2json::read_with_images` en Rust.
+
+| Origen | Se entrega como |
+|---|---|
+| Word | El archivo incrustado tal cual (PNG, JPEG, GIF, EMF, WMF, SVG…). |
+| PDF con JPEG (DCTDecode) o JPEG 2000 (JPXDecode) | El mismo JPEG o JPEG 2000, sin recomprimir. |
+| PDF con fax (CCITTFaxDecode) | TIFF de grupo 3 o 4 con los mismos datos. |
+| PDF con píxeles (Flate, LZW, RunLength o sin comprimir) | PNG: gris, RGB, CMYK (convertido a RGB), indexado con su paleta, tinta plana y máscaras de un bit, con transparencia si traen máscara suave del mismo tamaño (también la premezclada con `/Matte`). Si los datos ya son un PNG por dentro (Flate con predictor PNG), se copian sin recomprimir. |
+
+No se convierten, y figuran con `note`: JBIG2, espacios de color Lab o DeviceN de varias tintas, e imágenes de más de 25 millones de píxeles. Las imágenes incrustadas en el contenido de la página (`BI … EI`, poco comunes) se cuentan pero no se extraen.
+
+**Topes y archivos dañados.** La memoria que pide una imagen depende de los datos que trae, no del tamaño que declara:
+
+- Si a los datos de una imagen de PDF les falta más de la mitad de lo que su tamaño exige, no se extrae (`note`: datos incompletos); si falta menos (un escaneo cortado), se completa con ceros. Una máscara suave sin datos suficientes se ignora.
+- Los datos con predictor PNG se copian sin recomprimir solo si un lector estricto los aceptaría (zlib bien formado de punta a punta: bloques sin compresión con su largo complementario, códigos Huffman completos, el flujo terminando justo antes de la suma Adler-32 y esa suma correcta; filas completas y filtros 0 a 4); si no, se decodifican y se vuelven a comprimir. Las paletas se completan en negro hasta cubrir todos los índices posibles.
+- La tabla de una paleta o una máscara suave que comparten varias imágenes se decodifica una sola vez; para solo listar las imágenes no se lee ninguna. Una imagen escrita como diccionario directo en los recursos (sin flujo, no válida) se cuenta en la página pero no figura en `images`.
+- Por documento: a lo sumo 10.000 imágenes distintas en `images`, 100.000 lugares entre todas y 128 MB de imágenes (`doc2json::read_with_image_budget` en Rust acepta otro tope). Cada imagen descuenta del tope, antes de leerla, lo que declara: en PDF sus píxeles decodificados (el largo del flujo si es JPEG, JPEG 2000 o fax); en Word su tamaño descomprimido. Una imagen que ya no cabe no se decodifica. Lo que pasa de ahí queda fuera o con `note`, y con un aviso en `warnings`.
+- Como se cobran los píxeles decodificados, 128 MB son unas cinco páginas A4 escaneadas en RGB a 300 ppp (unos 25 MB cada una): en un documento escaneado más largo, las imágenes de las páginas siguientes quedan con `note`. Para subir el tope hay que leerlo con `doc2json::read_with_image_budget(bytes, tope)` en Rust; la consola y la web usan siempre 128 MB.
+- La misma imagen se reconoce aunque la citen de otra forma: en PDF por el número de objeto (sin la generación, que no cambia lo que se lee); en Word por la ruta de la parte sin distinguir mayúsculas. Las imágenes vinculadas (`TargetMode="External"`) no se leen del paquete aunque su destino se parezca a una parte de él.
 
 ---
 
@@ -280,10 +317,10 @@ Quien llame al módulo directamente (sin `doc2json.js`) usa `doc_convert(ptr, la
 | 1 | JSON completo | — |
 | 2 | Markdown | — |
 | 3 | Fragmentos en JSON | tamaño máximo en caracteres (0 = 2000) |
-| 4 | JSON con imágenes | lado mínimo de las imágenes (reservada) |
-| 5 | JSON completo con imágenes | lado mínimo de las imágenes (reservada) |
+| 4 | JSON con imágenes | lado mínimo de las imágenes |
+| 5 | JSON completo con imágenes | lado mínimo de las imágenes |
 
-Una operación que el módulo no conoce da error («Modo de conversion desconocido.»), nunca otra salida. El protocolo completo está al inicio de `doc2json/src/wasm.rs`.
+Con imágenes, el resultado es `[largo del JSON: u32 little endian][JSON][bytes de las imágenes]`, y cada imagen del JSON trae su `offset` y `length` en ese bloque final. Una operación que el módulo no conoce da error («Modo de conversion desconocido.»), nunca otra salida. El protocolo completo está al inicio de `doc2json/src/wasm.rs`.
 
 ### Guardar documentos en Supabase
 
@@ -455,7 +492,9 @@ node web/prueba.mjs
 - En PDF etiquetado vale lo que diga el etiquetado. Word no exporta las combinaciones verticales de celdas (`RowSpan`), así que esas celdas salen vacías en vez de `merged`. No se leen las etiquetas de formularios incrustados (`/Stm`) ni las anotaciones referidas desde el árbol (`OBJR`): su texto igual se recupera por posición.
 - No abre los PDF que piden contraseña para abrirse ni los protegidos con certificados o DRM: da un mensaje claro.
 - Si un PDF usa fuentes sin tabla de caracteres, ese texto es ilegible para cualquier extractor (también al copiar y pegar desde un visor).
-- Las imágenes se cuentan y, en Word, se nombran; no se extraen.
+- En PDF las imágenes no se insertan en `content` (que se deduce del texto): se ubican con `places`.
+- Los PNG se comprimen con códigos Huffman fijos: una imagen sin compresión en el PDF puede quedar más pesada que con un compresor completo. Las fotografías suelen venir como JPEG, que se entrega tal cual.
+- Las imágenes se extraen de Word y PDF; en PowerPoint y Excel se nombran pero no se extraen.
 - En Word y PowerPoint no se lee el texto de gráficos ni de diagramas SmartArt; en Excel no se leen gráficos, imágenes ni comentarios.
 - En Excel no se recalculan fórmulas ni se aplican los formatos de número completos (separador de miles, decimales fijos, moneda): los números salen con su valor exacto.
 - No lee `.doc`, `.xls` ni `.ppt` antiguos (Office 97-2003), ni libros binarios `.xlsb`, ni archivos de Office con contraseña de apertura: da un mensaje pidiendo guardarlos en el formato actual.
@@ -487,12 +526,19 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - 162 presentaciones reales: coincide el 99,8 % de los caracteres y no hay texto duplicado. El resto también está, cortado distinto: los saltos de línea dentro de una celda de tabla se conservan como tales.
 - 1.003 planillas reales (2,2 millones de celdas con valor): coincide el 99,8 % de las celdas. Lo que no coincide son textos con escapes `_xHHHH_` que la referencia deja sin decodificar (Excel los muestra decodificados, como aquí), valores tapados por una combinación de celdas que Excel no muestra, y 112 números.
 
+**doc2json, imágenes** contra PyMuPDF y Pillow
+
+- 300 PDF reales con imágenes (8.812 imágenes): se extraen 8.807 (las otras 5 pasan de 25 millones de píxeles) y todas abren en Pillow con el tamaño declarado (3.520 JPEG, 5.162 PNG, 125 TIFF). De los PNG comparables con el mapa de píxeles de PyMuPDF, 3.336 de 3.338 difieren en a lo sumo 1 nivel por canal; los otros 2 usan perfiles ICC, que PyMuPDF aplica y aquí no.
+- Lugares: 54.044 contra 54.230 de PyMuPDF; en páginas sin girar, el 98,8 % coincide con su rectángulo con menos de 1,5 puntos de diferencia.
+- 200 Word reales (10.426 imágenes): los bytes extraídos son idénticos a los del archivo incrustado en todos los casos, y el 98,3 % queda citado desde un bloque o una celda (el resto está en encabezados y pies).
+
 **Resistencia**
 
 - 1.500 PDF (6.127 páginas) y 400 Word reales: ningún fallo ni cuelgue; 51 ms por archivo en promedio.
 - 162 presentaciones y 1.003 planillas reales: ningún fallo ni cuelgue; mediana de 39 ms por presentación y 16 ms por planilla. Los únicos errores fueron archivos de bloqueo de Office y uno truncado, con un mensaje claro.
 - 460 archivos dañados a propósito (truncados, con bytes alterados, con tramos borrados): todos terminan en lectura parcial o en un error claro.
 - Archivos "bomba" armados en `doc2json/tests/presupuesto.rs` (un `.docx` de ~250 KB que descomprime 40 MB, otro con la bomba en los estilos o antes del cuerpo, un PDF con un flujo que descomprime 30 MB, seis flujos que solo juntos pasan el límite, flujos LZW, ASCII85, RunLength y cadenas de filtros, un flujo de objetos, un formulario repetido en 12 páginas, un PDF de 50 páginas): se cortan en el límite pedido con su aviso, sin afectar a la lectura siguiente.
+- Imágenes fabricadas para agotar la memoria o el trabajo (un diccionario de 1 MB dibujado 400 veces, también como diccionario directo; 5.000 × 5.000 píxeles declarados con 150 bytes; máscaras y paletas cortas; una paleta y una máscara de 1 MB compartidas por 200 imágenes; imágenes que no caben en el tope; PNG por dentro con filtros, sumas, NLEN o bytes sobrantes inválidos; la misma imagen citada con otra generación o con otras mayúsculas): `tests/imagenes_memoria.rs` mide la memoria máxima y la pedida en total con un asignador que cuenta, y `tests/imagenes.rs` el resultado.
 - En todas las herramientas, el archivo generado en el navegador es idéntico byte a byte al del ejecutable.
 
 Los scripts de comparación y los archivos con que se hizo esta validación no forman parte de este repositorio.
@@ -513,6 +559,7 @@ doc2json/src/           doc2json
   docx.rs               lector de Word: estilos, numeración, tablas, notas
   pptx.rs               lector de PowerPoint: orden de lectura, viñetas, tablas, notas
   xlsx.rs               lector de Excel: textos compartidos, formatos de fecha, combinaciones
+  image.rs  png.rs      lista de imágenes, formato por cabecera y escritor PNG
   pdf/
     object.rs           objetos de PDF y su analizador
     document.rs         tabla de referencias, objetos, páginas, metadatos
@@ -523,6 +570,7 @@ doc2json/src/           doc2json
     content.rs          intérprete del contenido de página (incluido el contenido marcado)
     layout.rs           de letras con coordenadas a líneas, párrafos y tablas
     structure.rs        PDF etiquetado: árbol de estructura a títulos, listas, tablas y notas
+    images.rs           imágenes de PDF: ubicación y conversión a PNG, JPEG o TIFF
   doc.rs                modelo común de documento y salida JSON
   markdown.rs           Markdown (tablas GFM, notas) y fragmentos por sección
   symbols.rs            fuentes Symbol y Wingdings a Unicode
@@ -530,6 +578,7 @@ doc2json/tests/
   ejemplo.rs            pruebas de punta a punta con los archivos de ejemplo/
   presupuesto.rs        archivos "bomba" armados en la prueba y los límites de recursos
   office.rs             PowerPoint y Excel con paquetes armados en la prueba
+  imagenes.rs           imágenes de Word y PDF armados en la prueba
 web/
   mpp2xlsx.js  .d.ts  .wasm     módulo de Project
   doc2json.js  .d.ts  .wasm     módulo de documentos

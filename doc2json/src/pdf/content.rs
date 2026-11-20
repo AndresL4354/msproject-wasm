@@ -73,10 +73,25 @@ struct Marked {
 /// Profundidad maxima del contenido marcado; lo que se abre mas adentro solo se cuenta.
 const MAX_MARKED: usize = 256;
 
+/// Una imagen dibujada: su objeto y la transformacion con que se dibujo.
+pub struct ImageUse {
+    /// Numero del objeto: las imagenes se reconocen por el aunque se repitan. Sin la generacion,
+    /// porque `Pdf::resolve` tampoco la usa (`7 0 R` y `7 1 R` son el mismo objeto).
+    pub key: u32,
+    /// El objeto compartido (el mismo `Rc` del cache del PDF): dibujar mil veces una imagen no
+    /// copia mil veces su diccionario. Por eso solo se registran imagenes indirectas.
+    pub obj: Rc<Obj>,
+    pub ctm: Matrix,
+}
+
 #[derive(Default)]
 pub struct PageText {
     pub items: Vec<Item>,
     pub images: usize,
+    /// Imagenes de objeto dibujadas (`Do`), en orden.
+    pub uses: Vec<ImageUse>,
+    /// Imagenes incrustadas en el contenido (`BI ... EI`): se cuentan, no se extraen.
+    pub inline_images: usize,
     /// Glifos sin correspondencia Unicode conocida.
     pub unmapped: usize,
 }
@@ -776,6 +791,7 @@ impl<'p, 'a> Interp<'p, 'a> {
                     };
                     lx.pos = end;
                     self.out.images += 1;
+                    self.out.inline_images += 1;
                 }
                 _ => {}
             }
@@ -784,19 +800,44 @@ impl<'p, 'a> Interp<'p, 'a> {
     }
 
     fn xobject(&mut self, resources: &Dict, name: &str, st: &State) {
-        // Sin copiar el diccionario de recursos: se dibujan muchas veces.
-        let (obj, _) = match self.pdf.sub_entry(resources, "XObject", name) {
-            Some(e) => e,
+        // Sin copiar diccionarios: se dibujan muchas veces, y `Pdf::resolve` copia los objetos
+        // directos. Uno indirecto se toma del cache del PDF; uno directo, prestado.
+        let held;
+        let xobjects: &Obj = match resources.get("XObject") {
+            Some(o @ Obj::Ref(..)) => {
+                held = self.pdf.resolve(o);
+                &held
+            }
+            Some(o) => o,
             None => return,
         };
+        let entry = match xobjects.as_dict().and_then(|x| x.get(name)) {
+            Some(o) => o,
+            None => return,
+        };
+        let shared = match entry {
+            Obj::Ref(n, _) => Some((*n, self.pdf.resolve(entry))),
+            _ => None,
+        };
+        let obj: &Obj = shared.as_ref().map_or(entry, |(_, o)| o);
         let dict = match obj.as_dict() {
             Some(d) => d,
             None => return,
         };
         match dict.get("Subtype").and_then(|s| s.as_name()) {
-            Some("Image") => self.out.images += 1,
+            Some("Image") => {
+                self.out.images += 1;
+                // Solo se registra una imagen indirecta (un flujo, como pide la norma), que comparte
+                // el `Rc` del cache. Un diccionario directo no es una imagen valida, y guardarlo
+                // pediria una copia por cada `Do`.
+                if let Some((n, o)) = &shared {
+                    if self.out.uses.len() < 100_000 {
+                        self.out.uses.push(ImageUse { key: *n, obj: o.clone(), ctm: st.ctm });
+                    }
+                }
+            }
             Some("Form") if self.depth < 12 => {
-                let data = match self.pdf.stream_data(&obj) {
+                let data = match self.pdf.stream_data(obj) {
                     Some(d) => d,
                     None => return,
                 };

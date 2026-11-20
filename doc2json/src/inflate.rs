@@ -2,6 +2,7 @@
 //!
 //! Lo usan los .docx (son un ZIP) y los PDF (filtro FlateDecode). Es tolerante: si los datos
 //! estan truncados o danados devuelve lo que alcanzo a descomprimir y lo indica en `ok`.
+//! `zlib_strict`, en cambio, rechaza todo lo que rechazaria un lector estricto como el de PNG.
 
 pub struct Inflated {
     pub data: Vec<u8>,
@@ -16,6 +17,12 @@ struct Bits<'a> {
     pos: usize,
     acc: u32,
     n: u32,
+    /// Rechaza lo que zlib rechaza aunque se pueda leer: largo de bloque sin su complemento y
+    /// codigos Huffman incompletos o sobrepasados.
+    strict: bool,
+    /// Distancia maxima de una referencia: la ventana que declara la cabecera zlib en la lectura
+    /// estricta; sin limite en la tolerante.
+    window: usize,
 }
 
 impl Bits<'_> {
@@ -186,6 +193,29 @@ fn fit(out: &mut Vec<u8>, n: usize, cap: usize, cut: &mut bool, fill: impl FnOnc
     Some(())
 }
 
+/// Las longitudes forman un codigo Huffman que zlib acepta: ni sobrepasado (mas codigos de los
+/// que caben) ni incompleto. Un codigo incompleto solo se admite con un unico simbolo de largo 1,
+/// y nunca en el codigo de las longitudes (`lengths_code`). Sin ningun simbolo tambien se acepta:
+/// falla al usarlo, como en zlib.
+fn complete(lengths: &[u8], lengths_code: bool) -> bool {
+    let mut count = [0i32; 16];
+    for &l in lengths {
+        count[(l & 15) as usize] += 1;
+    }
+    let max = (1..16).rev().find(|&l| count[l] > 0).unwrap_or(0);
+    if max == 0 {
+        return true;
+    }
+    let mut left = 1i32;
+    for c in &count[1..] {
+        left = (left << 1) - c;
+        if left < 0 {
+            return false;
+        }
+    }
+    left == 0 || (!lengths_code && max == 1)
+}
+
 /// Descomprime un bloque con Huffman. `cut` se marca si la salida llego a `cap` (no por datos
 /// danados): lo que cabia queda en `out`, hasta exactamente `cap` bytes.
 fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, cap: usize, cut: &mut bool) -> Option<()> {
@@ -210,7 +240,7 @@ fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, cap: us
                 return None;
             }
             let distance = DIST_BASE[d] as usize + b.bits(DIST_EXTRA[d] as u32)? as usize;
-            if distance > out.len() {
+            if distance > out.len() || distance > b.window {
                 return None;
             }
             fit(out, len, cap, cut, |o, k| copy_back(o, distance, k))?;
@@ -240,6 +270,12 @@ fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize, cut: &mut bool) -> Option<()
             0 => {
                 b.align();
                 let len = *b.d.get(b.pos)? as usize | (*b.d.get(b.pos + 1)? as usize) << 8;
+                if b.strict {
+                    let nlen = *b.d.get(b.pos + 2)? as usize | (*b.d.get(b.pos + 3)? as usize) << 8;
+                    if nlen != !len & 0xFFFF {
+                        return None;
+                    }
+                }
                 b.pos += 4;
                 let chunk = b.d.get(b.pos..b.pos + len)?;
                 // Un bloque almacenado que no cabe entero tambien entrega lo que cabe y avisa.
@@ -263,6 +299,9 @@ fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize, cut: &mut bool) -> Option<()
                 for &o in CLEN_ORDER.iter().take(nclen) {
                     cl[o] = b.bits(3)? as u8;
                 }
+                if b.strict && !complete(&cl, true) {
+                    return None;
+                }
                 let clh = Huffman::new(&cl);
                 let mut lengths = vec![0u8; nlit + ndist];
                 let mut i = 0usize;
@@ -285,6 +324,10 @@ fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize, cut: &mut bool) -> Option<()
                     lengths[i..i + repeat].fill(value);
                     i += repeat;
                 }
+                // Sin codigo para el fin de bloque, zlib no lo lee.
+                if b.strict && (lengths[256] == 0 || !complete(&lengths[..nlit], false) || !complete(&lengths[nlit..], false)) {
+                    return None;
+                }
                 block(b, out, &Huffman::new(&lengths[..nlit]), &Huffman::new(&lengths[nlit..]), cap, cut)?;
             }
             _ => return None,
@@ -300,12 +343,40 @@ fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize, cut: &mut bool) -> Option<()
 pub fn inflate(d: &[u8]) -> Inflated {
     let cap = crate::budget::room(MAX_OUTPUT);
     let mut out = Vec::with_capacity(d.len().saturating_mul(3).min(cap));
-    let mut b = Bits { d, pos: 0, acc: 0, n: 0 };
+    let mut b = Bits { d, pos: 0, acc: 0, n: 0, strict: false, window: usize::MAX };
     let mut cut = false;
     let ok = run(&mut b, &mut out, cap, &mut cut).is_some();
     // Se corto por el presupuesto (no por el tope fijo por flujo ni por datos danados): se avisa.
     crate::budget::spend(out.len(), cut && cap < MAX_OUTPUT);
     Inflated { data: out, ok }
+}
+
+/// Descomprime un flujo zlib solo si un lector estricto (el de un PNG) lo aceptaria entero:
+/// cabecera valida, ventana de hasta 32 KB, sin diccionario previo y ninguna referencia mas lejana
+/// que la ventana declarada; bloques sin compresion con su largo complementario (NLEN) y codigos
+/// Huffman completos; el flujo DEFLATE terminando justo antes de la suma Adler-32, y esa suma
+/// correcta. `None` si no, o si la salida pasaria de `max` bytes (quien llama sabe cuanto debe
+/// medir: no se descomprime de mas para descubrir que sobra). Lo descomprimido se descuenta del
+/// presupuesto de la lectura, como en `inflate`.
+pub fn zlib_strict(d: &[u8], max: usize) -> Option<Vec<u8>> {
+    if d.len() < 6 || d[0] & 0x0F != 8 || d[0] >> 4 > 7 || ((d[0] as u32) << 8 | d[1] as u32) % 31 != 0 || d[1] & 0x20 != 0 {
+        return None;
+    }
+    // Sin los 4 bytes de la suma: si el flujo DEFLATE los necesitara, no termina donde debe.
+    let body = &d[2..d.len() - 4];
+    let limit = max.min(MAX_OUTPUT);
+    let cap = crate::budget::room(limit);
+    let mut out = Vec::with_capacity(body.len().saturating_mul(3).min(cap));
+    let mut b = Bits { d: body, pos: 0, acc: 0, n: 0, strict: true, window: 1 << ((d[0] >> 4) + 8) };
+    let mut cut = false;
+    let done = run(&mut b, &mut out, cap, &mut cut);
+    crate::budget::spend(out.len(), cut && cap < limit);
+    done?;
+    // La lectura rapida carga bytes por adelantado (`fill`): los enteros que quedan sin consumir
+    // en el acumulador no son parte del flujo DEFLATE.
+    let end = b.pos - (b.n / 8) as usize;
+    let adler = u32::from_be_bytes([d[d.len() - 4], d[d.len() - 3], d[d.len() - 2], d[d.len() - 1]]);
+    (end == body.len() && crate::png::adler32(&out) == adler).then_some(out)
 }
 
 /// Descomprime un flujo zlib (el del filtro FlateDecode de PDF). Si no trae cabecera zlib
@@ -356,6 +427,8 @@ mod tests {
         assert!(r.ok);
         let esperado = "Mantenimiento de chancador primario, cambio de poste y limpieza de taza. ".repeat(6) + "Fin.";
         assert_eq!(r.data, esperado.as_bytes());
+        // Hecho por zlib: tambien lo acepta la lectura estricta.
+        assert_eq!(zlib_strict(&d, MAX_OUTPUT).as_deref(), Some(esperado.as_bytes()));
     }
 
     #[test]
@@ -363,5 +436,166 @@ mod tests {
         let d = [0x78, 0xDA, 0xCB, 0xC8];
         let r = zlib(&d);
         assert!(!r.ok);
+    }
+
+    /// Escribe bits como DEFLATE: los numeros desde el bit bajo; los codigos Huffman, desde el alto.
+    #[derive(Default)]
+    struct Escritor {
+        out: Vec<u8>,
+        acc: u8,
+        n: u32,
+    }
+
+    impl Escritor {
+        fn bit(&mut self, b: u32) {
+            self.acc |= (b as u8) << self.n;
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.acc);
+                self.acc = 0;
+                self.n = 0;
+            }
+        }
+        fn bits(&mut self, v: u32, count: u32) {
+            for i in 0..count {
+                self.bit((v >> i) & 1);
+            }
+        }
+        fn code(&mut self, code: &str) {
+            for c in code.bytes() {
+                self.bit((c - b'0') as u32);
+            }
+        }
+        fn fin(mut self) -> Vec<u8> {
+            if self.n > 0 {
+                self.out.push(self.acc);
+            }
+            self.out
+        }
+    }
+
+    /// zlib de "a" en un bloque de Huffman dinamico. `largo_b` y `largo_fin` son los largos de los
+    /// codigos de 'b' y del fin de bloque ('a' mide 1), y `fin` el codigo de fin de bloque.
+    fn dinamico(largo_b: u32, largo_fin: u32, fin: &str) -> Vec<u8> {
+        let mut w = Escritor::default();
+        w.bits(1, 1); // ultimo bloque
+        w.bits(2, 2); // Huffman dinamico
+        w.bits(0, 5); // 257 literales y largos
+        w.bits(0, 5); // 1 distancia
+        w.bits(14, 4); // 18 largos del codigo de largos
+        // Codigo de largos (completo): 18 -> "0", 1 -> "10", 2 -> "11".
+        for s in [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1] {
+            w.bits(
+                match s {
+                    18 => 1,
+                    1 | 2 => 2,
+                    _ => 0,
+                },
+                3,
+            );
+        }
+        let mut largos = [0u32; 258];
+        largos[97] = 1;
+        largos[98] = largo_b;
+        largos[256] = largo_fin;
+        largos[257] = 1; // una sola distancia de largo 1: incompleto, pero zlib lo admite
+        let mut i = 0;
+        while i < largos.len() {
+            if largos[i] == 0 {
+                let mut run = 0;
+                while i + run < largos.len() && largos[i + run] == 0 && run < 138 {
+                    run += 1;
+                }
+                assert!(run >= 11);
+                w.code("0");
+                w.bits(run as u32 - 11, 7);
+                i += run;
+            } else {
+                w.code(if largos[i] == 1 { "10" } else { "11" });
+                i += 1;
+            }
+        }
+        w.code("0"); // 'a'
+        w.code(fin);
+        let mut z = vec![0x78, 0x01];
+        z.extend_from_slice(&w.fin());
+        z.extend_from_slice(&((98u32 << 16) | 98).to_be_bytes()); // Adler-32 de "a"
+        z
+    }
+
+    #[test]
+    fn zlib_estricto_acepta_flujos_validos() {
+        let fijo = [0x78, 0xDA, 0xCB, 0xC8, 0xCF, 0x49, 0x54, 0xC8, 0xC0, 0x24, 0x00, 0x6D, 0x1E, 0x08, 0xB5];
+        assert_eq!(zlib_strict(&fijo, MAX_OUTPUT).as_deref(), Some(&b"hola hola hola hola hola"[..]));
+        let mut almacenado = vec![0x78, 0x01, 0x01, 0x04, 0x00, 0xFB, 0xFF, b'h', b'o', b'l', b'a'];
+        almacenado.extend_from_slice(&crate::png::adler32(b"hola").to_be_bytes());
+        assert_eq!(zlib_strict(&almacenado, MAX_OUTPUT).as_deref(), Some(&b"hola"[..]));
+        // Codigos completos ('a' y fin de bloque de largo 1).
+        assert_eq!(zlib_strict(&dinamico(0, 1, "1"), MAX_OUTPUT).as_deref(), Some(&b"a"[..]));
+    }
+
+    #[test]
+    fn zlib_estricto_rechaza_lo_que_el_tolerante_lee() {
+        let mut almacenado = vec![0x78, 0x01, 0x01, 0x04, 0x00, 0xFB, 0xFF, b'h', b'o', b'l', b'a'];
+        almacenado.extend_from_slice(&crate::png::adler32(b"hola").to_be_bytes());
+        let mut casos: Vec<(&str, Vec<u8>)> = Vec::new();
+        // NLEN que no es el complemento de LEN.
+        let mut nlen = almacenado.clone();
+        nlen[5] = 0;
+        casos.push(("NLEN", nlen));
+        // Un byte de mas entre el fin del flujo DEFLATE y la suma.
+        let mut sobra = almacenado.clone();
+        sobra.insert(sobra.len() - 4, 0);
+        casos.push(("byte sobrante", sobra));
+        // Suma Adler-32 equivocada.
+        let mut adler = almacenado.clone();
+        let n = adler.len();
+        adler[n - 1] ^= 1;
+        casos.push(("Adler-32", adler));
+        // Ventana de 64 KB (CINFO 8), con la cabecera bien verificada.
+        let mut ventana = almacenado.clone();
+        ventana[..2].copy_from_slice(&[0x88, 0x1C]);
+        casos.push(("ventana", ventana));
+        // Fin de bloque de largo 2 junto a 'a' de largo 1: codigo incompleto.
+        casos.push(("incompleto", dinamico(0, 2, "10")));
+        // 'a' y fin de bloque de largo 1, y ademas 'b' de largo 2: codigo sobrepasado.
+        casos.push(("sobrepasado", dinamico(2, 1, "1")));
+        for (nombre, z) in casos {
+            let r = zlib(&z);
+            assert!(r.ok && !r.data.is_empty(), "{}: el lector tolerante deberia leerlo", nombre);
+            assert_eq!(zlib_strict(&z, MAX_OUTPUT), None, "{}", nombre);
+        }
+    }
+
+    #[test]
+    fn zlib_estricto_rechaza_distancias_mayores_que_la_ventana() {
+        // Bloque sin compresion con 300 bytes y luego uno de Huffman fijo que copia 3 bytes desde
+        // 300 atras.
+        let datos: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut cuerpo = vec![0x00, 0x2C, 0x01, 0xD3, 0xFE];
+        cuerpo.extend_from_slice(&datos);
+        let mut w = Escritor::default();
+        w.bits(1, 1); // ultimo bloque
+        w.bits(1, 2); // Huffman fijo
+        w.code("0000001"); // largo 3
+        w.code("10000"); // distancias de 257 a 384
+        w.bits(300 - 257, 7);
+        w.code("0000000"); // fin de bloque
+        cuerpo.extend_from_slice(&w.fin());
+        let mut esperado = datos.clone();
+        esperado.extend_from_slice(&datos[..3]);
+        let adler = crate::png::adler32(&esperado).to_be_bytes();
+        let con_cabecera = |cabecera: [u8; 2]| {
+            let mut z = cabecera.to_vec();
+            z.extend_from_slice(&cuerpo);
+            z.extend_from_slice(&adler);
+            z
+        };
+        // Ventana de 32 KB: la referencia cabe.
+        assert_eq!(zlib_strict(&con_cabecera([0x78, 0x01]), MAX_OUTPUT).as_deref(), Some(&esperado[..]));
+        // Ventana de 256 bytes (CINFO 0): la referencia queda fuera, aunque el tolerante la lee.
+        let corta = con_cabecera([0x08, 0x1D]);
+        assert_eq!(zlib(&corta).data, esperado);
+        assert_eq!(zlib_strict(&corta, MAX_OUTPUT), None);
     }
 }
