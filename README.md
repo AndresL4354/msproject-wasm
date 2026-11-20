@@ -5,7 +5,7 @@ Dos herramientas independientes, escritas en **Rust sin ninguna dependencia**, q
 | Herramienta | Entrada | Salida | Ejecutable | WebAssembly |
 |---|---|---|---|---|
 | **mpp2xlsx** | Microsoft Project (`.mpp`) | Excel (`.xlsx`) con Gantt, y JSON | 569 KB | 339 KB (93 KB con brotli) |
-| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado, e imágenes | 554 KB | 481 KB (149 KB con brotli) |
+| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado, e imágenes | 960 KB | 745 KB (219 KB con brotli) |
 
 No necesitan Microsoft Project, Office, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
 
