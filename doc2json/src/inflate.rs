@@ -597,5 +597,60 @@ mod tests {
         let corta = con_cabecera([0x08, 0x1D]);
         assert_eq!(zlib(&corta).data, esperado);
         assert_eq!(zlib_strict(&corta, MAX_OUTPUT), None);
+
+        // Una referencia justo a la distancia de la ventana (256 con CINFO 0) si cabe.
+        let mut cuerpo = vec![0x00, 0x2C, 0x01, 0xD3, 0xFE];
+        cuerpo.extend_from_slice(&datos);
+        let mut w = Escritor::default();
+        w.bits(1, 1);
+        w.bits(1, 2);
+        w.code("0000001"); // largo 3
+        w.code("01111"); // distancias de 193 a 256
+        w.bits(256 - 193, 6);
+        w.code("0000000");
+        cuerpo.extend_from_slice(&w.fin());
+        let mut esperado = datos.clone();
+        esperado.extend_from_slice(&datos[44..47]);
+        let mut z = vec![0x08, 0x1D];
+        z.extend_from_slice(&cuerpo);
+        z.extend_from_slice(&crate::png::adler32(&esperado).to_be_bytes());
+        assert_eq!(zlib_strict(&z, MAX_OUTPUT).as_deref(), Some(&esperado[..]));
+    }
+
+    #[test]
+    fn zlib_estricto_rechaza_bytes_sobrantes_tras_un_bloque_huffman() {
+        // La lectura rapida carga bytes por adelantado: el byte de mas entre el fin del bloque
+        // Huffman y la suma puede quedar ya cargado, y no por eso es parte del flujo.
+        let fijo = [0x78, 0xDA, 0xCB, 0xC8, 0xCF, 0x49, 0x54, 0xC8, 0xC0, 0x24, 0x00, 0x6D, 0x1E, 0x08, 0xB5];
+        for extra in [&[0u8][..], &[0, 0][..], &[0xFF, 0xFF, 0xFF][..]] {
+            let mut sobra = fijo.to_vec();
+            let n = sobra.len() - 4;
+            sobra.splice(n..n, extra.iter().copied());
+            assert!(zlib(&sobra).ok, "el tolerante lo lee");
+            assert_eq!(zlib_strict(&sobra, MAX_OUTPUT), None, "{:?}", extra);
+        }
+    }
+
+    #[test]
+    fn zlib_estricto_no_pasa_del_largo_pedido() {
+        // Un flujo que infla ~1 MB de ceros (un literal y copias de 258 a distancia 1): con un largo
+        // maximo de 1.000 se descomprime a lo sumo eso, y el presupuesto lo registra.
+        let mut w = Escritor::default();
+        w.bits(1, 1);
+        w.bits(1, 2);
+        w.code("00110000"); // literal 0
+        for _ in 0..4000 {
+            w.code("11000101"); // largo 258
+            w.code("00000"); // distancia 1
+        }
+        w.code("0000000");
+        let mut z = vec![0x78, 0x01];
+        z.extend_from_slice(&w.fin());
+        z.extend_from_slice(&crate::png::adler32(&vec![0u8; 1 + 4000 * 258]).to_be_bytes());
+        assert_eq!(zlib_strict(&z, MAX_OUTPUT).map(|d| d.len()), Some(1 + 4000 * 258));
+        crate::budget::begin(crate::budget::Limits::default());
+        assert_eq!(zlib_strict(&z, 1000), None);
+        let gastado = crate::budget::end();
+        assert!(gastado.decompressed <= 1000 && !gastado.decompressed_hit, "{:?}", gastado);
     }
 }

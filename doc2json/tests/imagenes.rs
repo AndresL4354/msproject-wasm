@@ -660,6 +660,25 @@ fn pdf_tope_descuenta_los_pixeles_declarados_antes_de_decodificar() {
 }
 
 #[test]
+fn pdf_imagenes_que_inflan_de_mas_cuentan_en_el_presupuesto_de_la_lectura() {
+    // Imagenes de 1 x 1 cuyo flujo infla 60.000 bytes cada una: el tope de imagenes las cobra por
+    // su pixel declarado, pero descomprimirlas cuenta en el presupuesto de la lectura, que avisa al
+    // agotarse.
+    let n = 5;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let imgs = (0..n).map(|_| stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode", &zlib_stored(&[0u8; 60_000]))).collect();
+    let bytes = pdf_con(&names, &content, imgs);
+    let limites = doc2json::budget::Limits { max_decompressed: 100_000, ..Default::default() };
+    let d = doc2json::read_with(&bytes, limites, Some(doc2json::image::MAX_EXTRACTED)).unwrap();
+    assert_eq!(d.images.len(), n);
+    assert!(d.warnings.iter().any(|w| w.contains("limite de datos descomprimidos")), "{:?}", d.warnings);
+    // Sin presupuesto chico, las cinco se extraen.
+    let d = doc2json::read_with(&bytes, Default::default(), Some(doc2json::image::MAX_EXTRACTED)).unwrap();
+    assert!(d.images.iter().all(|i| i.data.is_some()), "{:?}", d.images.iter().map(|i| &i.note).collect::<Vec<_>>());
+}
+
+#[test]
 fn pdf_paleta_y_mascara_compartidas_se_aplican_a_cada_imagen() {
     // La misma tabla de colores en dos paletas de distinta base, y la misma mascara suave en dos
     // imagenes de su tamano y en una de otro tamano (que sale sin transparencia).

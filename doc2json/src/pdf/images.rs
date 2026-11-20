@@ -329,7 +329,8 @@ fn bits(pdf: &Pdf, d: &Dict) -> u8 {
 
 /// Los datos Flate con predictor PNG ya son el contenido de IDAT de un PNG. Se copian solo si un
 /// lector de PNG estricto los aceptaria: zlib que pasa `inflate::zlib_strict` (sin diccionario,
-/// bloques bien formados, sin bytes entre el final y la suma Adler-32, y esa suma correcta),
+/// bloques bien formados, ninguna referencia mas lejana que la ventana declarada, sin bytes entre
+/// el final y la suma Adler-32, y esa suma correcta),
 /// filas completas y tipos de filtro 0 a 4. Si no, `None` y la imagen se decodifica y se vuelve
 /// a comprimir.
 fn passthrough(pdf: &Pdf, shared: &mut Shared, d: &Dict, data: &[u8], w: u32, h: u32, p: &Parms) -> Option<Vec<u8>> {
