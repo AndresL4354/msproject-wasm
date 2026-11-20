@@ -40,6 +40,10 @@ const MAX_SYMBOLS: usize = 1 << 20;
 /// diccionarios, regiones, fin); sin tope, cada 11 bytes del archivo arman uno.
 const MAX_SEGMENTS: usize = 1 << 16;
 
+/// Tope de referencias entre segmentos de un flujo, sumadas las de todos sus segmentos. Cada una
+/// ocupa un byte en el archivo pero cuatro en memoria; un segmento real cita unos pocos.
+const MAX_REFS: usize = 1 << 20;
+
 /// Lecturas permitidas despues del final de los datos (o de la marca de fin). Un flujo bien
 /// formado solo necesita unas pocas; pasado esto, los datos se terminaron antes de tiempo.
 const MQ_TAIL: u32 = 256;
@@ -853,6 +857,7 @@ fn segments(d: &[u8]) -> Result<Vec<Segment<'_>>, String> {
     let bad = || "JBIG2: encabezado de segmento danado.".to_string();
     let mut out = Vec::new();
     let mut i = 0usize;
+    let mut all_refs = 0usize;
     while i + 11 <= d.len() {
         let number = be32(d, i).ok_or_else(bad)?;
         let flags = d[i + 4];
@@ -865,6 +870,10 @@ fn segments(d: &[u8]) -> Result<Vec<Segment<'_>>, String> {
             i += 4 + (count + 8) / 8;
         } else {
             i += 1;
+        }
+        all_refs = all_refs.saturating_add(count);
+        if all_refs > MAX_REFS {
+            return Err("JBIG2: demasiadas referencias entre segmentos.".into());
         }
         let size = if number <= 256 { 1 } else if number <= 65536 { 2 } else { 4 };
         let mut refs = Vec::with_capacity(count.min(1024));
@@ -1560,7 +1569,8 @@ mod tests {
         s.extend(segment(1, 0, &DictEnc::new().data(0, 0, 0x8000_0001)));
         assert!(decode(&s, None, 8, 8).unwrap_err().contains("demasiados simbolos"));
         // Una region de texto que junta mas simbolos que el tope repitiendo la referencia al mismo
-        // diccionario (forma larga de las referencias: 1.100.000 de ellas).
+        // diccionario (forma larga de las referencias: 1.100.000 de ellas). El tope de referencias
+        // la corta antes de juntar los simbolos.
         let mut de = DictEnc::new();
         de.class(1, &[glyph(1, 1)]);
         de.runs(&[0, 1]);
@@ -1575,7 +1585,28 @@ mod tests {
         s.push(1);
         s.extend_from_slice(&(body.len() as u32).to_be_bytes());
         s.extend(body);
-        assert!(decode(&s, None, 8, 8).unwrap_err().contains("demasiados simbolos"));
+        assert!(decode(&s, None, 8, 8).unwrap_err().contains("demasiadas referencias"));
+    }
+
+    #[test]
+    fn referencias_entre_segmentos_con_tope() {
+        // Segmentos que citan, entre todos, mas de `MAX_REFS` segmentos: cada referencia ocupa
+        // cuatro bytes en memoria y uno en el archivo. Por debajo del tope se leen.
+        let con = |por_segmento: u32, segmentos: u32| {
+            let mut s = Vec::new();
+            for k in 0..segmentos {
+                s.extend_from_slice(&(k + 1).to_be_bytes());
+                s.push(62); // extension (se ignora)
+                s.extend_from_slice(&(por_segmento | 0xE000_0000).to_be_bytes());
+                s.extend(vec![0u8; (por_segmento as usize + 8) / 8]);
+                s.extend(vec![0u8; por_segmento as usize]);
+                s.push(1);
+                s.extend_from_slice(&0u32.to_be_bytes());
+            }
+            s
+        };
+        assert!(matches!(segments(&con(300_000, 4)), Err(e) if e.contains("demasiadas referencias")));
+        assert_eq!(segments(&con(1000, 3)).map(|s| s.len()), Ok(3));
     }
 
     #[test]

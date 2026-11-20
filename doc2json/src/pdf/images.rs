@@ -34,6 +34,7 @@ pub const MAX_WORK: u64 = 2_000_000_000;
 /// Filtros que puede encadenar una imagen. Los reales usan uno o dos; con cientos, cada fax o
 /// JBIG2 de la cadena volveria a decodificar la imagen entera.
 pub const MAX_FILTERS: usize = 8;
+const ERR_WORK: &str = "Se alcanzo el tope de trabajo de decodificacion de imagenes del documento.";
 
 /// Bytes de la tabla de una paleta que se pueden usar: 256 entradas de hasta 4 componentes.
 const MAX_LOOKUP: usize = 256 * 4;
@@ -45,8 +46,8 @@ struct Mask {
 }
 
 /// Lo que comparten las imagenes de un documento al extraerlas: las tablas de las paletas
-/// `/Indexed`, las mascaras suaves y los `JBIG2Globals`, que se decodifican una sola vez (por numero
-/// de objeto), y el trabajo de decodificacion que le queda al documento.
+/// `/Indexed`, las mascaras suaves y los `JBIG2Globals`, que se leen una sola vez (por numero de
+/// objeto), y el trabajo de decodificacion que le queda al documento.
 pub struct Shared {
     /// Tablas de paletas, recortadas a `MAX_LOOKUP` bytes.
     lookups: HashMap<u32, Rc<Vec<u8>>>,
@@ -54,10 +55,10 @@ pub struct Shared {
     /// queden imagenes por usarla, segun `mask_uses`.
     masks: HashMap<u32, Option<Rc<Mask>>>,
     mask_uses: HashMap<u32, usize>,
-    /// Datos de los `JBIG2Globals` ya leidos (`None` si no se pudieron leer). Como las mascaras,
-    /// cada uno se guarda solo mientras le queden pasadas de `JBIG2Decode` por usarlo.
+    /// Datos de los `JBIG2Globals` ya leidos. Los comprimidos los guarda (y los descuenta del
+    /// presupuesto una sola vez) el lector de PDF, y aqui se comparten sin copiarlos; uno sin
+    /// comprimir es una copia que a lo sumo mide lo que el archivo.
     globals: HashMap<u32, Option<Rc<Vec<u8>>>>,
-    globals_uses: HashMap<u32, usize>,
     /// Pixeles que aun se pueden decodificar en el documento (empieza en `MAX_WORK`).
     work: u64,
 }
@@ -81,24 +82,19 @@ pub enum Over {
 }
 
 impl Shared {
-    /// Cuenta cuantas de las imagenes `objs` usan cada mascara suave, y cuantas pasadas de
-    /// `JBIG2Decode` usan cada `JBIG2Globals`.
-    pub fn new(pdf: &Pdf, objs: &[Rc<Obj>]) -> Shared {
+    /// Cuenta cuantas de las imagenes `objs` usan cada mascara suave.
+    pub fn new(objs: &[Rc<Obj>]) -> Shared {
         let mut mask_uses = HashMap::new();
-        let mut globals_uses = HashMap::new();
         for d in objs.iter().filter_map(|o| o.as_dict()) {
             if let Some(Obj::Ref(n, _)) = d.get("SMask") {
                 *mask_uses.entry(*n).or_insert(0) += 1;
             }
-            for n in globals_refs(pdf, d) {
-                *globals_uses.entry(n).or_insert(0) += 1;
-            }
         }
-        Shared { lookups: HashMap::new(), masks: HashMap::new(), mask_uses, globals: HashMap::new(), globals_uses, work: MAX_WORK }
+        Shared { lookups: HashMap::new(), masks: HashMap::new(), mask_uses, globals: HashMap::new(), work: MAX_WORK }
     }
 
-    /// Datos del `JBIG2Globals` de los parametros de una pasada de `JBIG2Decode`. Uno que usan
-    /// varias imagenes se lee con la primera y se guarda hasta la ultima.
+    /// Datos del `JBIG2Globals` de los parametros de una pasada de `JBIG2Decode`, leidos una vez
+    /// por objeto aunque los usen muchas imagenes.
     fn globals(&mut self, pdf: &Pdf, parms: &Dict) -> Option<Rc<Vec<u8>>> {
         // Es un flujo, y los flujos son siempre objetos indirectos.
         let entry = parms.get("JBIG2Globals")?;
@@ -106,25 +102,15 @@ impl Shared {
             Obj::Ref(n, _) => *n,
             _ => return None,
         };
-        let left = self.globals_uses.get_mut(&n).map_or(0, |c| {
-            *c = c.saturating_sub(1);
-            *c
-        });
-        let data = match self.globals.get(&n) {
-            Some(g) => g.clone(),
-            None => {
-                let o = pdf.resolve(entry);
-                match &*o {
-                    Obj::Stream { .. } => pdf.stream_data(&o),
-                    _ => None,
-                }
-            }
-        };
-        if left > 0 {
-            self.globals.insert(n, data.clone());
-        } else {
-            self.globals.remove(&n);
+        if let Some(g) = self.globals.get(&n) {
+            return g.clone();
         }
+        let o = pdf.resolve(entry);
+        let data = match &*o {
+            Obj::Stream { .. } => pdf.stream_data(&o),
+            _ => None,
+        };
+        self.globals.insert(n, data.clone());
         data
     }
 
@@ -312,6 +298,8 @@ pub fn classify(pdf: &Pdf, d: &Dict) -> (&'static str, Option<String>) {
         return (f, None);
     }
     match image_space(pdf, d, None) {
+        // Un fax en un espacio de color que no se convierte sale tal cual (`extract`).
+        Space::Other(_) if is_fax(pdf, d) => ("tiff", None),
         Space::Other(name) => ("desconocido", Some(format!("Espacio de color {} no soportado.", name))),
         _ => ("png", None),
     }
@@ -352,32 +340,6 @@ fn too_big(pdf: &Pdf, d: &Dict, w: u32, h: u32) -> bool {
     w as u64 * h as u64 > if one_bit { MAX_PIXELS_1BIT } else { MAX_PIXELS }
 }
 
-/// Numero de objeto del `JBIG2Globals` de cada `JBIG2Decode` de la cadena de filtros, con los
-/// parametros emparejados como en `Pdf::stream_parts`.
-fn globals_refs(pdf: &Pdf, d: &Dict) -> Vec<u32> {
-    let names = filter_names(pdf, d);
-    let parms = match d.get("DecodeParms").or_else(|| d.get("DP")) {
-        Some(p) => pdf.resolve(p),
-        None => return Vec::new(),
-    };
-    let global = |p: &Dict| match p.get("JBIG2Globals") {
-        Some(Obj::Ref(n, _)) => Some(*n),
-        _ => None,
-    };
-    let mut out = Vec::new();
-    for (i, name) in names.iter().enumerate() {
-        if name != "JBIG2Decode" {
-            continue;
-        }
-        let n = match &*parms {
-            Obj::Dict(p) if i == 0 || names.len() == 1 => global(p),
-            Obj::Array(a) => a.get(i).map(|o| pdf.resolve(o)).and_then(|o| o.as_dict().and_then(global)),
-            _ => None,
-        };
-        out.extend(n);
-    }
-    out
-}
 
 /// Algun filtro de la imagen es de fax (CCITT): si no se puede decodificar, se entrega tal cual.
 fn is_fax(pdf: &Pdf, d: &Dict) -> bool {
@@ -405,8 +367,11 @@ pub fn cost(pdf: &Pdf, obj: &Obj) -> Cost {
         return Cost::default();
     }
     let first_image = names.iter().position(|n| image_filter(n).is_some());
-    let passes = names[..first_image.unwrap_or(names.len())].iter().filter(|n| matches!(n.as_str(), "CCITTFaxDecode" | "CCF" | "JBIG2Decode")).count() as u64;
-    let pixels = (w as u64 * h as u64).saturating_mul(passes);
+    let before = &names[..first_image.unwrap_or(names.len())];
+    let passes = before.iter().filter(|n| matches!(n.as_str(), "CCITTFaxDecode" | "CCF" | "JBIG2Decode")).count() as u64;
+    // Cada pasada de fax arma ademas las tablas de su decodificador, aunque la imagen sea de 1 x 1.
+    let tables = before.iter().filter(|n| matches!(n.as_str(), "CCITTFaxDecode" | "CCF")).count() as u64 * ccitt::TABLE_ENTRIES;
+    let pixels = (w as u64 * h as u64).saturating_mul(passes).saturating_add(tables);
     if first_image.is_some() {
         return Cost { bytes: len, pixels };
     }
@@ -456,12 +421,22 @@ pub fn extract(pdf: &Pdf, shared: &mut Shared, obj: &Obj) -> Result<(&'static st
     let (mut data, chain) = pdf.stream_parts(obj).ok_or("No se pudieron leer los datos de la imagen.")?;
     let last = chain.len().saturating_sub(1);
     let mut note = None;
+    // Ya se decodifico un fax o un JBIG2: lo que hay son filas de un bit, no un archivo.
+    let mut bitmap = false;
     for (i, (name, parms, raw)) in chain.iter().enumerate() {
         if let Some(kind) = image_filter(name) {
+            if bitmap {
+                return Err(format!("La imagen aplica {} sobre un fax o un JBIG2 ya decodificado: no se puede entregar.", name));
+            }
             return Ok((kind, data, None));
         }
         match name.as_str() {
             "CCITTFaxDecode" | "CCF" => {
+                // Un fax en un espacio de color que no se convierte sale tal cual, como TIFF.
+                if i == 0 && matches!(image_space(pdf, d, None), Space::Other(_)) {
+                    return Ok(("tiff", ccitt_tiff(pdf, &data, w, h, raw.as_ref(), inverted(pdf, d)), None));
+                }
+                bitmap = true;
                 let (rows, decoded) = ccitt_samples(pdf, &data, w, h, raw.as_ref(), &mut shared.work)?;
                 let rows = match rows {
                     Some(rows) => rows,
@@ -483,6 +458,11 @@ pub fn extract(pdf: &Pdf, shared: &mut Shared, obj: &Obj) -> Result<(&'static st
             }
             "JBIG2Decode" => {
                 let globals = raw.as_ref().and_then(|p| shared.globals(pdf, p));
+                // Los segmentos de los globales se vuelven a leer en cada imagen que los usa: cada
+                // lectura se cobra al trabajo del documento, por su largo.
+                let parse = globals.as_ref().map_or(0, |g| g.len() as u64);
+                shared.work = shared.work.checked_sub(parse).ok_or(ERR_WORK)?;
+                bitmap = true;
                 // Ya se cobraron sus pixeles, como a cualquier imagen. Una pagina comun gasta unas
                 // tres veces eso en unidades de `jbig2` (la pagina, su region y la combinacion); lo
                 // que pase de ahi (diccionarios, refinamientos, muchas regiones) sale de lo que le

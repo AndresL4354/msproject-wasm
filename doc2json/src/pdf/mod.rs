@@ -427,7 +427,7 @@ fn read_tagged(bytes: &[u8], tags: bool, extract: Option<usize>) -> Result<Docum
     if let Some(limit) = extract {
         let mut budget = Budget::new(limit);
         // Paletas y mascaras compartidas, y el trabajo de decodificacion que le queda al documento.
-        let mut shared = images::Shared::new(&pdf, &objs);
+        let mut shared = images::Shared::new(&objs);
         let mut skipped_work = 0usize;
         for (img, obj) in doc.images.iter_mut().zip(&objs) {
             // Cada imagen se cobra antes de decodificarla, por lo que declara, a los dos topes del

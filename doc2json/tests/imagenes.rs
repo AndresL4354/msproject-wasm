@@ -823,8 +823,9 @@ fn tope_de_bytes_extraidos_por_documento() {
 fn tope_de_trabajo_de_decodificacion_por_documento() {
     // 25 faxes de 10.000 x 10.000 (100 millones de pixeles cada uno) que no dan nada: cada uno sale
     // como TIFF de pocos bytes, asi que el tope de bytes no los frena. El trabajo se cobra antes de
-    // decodificar, por el tamano declarado: con 2.000 millones entran 20 y los 5 siguientes quedan
-    // con una nota. Antes se decodificaban todos.
+    // decodificar, por el tamano declarado y las tablas de cada fax: con 2.000 millones entran 19
+    // (20 justos no caben por las tablas) y los 6 siguientes quedan con una nota. Antes se
+    // decodificaban todos.
     let n = 25;
     let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
     let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
@@ -833,9 +834,9 @@ fn tope_de_trabajo_de_decodificacion_por_documento() {
     let d = read_with_images(&pdf_con(&names, &content, imgs)).unwrap();
     assert_eq!(d.images.len(), 25);
     let topadas: Vec<usize> = (0..n).filter(|&i| d.images[i].note.as_deref().unwrap_or("").contains("tope de trabajo")).collect();
-    assert_eq!(topadas, (20..25).collect::<Vec<_>>());
-    assert!(d.images[..20].iter().all(|i| i.format == "tiff" && i.data.is_some()));
-    assert!(d.warnings.iter().any(|w| w.contains("5 imagenes no se decodificaron")), "{:?}", d.warnings);
+    assert_eq!(topadas, (19..25).collect::<Vec<_>>());
+    assert!(d.images[..19].iter().all(|i| i.format == "tiff" && i.data.is_some()));
+    assert!(d.warnings.iter().any(|w| w.contains("6 imagenes no se decodificaron")), "{:?}", d.warnings);
     // Los JPEG no se decodifican: no gastan trabajo. Cien de 5.000 x 5.000 (2.500 millones de
     // pixeles declarados) se entregan todos.
     let n = 100;
@@ -862,15 +863,37 @@ fn faxes_topados(filters: &str) -> Vec<usize> {
 #[test]
 fn cada_pasada_de_fax_se_cobra() {
     // Con dos faxes en la cadena, cada imagen decodificaria dos veces: se cobran 200 millones de
-    // pixeles por imagen y entran 10 (antes, 20, con un solo cobro por imagen).
-    assert_eq!(faxes_topados("[/CCITTFaxDecode /CCITTFaxDecode]"), (10..25).collect::<Vec<_>>());
+    // pixeles por imagen (mas las tablas de cada pasada) y entran 9 (antes, 20, con un solo cobro
+    // por imagen).
+    assert_eq!(faxes_topados("[/CCITTFaxDecode /CCITTFaxDecode]"), (9..25).collect::<Vec<_>>());
 }
 
 #[test]
 fn fax_antes_de_un_jpeg_se_cobra() {
     // El fax se decodifica antes de llegar al JPEG: se cobra igual. Antes el JPEG dejaba el costo
     // en 0 y no se topaba ninguna.
-    assert_eq!(faxes_topados("[/CCITTFaxDecode /DCTDecode]"), (20..25).collect::<Vec<_>>());
+    assert_eq!(faxes_topados("[/CCITTFaxDecode /DCTDecode]"), (19..25).collect::<Vec<_>>());
+}
+
+#[test]
+fn fax_seguido_de_un_jpeg_no_se_entrega_como_jpeg() {
+    // Tras decodificar el fax quedan filas de un bit, no un JPEG: no se entregan como si lo fueran.
+    let fax = "/Subtype /Image /Width 8 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter [/CCF /DCTDecode] /DecodeParms [<< /K -1 /Columns 8 >> null]";
+    let d = read_with_images(&pdf_con("/I0 5 0 R ", "/I0 Do ", vec![stream(fax, &[0xFF, 0xFF])])).unwrap();
+    assert!(d.images[0].data.is_none(), "{:?}", d.images[0].format);
+    assert!(d.images[0].note.as_deref().unwrap_or("").contains("ya decodificado"), "{:?}", d.images[0].note);
+}
+
+#[test]
+fn fax_con_espacio_de_color_no_soportado_sale_como_tiff() {
+    // Un fax en un espacio de color que no se convierte (Lab) sale tal cual, como TIFF, igual que
+    // antes de decodificar los faxes; la lista lo anuncia asi.
+    let fax = "/Subtype /Image /Width 8 /Height 2 /ColorSpace [/Lab << /WhitePoint [1 1 1] >>] /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>";
+    let bytes = pdf_con("/I0 5 0 R ", "/I0 Do ", vec![stream(fax, &[0, 0])]);
+    assert_eq!(read(&bytes).unwrap().images[0].format, "tiff");
+    let d = read_with_images(&bytes).unwrap();
+    assert_eq!(d.images[0].format, "tiff");
+    assert!(d.images[0].data.as_deref().map_or(false, |t| t.starts_with(b"II* ") || t.starts_with(b"MM *")), "{:?}", d.images[0].note);
 }
 
 #[test]
