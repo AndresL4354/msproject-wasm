@@ -1,23 +1,39 @@
 //! Imagenes de PDF: formato con que se entregan, ubicacion en la pagina y extraccion.
 //!
 //! - JPEG (DCTDecode) y JPEG 2000 (JPXDecode) se entregan tal cual, sin recomprimir.
-//! - Fax (CCITTFaxDecode) se envuelve en un TIFF de una tira, sin decodificar.
+//! - Fax (CCITTFaxDecode, grupos 3 y 4) y JBIG2 se decodifican y salen como PNG de un bit,
+//!   listos para OCR. Si el fax no se puede decodificar, se entrega envuelto en un TIFF.
 //! - Los pixeles (Flate, LZW, RunLength, sin compresion...) pasan a PNG: gris, RGB, CMYK
 //!   (convertido a RGB), indexado (con su paleta), tinta plana (Separation) y mascaras de un bit;
 //!   con transparencia si traen mascara suave (SMask) del mismo tamano. Si el flujo ya es un PNG
 //!   por dentro (Flate con predictor PNG y parametros coincidentes) se copia sin recomprimir.
-//! - JBIG2 y espacios de color como Lab no se convierten: la imagen figura con una nota.
+//! - Espacios de color como Lab, y JBIG2 con Huffman o semitonos, no se convierten: la imagen
+//!   figura con una nota.
 
 use super::document::Pdf;
 use super::filters::{self, Parms};
 use super::object::{Dict, Obj};
 use crate::inflate;
 use crate::png::{self, Color, Spec};
+use crate::image::Budget;
+use crate::{ccitt, jbig2};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Tope de pixeles por imagen al extraer (5.000 x 5.000): mas alla, la memoria no compensa.
 pub const MAX_PIXELS: u64 = 25_000_000;
+/// Tope para imagenes de un bit (escaneos en blanco y negro), que ocupan mucho menos: alcanza
+/// para una hoja A3 a 600 dpi (unos 70 millones de pixeles).
+pub const MAX_PIXELS_1BIT: u64 = 100_000_000;
+/// Trabajo de decodificacion por documento, en pixeles: unas 230 hojas A4 escaneadas a 300 dpi.
+/// Cada imagen se cobra antes de decodificarla (`Shared::charge`), junto con el tope de bytes
+/// (`image::Budget`). Es aparte de ese tope, que cuenta lo que ocupan las imagenes y quien llama
+/// puede fijar mas alto: de este sale tambien lo que una imagen pida de mas al decodificarse (un
+/// JBIG2 con diccionarios, o un fax con mas columnas que la imagen).
+pub const MAX_WORK: u64 = 2_000_000_000;
+/// Filtros que puede encadenar una imagen. Los reales usan uno o dos; con cientos, cada fax o
+/// JBIG2 de la cadena volveria a decodificar la imagen entera.
+pub const MAX_FILTERS: usize = 8;
 
 /// Bytes de la tabla de una paleta que se pueden usar: 256 entradas de hasta 4 componentes.
 const MAX_LOOKUP: usize = 256 * 4;
@@ -28,8 +44,9 @@ struct Mask {
     matte: Option<Vec<f64>>,
 }
 
-/// Lo que varias imagenes comparten y se decodifica una sola vez por documento: las tablas de
-/// las paletas `/Indexed` y las mascaras suaves, por numero de objeto.
+/// Lo que comparten las imagenes de un documento al extraerlas: las tablas de las paletas
+/// `/Indexed`, las mascaras suaves y los `JBIG2Globals`, que se decodifican una sola vez (por numero
+/// de objeto), y el trabajo de decodificacion que le queda al documento.
 pub struct Shared {
     /// Tablas de paletas, recortadas a `MAX_LOOKUP` bytes.
     lookups: HashMap<u32, Rc<Vec<u8>>>,
@@ -37,18 +54,93 @@ pub struct Shared {
     /// queden imagenes por usarla, segun `mask_uses`.
     masks: HashMap<u32, Option<Rc<Mask>>>,
     mask_uses: HashMap<u32, usize>,
+    /// Datos de los `JBIG2Globals` ya leidos (`None` si no se pudieron leer). Como las mascaras,
+    /// cada uno se guarda solo mientras le queden pasadas de `JBIG2Decode` por usarlo.
+    globals: HashMap<u32, Option<Rc<Vec<u8>>>>,
+    globals_uses: HashMap<u32, usize>,
+    /// Pixeles que aun se pueden decodificar en el documento (empieza en `MAX_WORK`).
+    work: u64,
+}
+
+/// Lo que costara extraer una imagen segun lo que declara, sin leer sus datos (`cost`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cost {
+    /// Bytes que ocupara, para el tope de bytes de las imagenes (`image::Budget`).
+    pub bytes: usize,
+    /// Pixeles que se decodificaran, para el tope de trabajo (`MAX_WORK`).
+    pub pixels: u64,
+}
+
+/// Tope del documento que una imagen ya no alcanza (`Shared::charge`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Over {
+    /// El de bytes de las imagenes (`image::Budget`).
+    Bytes,
+    /// El de trabajo de decodificacion (`MAX_WORK`).
+    Work,
 }
 
 impl Shared {
-    /// Cuenta cuantas de las imagenes `objs` usan cada mascara suave.
-    pub fn new(objs: &[Rc<Obj>]) -> Shared {
+    /// Cuenta cuantas de las imagenes `objs` usan cada mascara suave, y cuantas pasadas de
+    /// `JBIG2Decode` usan cada `JBIG2Globals`.
+    pub fn new(pdf: &Pdf, objs: &[Rc<Obj>]) -> Shared {
         let mut mask_uses = HashMap::new();
-        for o in objs {
-            if let Some(Obj::Ref(n, _)) = o.as_dict().and_then(|d| d.get("SMask")) {
+        let mut globals_uses = HashMap::new();
+        for d in objs.iter().filter_map(|o| o.as_dict()) {
+            if let Some(Obj::Ref(n, _)) = d.get("SMask") {
                 *mask_uses.entry(*n).or_insert(0) += 1;
             }
+            for n in globals_refs(pdf, d) {
+                *globals_uses.entry(n).or_insert(0) += 1;
+            }
         }
-        Shared { lookups: HashMap::new(), masks: HashMap::new(), mask_uses }
+        Shared { lookups: HashMap::new(), masks: HashMap::new(), mask_uses, globals: HashMap::new(), globals_uses, work: MAX_WORK }
+    }
+
+    /// Datos del `JBIG2Globals` de los parametros de una pasada de `JBIG2Decode`. Uno que usan
+    /// varias imagenes se lee con la primera y se guarda hasta la ultima.
+    fn globals(&mut self, pdf: &Pdf, parms: &Dict) -> Option<Rc<Vec<u8>>> {
+        // Es un flujo, y los flujos son siempre objetos indirectos.
+        let entry = parms.get("JBIG2Globals")?;
+        let n = match entry {
+            Obj::Ref(n, _) => *n,
+            _ => return None,
+        };
+        let left = self.globals_uses.get_mut(&n).map_or(0, |c| {
+            *c = c.saturating_sub(1);
+            *c
+        });
+        let data = match self.globals.get(&n) {
+            Some(g) => g.clone(),
+            None => {
+                let o = pdf.resolve(entry);
+                match &*o {
+                    Obj::Stream { .. } => pdf.stream_data(&o),
+                    _ => None,
+                }
+            }
+        };
+        if left > 0 {
+            self.globals.insert(n, data.clone());
+        } else {
+            self.globals.remove(&n);
+        }
+        data
+    }
+
+    /// Cobra la imagen antes de decodificarla, por lo que declara (`cost`), a los dos topes del
+    /// documento: sus pixeles al trabajo que queda y sus bytes a `budget`. Si no cabe en alguno no
+    /// cobra nada y dice cual; si cabe, devuelve los bytes reservados (para `Budget::store`).
+    pub fn charge(&mut self, pdf: &Pdf, obj: &Obj, budget: &mut Budget) -> Result<usize, Over> {
+        let c = cost(pdf, obj);
+        if c.pixels > self.work {
+            return Err(Over::Work);
+        }
+        if !budget.reserve(c.bytes) {
+            return Err(Over::Bytes);
+        }
+        self.work -= c.pixels;
+        Ok(c.bytes)
     }
 
     /// Tabla de colores de una paleta. La de un objeto indirecto se lee una sola vez.
@@ -81,15 +173,11 @@ fn resolved<R>(pdf: &Pdf, o: &Obj, f: impl FnOnce(&Obj) -> R) -> R {
     }
 }
 
-const NOTE_JBIG2: &str = "Imagen JBIG2 (tipica de escaneos en blanco y negro): no se convierte.";
-
 /// Filtro que ya es un formato de imagen: los datos se entregan desde ahi.
 fn image_filter(name: &str) -> Option<&'static str> {
     match name {
         "DCTDecode" | "DCT" => Some("jpeg"),
         "JPXDecode" => Some("jp2"),
-        "CCITTFaxDecode" | "CCF" => Some("tiff"),
-        "JBIG2Decode" => Some("jbig2"),
         _ => None,
     }
 }
@@ -221,7 +309,7 @@ fn image_space(pdf: &Pdf, d: &Dict, shared: Option<&mut Shared>) -> Space {
 /// nada, tampoco la tabla de una paleta.
 pub fn classify(pdf: &Pdf, d: &Dict) -> (&'static str, Option<String>) {
     if let Some(f) = filter_names(pdf, d).iter().find_map(|n| image_filter(n)) {
-        return (f, (f == "jbig2").then(|| NOTE_JBIG2.to_string()));
+        return (f, None);
     }
     match image_space(pdf, d, None) {
         Space::Other(name) => ("desconocido", Some(format!("Espacio de color {} no soportado.", name))),
@@ -257,64 +345,239 @@ pub fn place(m: [f64; 6], bbox: [f64; 4], rotate: i64) -> (f64, f64, f64, f64) {
     (r(x0), r(ph - y1), r(x1 - x0), r(y1 - y0))
 }
 
-/// Bytes que costara extraer la imagen segun lo que declara, sin leer sus datos: sus pixeles
-/// decodificados (y los de su mascara suave, si la trae) o, si se entrega tal cual (JPEG, JPEG
-/// 2000, fax o JBIG2), el largo del flujo. 0 si `extract` la rechaza sin leer nada.
-pub fn work(pdf: &Pdf, obj: &Obj) -> usize {
+/// La imagen pasa del tope de pixeles por imagen: `MAX_PIXELS_1BIT` si es de un bit (un
+/// escaneo en blanco y negro), `MAX_PIXELS` si no.
+fn too_big(pdf: &Pdf, d: &Dict, w: u32, h: u32) -> bool {
+    let one_bit = bits(pdf, d) == 1 && image_space(pdf, d, None).components() == 1 && d.get("SMask").is_none();
+    w as u64 * h as u64 > if one_bit { MAX_PIXELS_1BIT } else { MAX_PIXELS }
+}
+
+/// Numero de objeto del `JBIG2Globals` de cada `JBIG2Decode` de la cadena de filtros, con los
+/// parametros emparejados como en `Pdf::stream_parts`.
+fn globals_refs(pdf: &Pdf, d: &Dict) -> Vec<u32> {
+    let names = filter_names(pdf, d);
+    let parms = match d.get("DecodeParms").or_else(|| d.get("DP")) {
+        Some(p) => pdf.resolve(p),
+        None => return Vec::new(),
+    };
+    let global = |p: &Dict| match p.get("JBIG2Globals") {
+        Some(Obj::Ref(n, _)) => Some(*n),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        if name != "JBIG2Decode" {
+            continue;
+        }
+        let n = match &*parms {
+            Obj::Dict(p) if i == 0 || names.len() == 1 => global(p),
+            Obj::Array(a) => a.get(i).map(|o| pdf.resolve(o)).and_then(|o| o.as_dict().and_then(global)),
+            _ => None,
+        };
+        out.extend(n);
+    }
+    out
+}
+
+/// Algun filtro de la imagen es de fax (CCITT): si no se puede decodificar, se entrega tal cual.
+fn is_fax(pdf: &Pdf, d: &Dict) -> bool {
+    filter_names(pdf, d).iter().any(|n| matches!(n.as_str(), "CCITTFaxDecode" | "CCF"))
+}
+
+/// Lo que costara extraer la imagen segun lo que declara, sin leer sus datos. En bytes: sus
+/// pixeles decodificados (y los de su mascara suave, si la trae) o, si se entrega tal cual (JPEG o
+/// JPEG 2000), el largo del flujo. Un fax tambien cuenta el largo del flujo: si no da al menos la
+/// mitad de las filas sale tal cual, como TIFF, y lo que entregue de mas se cobra al guardarlo. En
+/// pixeles: los declarados, una vez por cada fax o JBIG2 de la cadena de filtros (cada uno
+/// decodifica la imagen entera), salvo despues de un JPEG o JPEG 2000, donde `extract` termina sin
+/// decodificar. Todo en 0 si `extract` la rechaza sin leer nada.
+pub fn cost(pdf: &Pdf, obj: &Obj) -> Cost {
     let (d, len) = match obj {
         Obj::Stream { dict, len, .. } => (dict, *len),
-        _ => return 0,
+        _ => return Cost::default(),
     };
     let (w, h) = match size(pdf, d) {
-        Some((w, h)) if w as u64 * h as u64 <= MAX_PIXELS => (w, h),
-        _ => return 0,
+        Some((w, h)) if !too_big(pdf, d, w, h) => (w, h),
+        _ => return Cost::default(),
     };
-    if filter_names(pdf, d).iter().any(|n| image_filter(n).is_some()) {
-        return len;
+    let names = filter_names(pdf, d);
+    if names.len() > MAX_FILTERS {
+        return Cost::default();
+    }
+    let first_image = names.iter().position(|n| image_filter(n).is_some());
+    let passes = names[..first_image.unwrap_or(names.len())].iter().filter(|n| matches!(n.as_str(), "CCITTFaxDecode" | "CCF" | "JBIG2Decode")).count() as u64;
+    let pixels = (w as u64 * h as u64).saturating_mul(passes);
+    if first_image.is_some() {
+        return Cost { bytes: len, pixels };
+    }
+    let pixels = pixels.max(w as u64 * h as u64);
+    if is_fax(pdf, d) {
+        return Cost { bytes: len, pixels };
     }
     let space = image_space(pdf, d, None);
     if let Space::Other(_) = space {
-        return 0;
+        return Cost::default();
     }
-    let pixels = image_bytes(w, h, space.components(), bits(pdf, d)).unwrap_or(usize::MAX);
+    let bytes = image_bytes(w, h, space.components(), bits(pdf, d)).unwrap_or(usize::MAX);
     let mask = if d.get("SMask").is_some() { w as usize * h as usize } else { 0 };
-    pixels.saturating_add(mask)
+    Cost { bytes: bytes.saturating_add(mask), pixels }
 }
 
-/// Extrae la imagen: formato y bytes del archivo, o el motivo por el que no se entrega.
-pub fn extract(pdf: &Pdf, shared: &mut Shared, obj: &Obj) -> Result<(&'static str, Vec<u8>), String> {
+/// Mensaje de una imagen que no se decodifica porque el documento ya gasto su trabajo.
+pub fn work_note() -> String {
+    format!("No se decodifica: se alcanzo el tope de trabajo de {} millones de pixeles por documento.", MAX_WORK / 1_000_000)
+}
+
+/// Extrae la imagen: formato, bytes del archivo y un aviso (por ejemplo, un fax danado que se
+/// decodifico en parte), o el motivo por el que no se entrega. Quien llama ya la cobro con
+/// `Shared::charge`. Las paletas y mascaras que comparten varias imagenes se decodifican una vez,
+/// y lo que la imagen pida de trabajo de mas (un JBIG2 con diccionarios, o un fax con mas columnas
+/// que la imagen) sale del que le queda al documento (`shared`).
+pub fn extract(pdf: &Pdf, shared: &mut Shared, obj: &Obj) -> Result<(&'static str, Vec<u8>, Option<String>), String> {
     let d = match obj {
         Obj::Stream { dict, .. } => dict,
         _ => return Err("El objeto no es una imagen.".into()),
     };
     let (w, h) = size(pdf, d).ok_or("La imagen no declara su tamano.")?;
-    if w as u64 * h as u64 > MAX_PIXELS {
+    if too_big(pdf, d, w, h) {
         return Err(format!("Imagen demasiado grande para extraerla ({} x {} pixeles).", w, h));
     }
-    // Un espacio de color que no se convierte se rechaza antes de decodificar (`work` la cuenta en 0).
-    if !filter_names(pdf, d).iter().any(|n| image_filter(n).is_some()) {
+    let filters = filter_names(pdf, d).len();
+    if filters > MAX_FILTERS {
+        return Err(format!("La imagen encadena {} filtros (a lo sumo {}): no se decodifica.", filters, MAX_FILTERS));
+    }
+    // Un espacio de color que no se convierte se rechaza antes de decodificar (`cost` la cuenta
+    // en 0), salvo en un fax, que si no se decodifica sale tal cual.
+    if !filter_names(pdf, d).iter().any(|n| image_filter(n).is_some()) && !is_fax(pdf, d) {
         if let Space::Other(name) = image_space(pdf, d, None) {
             return Err(format!("Espacio de color {} no soportado.", name));
         }
     }
     let (mut data, chain) = pdf.stream_parts(obj).ok_or("No se pudieron leer los datos de la imagen.")?;
     let last = chain.len().saturating_sub(1);
+    let mut note = None;
     for (i, (name, parms, raw)) in chain.iter().enumerate() {
         if let Some(kind) = image_filter(name) {
-            return match kind {
-                "jbig2" => Err(NOTE_JBIG2.into()),
-                "tiff" => Ok(("tiff", ccitt_tiff(pdf, &data, w, h, raw.as_ref(), inverted(pdf, d)))),
-                k => Ok((k, data)),
-            };
+            return Ok((kind, data, None));
+        }
+        match name.as_str() {
+            "CCITTFaxDecode" | "CCF" => {
+                let (rows, decoded) = ccitt_samples(pdf, &data, w, h, raw.as_ref(), &mut shared.work)?;
+                let rows = match rows {
+                    Some(rows) => rows,
+                    None => {
+                        let tiff = ccitt_tiff(pdf, &data, w, h, raw.as_ref(), inverted(pdf, d));
+                        let why = if decoded == 0 {
+                            "No se pudo decodificar el fax: se entrega tal cual, como TIFF.".to_string()
+                        } else {
+                            format!("Fax danado: solo se decodificaron {} de {} filas; se entrega tal cual, como TIFF.", decoded, h)
+                        };
+                        return Ok(("tiff", tiff, Some(why)));
+                    }
+                };
+                if decoded < h as usize {
+                    note = Some(format!("Fax danado: se decodificaron {} de {} filas.", decoded, h));
+                }
+                data = rows;
+                continue;
+            }
+            "JBIG2Decode" => {
+                let globals = raw.as_ref().and_then(|p| shared.globals(pdf, p));
+                // Ya se cobraron sus pixeles, como a cualquier imagen. Una pagina comun gasta unas
+                // tres veces eso en unidades de `jbig2` (la pagina, su region y la combinacion); lo
+                // que pase de ahi (diccionarios, refinamientos, muchas regiones) sale de lo que le
+                // queda al documento, haya salido bien o no.
+                let mut allowance = (w as u64 * h as u64).saturating_mul(3).saturating_add(shared.work);
+                let page = jbig2::decode(&data, globals.as_ref().map(|g| g.as_slice()), w as usize, h as usize, &mut allowance);
+                shared.work = shared.work.min(allowance);
+                let page = page?;
+                // En PDF, el filtro entrega 0 = negro (al reves que JBIG2).
+                data = pack(&page.px, page.w, page.h, true);
+                continue;
+            }
+            _ => {}
         }
         if i == last && matches!(name.as_str(), "FlateDecode" | "Fl") {
             if let Some(png) = passthrough(pdf, shared, d, &data, w, h, parms) {
-                return Ok(("png", png));
+                return Ok(("png", png, None));
             }
         }
         data = filters::apply(name, &data, parms).ok_or_else(|| format!("Filtro {} no soportado.", name))?;
     }
-    pixels_to_png(pdf, shared, d, data, w, h).map(|p| ("png", p))
+    pixels_to_png(pdf, shared, d, data, w, h).map(|p| ("png", p, note))
+}
+
+/// Filas de un bit empaquetadas a partir de un pixel por byte (1 = negro); `invert` deja 0 = negro.
+fn pack(px: &[u8], w: usize, h: usize, invert: bool) -> Vec<u8> {
+    let stride = ccitt::row_bytes(w);
+    let mut out = vec![0u8; stride * h];
+    for y in 0..h {
+        for x in 0..w {
+            if px.get(y * w + x).copied().unwrap_or(0) != 0 {
+                out[y * stride + x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    if invert {
+        out.iter_mut().for_each(|b| *b = !*b);
+    }
+    out
+}
+
+/// Fax decodificado como lo entrega el filtro de PDF (sin `BlackIs1`, 0 = negro), con filas del
+/// ancho de la imagen, y cuantas filas se decodificaron. Si se decodifico menos de la mitad no se
+/// arman las filas (`None`): igual que con los pixeles (`enough`), el alto declarado no decide la
+/// memoria si los datos no lo respaldan. Columnas o filas fuera de rango son un error.
+fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>, work: &mut u64) -> Result<(Option<Vec<u8>>, usize), String> {
+    let get = |k: &str| parms.and_then(|p| pdf.get(p, k).as_i64());
+    let on = |k: &str| matches!(parms, Some(p) if flag(pdf, p, k));
+    // Sin `as usize`: en wasm32 truncaria un valor enorme del archivo a uno chico cualquiera.
+    let size = |k: &str, default: u32| match get(k) {
+        Some(v) if v > 0 => usize::try_from(v).map_err(|_| format!("Fax con /{} fuera de rango ({}).", k, v)),
+        _ => Ok(default as usize),
+    };
+    let columns = size("Columns", w)?;
+    let p = ccitt::Params {
+        k: get("K").unwrap_or(0),
+        columns,
+        // Mas filas que las de la imagen no se usan: no se decodifican.
+        rows: size("Rows", h)?.min(h as usize),
+        byte_align: on("EncodedByteAlign"),
+        end_of_block: !matches!(parms, Some(p) if matches!(&*pdf.get(p, "EndOfBlock"), Obj::Bool(false))),
+    };
+    let (w, h) = (w as usize, h as usize);
+    let src_stride = ccitt::row_bytes(columns);
+    let stride = ccitt::row_bytes(w);
+    // Las filas de salida tambien se topan en bytes: con /Width 1, el tope de pixeles de la imagen
+    // permitiria 100 millones de filas de un byte.
+    if (stride as u64).saturating_mul(h as u64) > ccitt::MAX_BYTES {
+        return Err(format!("Fax demasiado grande para decodificarlo ({} x {} pixeles).", w, h));
+    }
+    // Las columnas que pasan del ancho de la imagen tambien se decodifican: se cobran aparte. Si
+    // pasan del tope, `decode` las rechaza sin decodificar nada.
+    let extra = if columns > ccitt::MAX_COLUMNS { 0 } else { (columns.saturating_sub(w) as u64).saturating_mul(h as u64) };
+    *work = work.checked_sub(extra).ok_or_else(work_note)?;
+    let (rows, decoded) = ccitt::decode(data, &p, h)?;
+    if decoded == 0 || decoded < h - h / 2 {
+        return Ok((None, decoded));
+    }
+    let black_is_1 = on("BlackIs1");
+    let mut out = vec![0u8; stride * h];
+    for y in 0..h.min(rows.len() / src_stride.max(1)) {
+        if columns == w {
+            out[y * stride..(y + 1) * stride].copy_from_slice(&rows[y * src_stride..(y + 1) * src_stride]);
+        } else {
+            for x in 0..w.min(columns) {
+                if rows[y * src_stride + x / 8] & (0x80 >> (x % 8)) != 0 {
+                    out[y * stride + x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+        }
+    }
+    if !black_is_1 {
+        out.iter_mut().for_each(|b| *b = !*b);
+    }
+    Ok((Some(out), decoded))
 }
 
 fn bits(pdf: &Pdf, d: &Dict) -> u8 {
@@ -551,7 +814,7 @@ impl PartialEq for Space {
 /// TIFF de una tira con los datos de fax tal cual (Grupo 3 o 4 segun `K`).
 fn ccitt_tiff(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>, invert: bool) -> Vec<u8> {
     let get = |k: &str| parms.and_then(|p| pdf.get(p, k).as_i64());
-    let on = |k: &str| parms.map_or(false, |p| flag(pdf, p, k));
+    let on = |k: &str| matches!(parms, Some(p) if flag(pdf, p, k));
     let k = get("K").unwrap_or(0);
     let compression: u32 = if k < 0 { 4 } else { 3 };
     // En PDF, sin BlackIs1 los bits 0 son negros: en TIFF eso es "BlackIsZero" (1).

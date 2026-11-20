@@ -204,10 +204,10 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 |---|---|
 | Word | El archivo incrustado tal cual (PNG, JPEG, GIF, EMF, WMF, SVG…). |
 | PDF con JPEG (DCTDecode) o JPEG 2000 (JPXDecode) | El mismo JPEG o JPEG 2000, sin recomprimir. |
-| PDF con fax (CCITTFaxDecode) | TIFF de grupo 3 o 4 con los mismos datos. |
+| PDF con fax (CCITTFaxDecode, grupos 3 y 4) o JBIG2 | PNG de un bit, decodificado: escaneos en blanco y negro listos para OCR o para un modelo de visión. Un fax del que no se puede decodificar al menos la mitad de las filas se entrega tal cual, en un TIFF. |
 | PDF con píxeles (Flate, LZW, RunLength o sin comprimir) | PNG: gris, RGB, CMYK (convertido a RGB), indexado con su paleta, tinta plana y máscaras de un bit, con transparencia si traen máscara suave del mismo tamaño (también la premezclada con `/Matte`). Si los datos ya son un PNG por dentro (Flate con predictor PNG), se copian sin recomprimir. |
 
-No se convierten, y figuran con `note`: JBIG2, espacios de color Lab o DeviceN de varias tintas, e imágenes de más de 25 millones de píxeles. Las imágenes incrustadas en el contenido de la página (`BI … EI`, poco comunes) se cuentan pero no se extraen.
+No se convierten, y figuran con `note`: JBIG2 con codificación Huffman, semitonos, regiones intermedias, plantilla extendida (`EXTTEMPLATE`) o diccionarios que reutilizan los contextos de otro (no aparecieron en más de mil imágenes JBIG2 reales), fax o JBIG2 cuyos tamaños declarados pasan los topes, JBIG2 con datos cortados (se informa en vez de inventar la parte que falta), imágenes que pasan el tope de trabajo de decodificación del documento (2.000 millones de píxeles entre todas, cobrados antes de decodificar cada una; JPEG y JPEG 2000 no cuentan), espacios de color Lab o DeviceN de varias tintas, e imágenes de más de 25 millones de píxeles (100 millones si son de un bit, como los escaneos). Las imágenes incrustadas en el contenido de la página (`BI … EI`, poco comunes) se cuentan pero no se extraen.
 
 **Topes y archivos dañados.** La memoria que pide una imagen depende de los datos que trae, no del tamaño que declara:
 
@@ -532,6 +532,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - 300 PDF reales con imágenes (8.812 imágenes): se extraen 8.807 (las otras 5 pasan de 25 millones de píxeles) y todas abren en Pillow con el tamaño declarado (3.520 JPEG, 5.162 PNG, 125 TIFF). De los PNG comparables con el mapa de píxeles de PyMuPDF, 3.336 de 3.338 difieren en a lo sumo 1 nivel por canal; los otros 2 usan perfiles ICC, que PyMuPDF aplica y aquí no.
 - Lugares: 54.044 contra 54.230 de PyMuPDF; en páginas sin girar, el 98,8 % coincide con su rectángulo con menos de 1,5 puntos de diferencia.
 - 200 Word reales (10.426 imágenes): los bytes extraídos son idénticos a los del archivo incrustado en todos los casos, y el 98,3 % queda citado desde un bloque o una celda (el resto está en encabezados y pies).
+- Escaneos en fax y JBIG2 (122 y 7 PDF reales): las 5.415 imágenes de fax y las 1.092 JBIG2 comparadas son idénticas píxel a píxel a las de PyMuPDF; solo quedan fuera 19 planos de más de 100 millones de píxeles. Además, 354 imágenes armadas para cubrir todos los largos de corrida y texto, codificadas en grupos 3 y 4 por libtiff, se decodifican idénticas. Mediana de 104 ms por documento. Estas cifras con archivos reales son de la primera versión revisada y no se volvieron a medir con los topes y los errores agregados después (segmento cortado, datos agotados en una región, MMR incompleto), que podrían rechazar alguna imagen que antes salía.
 
 **Resistencia**
 
@@ -539,7 +540,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - 162 presentaciones y 1.003 planillas reales: ningún fallo ni cuelgue; mediana de 39 ms por presentación y 16 ms por planilla. Los únicos errores fueron archivos de bloqueo de Office y uno truncado, con un mensaje claro.
 - 460 archivos dañados a propósito (truncados, con bytes alterados, con tramos borrados): todos terminan en lectura parcial o en un error claro.
 - Archivos "bomba" armados en `doc2json/tests/presupuesto.rs` (un `.docx` de ~250 KB que descomprime 40 MB, otro con la bomba en los estilos o antes del cuerpo, un PDF con un flujo que descomprime 30 MB, seis flujos que solo juntos pasan el límite, flujos LZW, ASCII85, RunLength y cadenas de filtros, un flujo de objetos, un formulario repetido en 12 páginas, un PDF de 50 páginas): se cortan en el límite pedido con su aviso, sin afectar a la lectura siguiente.
-- Imágenes fabricadas para agotar la memoria o el trabajo (un diccionario de 1 MB dibujado 400 veces, también como diccionario directo; 5.000 × 5.000 píxeles declarados con 150 bytes; máscaras y paletas cortas; una paleta y una máscara de 1 MB compartidas por 200 imágenes; imágenes que no caben en el tope; PNG por dentro con filtros, sumas, NLEN o bytes sobrantes inválidos; la misma imagen citada con otra generación o con otras mayúsculas): `tests/imagenes_memoria.rs` mide la memoria máxima y la pedida en total con un asignador que cuenta, y `tests/imagenes.rs` el resultado.
+- Fax, JBIG2 e imágenes fabricadas para agotar la memoria o el trabajo. En fax y JBIG2, la memoria se reserva según los tamaños declarados en el archivo, así que se acotan antes (fax: hasta 2²⁰ columnas, 200 millones de píxeles y 25 MB de filas, y no más filas que bits traen los datos; JBIG2: hasta 2²⁰ símbolos, y un presupuesto de píxeles y de cálculo proporcional al tamaño de la página). Las cuentas con datos del archivo se hacen en 64 bits o con tope, para que en wasm32 no desborden. Las pruebas incluyen cabeceras armadas para cada caso y miles de flujos alterados al azar, sin fallos y en menos de 2 s cada uno. Las demás imágenes: un diccionario de 1 MB dibujado 400 veces, también como diccionario directo; 5.000 × 5.000 píxeles declarados con 150 bytes; máscaras y paletas cortas; una paleta y una máscara de 1 MB compartidas por 200 imágenes; imágenes que no caben en el tope; PNG por dentro con filtros, sumas, NLEN o bytes sobrantes inválidos; la misma imagen citada con otra generación o con otras mayúsculas. En todos los casos, `tests/imagenes_memoria.rs` mide la memoria máxima y la pedida en total con un asignador que cuenta, y `tests/imagenes.rs` el resultado.
 - En todas las herramientas, el archivo generado en el navegador es idéntico byte a byte al del ejecutable.
 
 Los scripts de comparación y los archivos con que se hizo esta validación no forman parte de este repositorio.
@@ -561,6 +562,8 @@ doc2json/src/           doc2json
   pptx.rs               lector de PowerPoint: orden de lectura, viñetas, tablas, notas
   xlsx.rs               lector de Excel: textos compartidos, formatos de fecha, combinaciones
   image.rs  png.rs      lista de imágenes, formato por cabecera y escritor PNG
+  ccitt.rs              fax CCITT grupos 3 y 4 (T.4 y T.6), también el modo MMR de JBIG2
+  jbig2.rs              JBIG2 (T.88): decodificador aritmético MQ (anexo E; su forma sigue a pdf.js, Apache-2.0), regiones genéricas, de texto y refinamiento
   pdf/
     object.rs           objetos de PDF y su analizador
     document.rs         tabla de referencias, objetos, páginas, metadatos

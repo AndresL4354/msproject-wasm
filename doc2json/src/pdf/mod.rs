@@ -426,25 +426,37 @@ fn read_tagged(bytes: &[u8], tags: bool, extract: Option<usize>) -> Result<Docum
     doc.images = set.list;
     if let Some(limit) = extract {
         let mut budget = Budget::new(limit);
-        let mut shared = images::Shared::new(&objs);
+        // Paletas y mascaras compartidas, y el trabajo de decodificacion que le queda al documento.
+        let mut shared = images::Shared::new(&pdf, &objs);
+        let mut skipped_work = 0usize;
         for (img, obj) in doc.images.iter_mut().zip(&objs) {
-            // El tope cuenta el trabajo: lo que la imagen declara se descuenta antes de
-            // decodificarla, y una imagen que ya no cabe no se decodifica.
-            let work = images::work(&pdf, obj);
-            if !budget.reserve(work) {
-                budget.skip(img);
-                continue;
-            }
+            // Cada imagen se cobra antes de decodificarla, por lo que declara, a los dos topes del
+            // documento (bytes y trabajo): una que ya no cabe no se lee ni se decodifica.
+            let reserved = match shared.charge(&pdf, obj, &mut budget) {
+                Ok(bytes) => bytes,
+                Err(images::Over::Bytes) => {
+                    budget.skip(img);
+                    continue;
+                }
+                Err(images::Over::Work) => {
+                    img.note = Some(images::work_note());
+                    skipped_work += 1;
+                    continue;
+                }
+            };
             match images::extract(&pdf, &mut shared, obj) {
-                Ok((format, data)) => {
+                Ok((format, data, note)) => {
                     img.format = format;
-                    img.note = None;
-                    budget.store(img, data, work);
+                    img.note = note;
+                    budget.store(img, data, reserved);
                 }
                 Err(note) => img.note = Some(note),
             }
         }
         doc.warnings.extend(budget.warning());
+        if skipped_work > 0 {
+            doc.warnings.push(format!("{} imagenes no se decodificaron: superan el tope de trabajo de {} millones de pixeles por documento.", skipped_work, images::MAX_WORK / 1_000_000));
+        }
         if inline_images > 0 {
             doc.warnings.push(format!("{} imagenes incrustadas en el contenido de las paginas (BI ... EI) no se extraen.", inline_images));
         }

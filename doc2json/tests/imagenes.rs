@@ -150,6 +150,11 @@ fn decode_png(p: &[u8]) -> (u32, u32, u8, u8, Vec<u8>, Vec<u8>) {
     (w, h, depth, color, plte, out)
 }
 
+/// Bytes a partir de una cadena de bits ("0101..."), rellenando con ceros.
+fn bits(s: &str) -> Vec<u8> {
+    s.as_bytes().chunks(8).map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | (((v == b'1') as u8) << (7 - i)))).collect()
+}
+
 fn image(d: &Document, id: u32) -> &Image {
     &d.images[id as usize - 1]
 }
@@ -168,8 +173,11 @@ fn pdf_con_imagenes() -> Vec<u8> {
     let content1 = "q 100 0 0 50 72 600 cm /Im1 Do Q q 30 0 0 30 10 10 cm /Im2 Do Q q 20 0 0 20 300 300 cm /Im3 Do Q \
                     q 20 0 0 20 330 300 cm /Im4 Do Q q 20 0 0 20 360 300 cm /Im5 Do Q q 20 0 0 20 390 300 cm /Im6 Do Q \
                     q 20 0 0 20 420 300 cm /Im7 Do Q q 20 0 0 20 450 300 cm /Im8 Do Q";
-    let content2 = "q 100 0 0 50 72 600 cm /Im1 Do Q q 10 0 0 10 0 0 cm /Im9 Do Q";
-    let resources = "/Resources << /XObject << /Im1 7 0 R /Im2 8 0 R /Im3 9 0 R /Im4 10 0 R /Im5 12 0 R /Im6 13 0 R /Im7 14 0 R /Im8 15 0 R /Im9 16 0 R >> >>";
+    let content2 = "q 100 0 0 50 72 600 cm /Im1 Do Q q 10 0 0 10 0 0 cm /Im9 Do Q q 10 0 0 10 20 0 cm /Im10 Do Q";
+    let resources = "/Resources << /XObject << /Im1 7 0 R /Im2 8 0 R /Im3 9 0 R /Im4 10 0 R /Im5 12 0 R /Im6 13 0 R /Im7 14 0 R /Im8 15 0 R /Im9 16 0 R /Im10 18 0 R >> >>";
+    // Grupo 4, 8 x 4: fila 1 horizontal (2 blancos, 3 negros) y V0 hasta el final; filas 2 a 4
+    // iguales a la anterior (tres V0); luego el fin de bloque.
+    let g4 = bits("0010111101111111111000000000001000000000001");
     pdf(&[
         obj("<< /Type /Catalog /Pages 2 0 R >>"),
         obj("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>"),
@@ -191,22 +199,24 @@ fn pdf_con_imagenes() -> Vec<u8> {
             "/Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /Columns 2 >>",
             &zlib_stored(&png_rows),
         ),
-        // 13: fax grupo 4 (datos de relleno: solo se envuelven).
-        stream("/Subtype /Image /Width 8 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>", &[0x26, 0xA0]),
-        // 14: JBIG2, no se convierte.
+        // 13: fax grupo 4: se decodifica a PNG.
+        stream("/Subtype /Image /Width 8 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>", &g4),
+        // 14: JBIG2 sin segmentos validos: queda con una nota.
         stream("/Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode", &[0, 1, 2]),
         // 15: mascara de un bit (estarcido).
         stream("/Subtype /Image /Width 8 /Height 1 /ImageMask true", &[0b1111_0000]),
         // 16 y 17: gris premezclado con blanco (/Matte) y su mascara: 255 + (178 - 255) * 255 / 128 = 102.
         stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 17 0 R", &[178, 255]),
         stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [1]", &[128, 0]),
+        // 18: fax que no se puede decodificar: se entrega tal cual, en un TIFF.
+        stream("/Subtype /Image /Width 8 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>", &[0, 0]),
     ])
 }
 
 #[test]
 fn pdf_lista_lugares_y_formatos_sin_extraer() {
     let d = read(&pdf_con_imagenes()).unwrap();
-    assert_eq!(d.images.len(), 9);
+    assert_eq!(d.images.len(), 10);
     let im1 = image(&d, 1);
     assert_eq!((im1.format, im1.width, im1.height), ("png", Some(2), Some(2)));
     assert!(im1.data.is_none());
@@ -218,8 +228,8 @@ fn pdf_lista_lugares_y_formatos_sin_extraer() {
     let q = &im1.places[1];
     assert_eq!((q.page, q.w, q.h), (Some(2), 50.0, 100.0));
     let formats: Vec<&str> = d.images.iter().map(|i| i.format).collect();
-    assert_eq!(formats, ["png", "jpeg", "png", "png", "png", "tiff", "jbig2", "png", "png"]);
-    assert!(image(&d, 7).note.as_deref().unwrap_or("").contains("JBIG2"));
+    // Fax y JBIG2 se anuncian como PNG: se decodifican al extraer.
+    assert_eq!(formats, ["png", "jpeg", "png", "png", "png", "png", "png", "png", "png", "png"]);
     // La mascara suave (objeto 11) no se dibuja sola: no figura como imagen propia.
 }
 
@@ -252,10 +262,17 @@ fn pdf_extrae_cada_formato() {
     assert_eq!(px, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]);
     assert!(p5.windows(5).any(|w| w == [0x78, 0x01, 1, 14, 0]));
 
-    // Fax: TIFF de grupo 4 con los datos tal cual al final.
-    let tif = data(6);
+    // Fax de grupo 4 decodificado: gris de 1 bit, 0 = negro (sin BlackIs1).
+    let (w, h, depth, color, _, px) = decode_png(&data(6));
+    assert_eq!((w, h, depth, color), (8, 4, 1, 0));
+    assert_eq!(px, [0b1100_0111; 4]);
+    assert!(image(&d, 6).note.is_none());
+
+    // Fax que no se decodifica: TIFF de grupo 4 con los datos tal cual al final, y una nota.
+    let tif = data(10);
     assert!(tif.starts_with(b"II*\0"));
-    assert!(tif.ends_with(&[0x26, 0xA0]));
+    assert!(tif.ends_with(&[0, 0]));
+    assert!(image(&d, 10).note.as_deref().unwrap_or("").contains("TIFF"));
     let entry = |tag: u16| {
         let n = u16::from_le_bytes([tif[8], tif[9]]) as usize;
         (0..n).map(|k| 10 + 12 * k).find(|&o| u16::from_le_bytes([tif[o], tif[o + 1]]) == tag).map(|o| u32::from_le_bytes([tif[o + 8], tif[o + 9], tif[o + 10], tif[o + 11]]))
@@ -263,6 +280,7 @@ fn pdf_extrae_cada_formato() {
     assert_eq!((entry(256), entry(257), entry(259)), (Some(8), Some(4), Some(4)));
 
     assert!(image(&d, 7).data.is_none());
+    assert!(image(&d, 7).note.as_deref().unwrap_or("").contains("JBIG2"));
 
     // Estarcido: gris de 1 bit, los ceros son la tinta (negro).
     let (w, _, depth, color, _, px) = decode_png(&data(8));
@@ -279,9 +297,10 @@ fn pdf_extrae_cada_formato() {
 fn pdf_json_y_bloque_de_bytes() {
     let d = read_with_images(&pdf_con_imagenes()).unwrap();
     let (json, blob) = doc2json::doc::to_json_with_images(&d, false, 3);
-    // Con lado minimo 3 solo quedan los bytes de la imagen de fax (8 x 4) y del estarcido no (8 x 1).
-    let tif = image(&d, 6).data.clone().unwrap();
-    assert_eq!(blob, tif);
+    // Con lado minimo 3 solo quedan los bytes de los dos fax (8 x 4); el estarcido (8 x 1) no.
+    let mut both = image(&d, 6).data.clone().unwrap();
+    both.extend(image(&d, 10).data.clone().unwrap());
+    assert_eq!(blob, both);
     assert!(json.contains("\"offset\":0"));
     assert!(json.contains("\"places\":[{\"page\":1,\"x\":72,\"y\":142,\"w\":100,\"h\":50}"));
     // Sin extraer, el JSON no cambia por las imagenes salvo la lista.
@@ -402,6 +421,36 @@ fn ejemplos_sin_imagenes_no_cambian() {
         let expected = std::fs::read_to_string(format!("{}.json", path)).unwrap();
         assert_eq!(doc2json::doc::to_json(&d, false), expected);
     }
+}
+
+#[test]
+fn pdf_fax_y_jbig2_con_tamanos_fuera_de_rango() {
+    // /Columns enormes: en wasm32, 2^31 columnas por 16 filas daba un arreglo de 0 bytes y la
+    // primera fila caia fuera; un valor de mas de 32 bits se truncaba. Ahora quedan con una nota.
+    // /Rows mayor que el alto de la imagen no hace decodificar filas de mas. El JBIG2 es un
+    // segmento de 11 bytes con largo 0xFFFFFFFE, que en wasm32 desbordaba.
+    let fax = |columns: &str, rows: &str| {
+        stream(&format!("/Subtype /Image /Width 8 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 {} {} >>", columns, rows), &[0xFF, 0xFF])
+    };
+    let bytes = pdf(&[
+        obj("<< /Type /Catalog /Pages 2 0 R >>"),
+        obj("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>"),
+        obj("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R /Im2 6 0 R /Im3 7 0 R /Im4 8 0 R >> >> >>"),
+        stream("", b"q 8 0 0 16 0 0 cm /Im1 Do Q q 8 0 0 16 20 0 cm /Im2 Do Q q 8 0 0 16 40 0 cm /Im3 Do Q q 8 0 0 8 60 0 cm /Im4 Do Q"),
+        fax("/Columns 2147483648", ""),
+        fax("/Columns 99999999999999", ""),
+        fax("", "/Rows 99999999999"),
+        stream("/Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode", &[0, 0, 0, 0, 48, 0, 1, 0xFF, 0xFF, 0xFF, 0xFE]),
+    ]);
+    let d = read_with_images(&bytes).unwrap();
+    for id in [1, 2] {
+        assert!(image(&d, id).data.is_none());
+        assert!(image(&d, id).note.as_deref().unwrap_or("").contains("demasiado grande"), "{:?}", image(&d, id).note);
+    }
+    let (w, h, _, _, _, _) = decode_png(image(&d, 3).data.as_deref().unwrap());
+    assert_eq!((w, h), (8, 16));
+    let (w, h, _, _, _, px) = decode_png(image(&d, 4).data.as_deref().unwrap());
+    assert_eq!((w, h, px), (8, 8, vec![0xFF; 8]));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -768,6 +817,70 @@ fn tope_de_bytes_extraidos_por_documento() {
     assert!(d.images[0].data.is_none());
     assert_eq!(d.images[1].data.as_deref(), Some(&logo[..]));
     assert_eq!(d.warnings.len(), 1);
+}
+
+#[test]
+fn tope_de_trabajo_de_decodificacion_por_documento() {
+    // 25 faxes de 10.000 x 10.000 (100 millones de pixeles cada uno) que no dan nada: cada uno sale
+    // como TIFF de pocos bytes, asi que el tope de bytes no los frena. El trabajo se cobra antes de
+    // decodificar, por el tamano declarado: con 2.000 millones entran 20 y los 5 siguientes quedan
+    // con una nota. Antes se decodificaban todos.
+    let n = 25;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let fax = "/Subtype /Image /Width 10000 /Height 10000 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 10000 >>";
+    let imgs = (0..n).map(|_| stream(fax, &[0, 0])).collect();
+    let d = read_with_images(&pdf_con(&names, &content, imgs)).unwrap();
+    assert_eq!(d.images.len(), 25);
+    let topadas: Vec<usize> = (0..n).filter(|&i| d.images[i].note.as_deref().unwrap_or("").contains("tope de trabajo")).collect();
+    assert_eq!(topadas, (20..25).collect::<Vec<_>>());
+    assert!(d.images[..20].iter().all(|i| i.format == "tiff" && i.data.is_some()));
+    assert!(d.warnings.iter().any(|w| w.contains("5 imagenes no se decodificaron")), "{:?}", d.warnings);
+    // Los JPEG no se decodifican: no gastan trabajo. Cien de 5.000 x 5.000 (2.500 millones de
+    // pixeles declarados) se entregan todos.
+    let n = 100;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let jpeg = "/Subtype /Image /Width 5000 /Height 5000 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode";
+    let imgs = (0..n).map(|_| stream(jpeg, &JPEG)).collect();
+    let d = read_with_images(&pdf_con(&names, &content, imgs)).unwrap();
+    assert!(d.images.iter().all(|i| i.data.is_some()), "{:?}", d.images.iter().find(|i| i.data.is_none()).map(|i| &i.note));
+}
+
+/// 25 faxes de 10.000 x 10.000 que no dan nada, con la cadena de filtros `filters`: cuales quedan
+/// con la nota del tope de trabajo.
+fn faxes_topados(filters: &str) -> Vec<usize> {
+    let n = 25;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let fax = format!("/Subtype /Image /Width 10000 /Height 10000 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter {} /DecodeParms << /K -1 /Columns 10000 >>", filters);
+    let imgs = (0..n).map(|_| stream(&fax, &[0, 0])).collect();
+    let d = read_with_images(&pdf_con(&names, &content, imgs)).unwrap();
+    (0..n).filter(|&i| d.images[i].note.as_deref().unwrap_or("").contains("tope de trabajo")).collect()
+}
+
+#[test]
+fn cada_pasada_de_fax_se_cobra() {
+    // Con dos faxes en la cadena, cada imagen decodificaria dos veces: se cobran 200 millones de
+    // pixeles por imagen y entran 10 (antes, 20, con un solo cobro por imagen).
+    assert_eq!(faxes_topados("[/CCITTFaxDecode /CCITTFaxDecode]"), (10..25).collect::<Vec<_>>());
+}
+
+#[test]
+fn fax_antes_de_un_jpeg_se_cobra() {
+    // El fax se decodifica antes de llegar al JPEG: se cobra igual. Antes el JPEG dejaba el costo
+    // en 0 y no se topaba ninguna.
+    assert_eq!(faxes_topados("[/CCITTFaxDecode /DCTDecode]"), (20..25).collect::<Vec<_>>());
+}
+
+#[test]
+fn cadena_de_filtros_con_tope() {
+    // 300 faxes encadenados: antes cada uno volvia a decodificar la imagen con un solo cobro.
+    let chain = format!("[{}]", "/CCF ".repeat(300));
+    let fax = format!("/Subtype /Image /Width 8 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter {} /DecodeParms << /K -1 /Columns 8 >>", chain);
+    let d = read_with_images(&pdf_con("/I0 5 0 R ", "/I0 Do ", vec![stream(&fax, &[0, 0])])).unwrap();
+    assert!(d.images[0].data.is_none());
+    assert!(d.images[0].note.as_deref().unwrap_or("").contains("300 filtros"), "{:?}", d.images[0].note);
 }
 
 #[test]
